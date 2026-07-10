@@ -262,7 +262,7 @@ pub async fn build_module_states(
             agent_registry: services.agent_registry.clone(),
             service: agent_service,
         }),
-        connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
+        connection_test: build_module_state_phase(&boot, "connection_test", || build_connection_test_state(services)),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
@@ -354,7 +354,7 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
     let pool = services.database.pool().clone();
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
-    let http_client = reqwest::Client::new();
+    let http_client = services.http_client.clone();
 
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
@@ -398,9 +398,9 @@ pub fn build_remote_agent_state(services: &AppServices) -> RemoteAgentRouterStat
 }
 
 /// Build the default `ConnectionTestRouterState`.
-pub fn build_connection_test_state() -> ConnectionTestRouterState {
+pub fn build_connection_test_state(services: &AppServices) -> ConnectionTestRouterState {
     ConnectionTestRouterState {
-        service: ConnectionTestService::new(reqwest::Client::new()),
+        service: ConnectionTestService::new(services.http_client.clone()),
     }
 }
 
@@ -444,7 +444,7 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
     let oauth_token_repo: Arc<dyn aionui_db::IOAuthTokenRepository> = Arc::new(
         aionui_db::SqliteOAuthTokenRepository::new(services.database.pool().clone()),
     );
-    let http_client = reqwest::Client::new();
+    let http_client = services.http_client.clone();
 
     McpRouterState {
         config_service: McpConfigService::new(repo.clone()),
@@ -747,7 +747,7 @@ pub fn build_shell_state(services: &AppServices) -> ShellRouterState {
         shell_service: Arc::new(aionui_shell::ShellService::new(Arc::new(
             aionui_shell::DefaultSystemOpener,
         ))),
-        stt_service: Arc::new(aionui_shell::SttService::new(reqwest::Client::new())),
+        stt_service: Arc::new(aionui_shell::SttService::new(services.http_client.clone())),
         client_pref_service,
     }
 }

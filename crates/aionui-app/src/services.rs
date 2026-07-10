@@ -31,6 +31,7 @@ pub struct AppServices {
     pub qr_token_store: Arc<QrTokenStore>,
     pub ws_manager: Arc<WebSocketManager>,
     pub event_bus: Arc<BroadcastEventBus>,
+    pub http_client: reqwest::Client,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
@@ -130,6 +131,7 @@ impl AppServices {
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
+        let http_client = reqwest::Client::new();
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
@@ -233,6 +235,7 @@ impl AppServices {
             qr_token_store: Arc::new(QrTokenStore::new()),
             ws_manager: Arc::new(WebSocketManager::new()),
             event_bus,
+            http_client,
             worker_task_manager,
             conversation_runtime_state,
             conversation_service,
