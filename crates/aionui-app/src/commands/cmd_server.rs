@@ -234,6 +234,7 @@ pub(crate) async fn run_server(
             kind: RuntimeStatusScopeKind::CustomAgent,
             id: "startup".into(),
         };
+        tokio::time::sleep(Duration::from_secs(5)).await;
         let prepare_started = Instant::now();
         info!("startup: managed runtime background preparation started");
         let result = async {
