@@ -45,7 +45,21 @@ pub fn validate_path_with_extra_root(
 ) -> Result<PathBuf, FileError> {
     let mut allowed_roots = base_roots.to_vec();
     if let Some(extra_root) = extra {
-        allowed_roots.push(extra_root);
+        let canonical_extra = std::fs::canonicalize(extra_root)
+            .map_err(|e| FileError::BadRequest(format!("cannot resolve workspace root: {}", e)))?;
+        let extra_is_allowed = base_roots.iter().any(|root| match std::fs::canonicalize(root) {
+            Ok(canonical_root) => canonical_extra.starts_with(canonical_root),
+            Err(_) => false,
+        });
+        if !extra_is_allowed {
+            return Err(FileError::PathOutsideSandbox {
+                message: "workspace root is outside the allowed sandbox".into(),
+                field: Some("workspace"),
+                operation: Some("access"),
+            });
+        }
+        allowed_roots.push(canonical_extra.as_path());
+        return validate_path(path, &allowed_roots);
     }
     validate_path(path, &allowed_roots)
 }
@@ -270,14 +284,33 @@ mod tests {
     }
 
     #[test]
-    fn validate_path_accepts_extra_workspace_root() {
+    fn validate_path_accepts_extra_workspace_root_inside_base_root() {
         let sandbox = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let file = workspace.path().join("hello.txt");
+        let workspace = sandbox.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let file = workspace.join("hello.txt");
         fs::write(&file, "hi").unwrap();
 
-        let result = validate_path_with_extra_root(file.to_str().unwrap(), &[sandbox.path()], Some(workspace.path()));
+        let result = validate_path_with_extra_root(file.to_str().unwrap(), &[sandbox.path()], Some(&workspace));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), fs::canonicalize(file).unwrap());
+    }
+
+    #[test]
+    fn validate_path_rejects_request_scoped_root_outside_base_roots() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("secret.txt");
+        fs::write(&file, "secret").unwrap();
+
+        let result = validate_path_with_extra_root(file.to_str().unwrap(), &[sandbox.path()], Some(outside.path()));
+
+        assert!(matches!(
+            result,
+            Err(FileError::PathOutsideSandbox {
+                field: Some("workspace"),
+                ..
+            })
+        ));
     }
 }

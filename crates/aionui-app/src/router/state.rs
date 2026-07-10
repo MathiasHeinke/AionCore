@@ -10,7 +10,7 @@ use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, Re
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
-use aionui_auth::extract_token_from_ws_headers;
+use aionui_auth::{extract_local_capability_from_headers, extract_token_from_ws_headers};
 use aionui_channel::ChannelRouterState;
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
@@ -118,10 +118,12 @@ pub struct ModuleStates {
     pub assistant: AssistantRouterState,
 }
 
-fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+fn default_allowed_roots(services: &AppServices) -> Vec<std::path::PathBuf> {
     let mut roots = vec![
         std::env::temp_dir(),
         dirs::home_dir().unwrap_or_else(std::env::temp_dir),
+        services.data_dir.clone(),
+        services.work_dir.clone(),
     ];
     // Auto-provisioned per-conversation workspaces live under
     // `{work_dir}/conversations/{label}-temp-{id}/`. On Windows the
@@ -131,12 +133,13 @@ fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::P
     // (ELECTRON-1BT). Including `work_dir` keeps temp + custom-on-drive
     // workspaces on the allowlist without widening the sandbox to
     // unrelated paths.
-    if let Some(wd) = work_dir
-        && !wd.as_os_str().is_empty()
-        && !roots.iter().any(|r| r == wd)
-    {
-        roots.push(wd.to_path_buf());
+    for explicit_root in &services.allowed_roots {
+        if !explicit_root.as_os_str().is_empty() && !roots.iter().any(|root| root == explicit_root) {
+            roots.push(explicit_root.clone());
+        }
     }
+    roots.sort();
+    roots.dedup();
     roots
 }
 
@@ -404,8 +407,8 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 /// Build the default `FileRouterState` from application services.
 pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, RouterBuildError> {
     let broadcaster = services.event_bus.clone();
-    let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
-    let browse_roots = BrowseRoots::new();
+    let allowed_roots = default_allowed_roots(services);
+    let browse_roots = BrowseRoots::from_roots(allowed_roots.clone());
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
     let watch_service = Arc::new(FileWatchService::new(broadcaster).map_err(file_watch_init_error)?);
     let snapshot_service = Arc::new(SnapshotService::new());
@@ -715,7 +718,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
 /// Build the default `OfficeRouterState` from application services.
 pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
     let data_dir = services.data_dir.as_path();
-    let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
+    let allowed_roots = default_allowed_roots(services);
 
     let spawner: Arc<dyn aionui_office::ProcessSpawner> =
         Arc::new(aionui_office::DefaultProcessSpawner::new(data_dir.to_path_buf()));
@@ -792,11 +795,12 @@ pub async fn build_extension_states(
 /// Build the default `WsHandlerState` from application services.
 pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
     if services.local {
+        let verifier = services.local_capability.clone();
         return WsHandlerState {
             manager: services.ws_manager.clone(),
             router: Arc::new(NoopMessageRouter),
-            token_validator: Arc::new(|_| true),
-            token_extractor: Arc::new(|_| Some("local".into())),
+            token_validator: Arc::new(move |token| verifier.as_ref().is_some_and(|verifier| verifier.verify(token))),
+            token_extractor: Arc::new(extract_local_capability_from_headers),
         };
     }
 

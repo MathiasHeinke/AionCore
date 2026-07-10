@@ -36,9 +36,22 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = env!("CARGO_PKG_VERSION").to_string())]
     pub app_version: String,
 
-    /// Run in local embedded mode (skip authentication, use system_default_user).
+    /// Run as an embedded loopback server using a per-launch capability.
     #[arg(long)]
     pub local: bool,
+
+    /// Owner-only file containing the per-launch local capability.
+    #[arg(long, requires = "local")]
+    pub local_capability_file: Option<PathBuf>,
+
+    /// Exact browser Origin allowed to call the local server. Repeatable.
+    /// Defaults to `null`, the serialized Origin of the packaged file:// UI.
+    #[arg(long, requires = "local")]
+    pub local_origin: Vec<String>,
+
+    /// Additional filesystem root exposed to file and office APIs. Repeatable.
+    #[arg(long)]
+    pub allowed_root: Vec<PathBuf>,
 
     /// Directory for log files. Defaults to {data-dir}/logs/.
     #[arg(long)]
@@ -195,6 +208,42 @@ mod tests {
     fn managed_resources_mode_accepts_download() {
         let cli = Cli::parse_from(["aioncore", "--managed-resources-mode", "download"]);
         assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
+    }
+
+    #[test]
+    fn local_capability_and_origin_require_local_mode() {
+        let capability_error = match Cli::try_parse_from(["aioncore", "--local-capability-file", "/tmp/capability"]) {
+            Ok(_) => panic!("local capability file should require --local"),
+            Err(error) => error,
+        };
+        assert_eq!(capability_error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let origin_error = match Cli::try_parse_from(["aioncore", "--local-origin", "null"]) {
+            Ok(_) => panic!("local origin should require --local"),
+            Err(error) => error,
+        };
+        assert_eq!(origin_error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn local_security_flags_are_repeatable() {
+        let cli = Cli::parse_from([
+            "aioncore",
+            "--local",
+            "--local-capability-file",
+            "/tmp/capability",
+            "--local-origin",
+            "null",
+            "--local-origin",
+            "http://localhost:5173",
+            "--allowed-root",
+            "/tmp/workspace-a",
+            "--allowed-root",
+            "/tmp/workspace-b",
+        ]);
+
+        assert_eq!(cli.local_origin, ["null", "http://localhost:5173"]);
+        assert_eq!(cli.allowed_root.len(), 2);
     }
 
     #[test]

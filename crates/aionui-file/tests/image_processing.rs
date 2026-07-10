@@ -98,15 +98,14 @@ async fn get_image_base64_nonexistent() {
 #[tokio::test]
 async fn image_base64_with_extra_workspace_root() {
     let sandbox = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    let file = workspace.path().join("test.png");
+    let workspace = sandbox.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let file = workspace.join("test.png");
     let png_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
     fs::write(&file, &png_bytes).unwrap();
 
     let svc = make_service(sandbox.path());
-    let result = svc
-        .get_image_base64(file.to_str().unwrap(), Some(workspace.path()))
-        .await;
+    let result = svc.get_image_base64(file.to_str().unwrap(), Some(&workspace)).await;
 
     assert!(result.unwrap().starts_with("data:image/png;base64,"));
 }

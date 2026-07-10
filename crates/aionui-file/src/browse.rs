@@ -49,14 +49,6 @@ pub fn default_browse_roots() -> Vec<PathBuf> {
         roots.extend(enumerate_windows_drives());
     }
 
-    #[cfg(unix)]
-    {
-        // Widest possible sandbox on Unix — the pre-M6 Express endpoint
-        // allowed `/`, and the WebUI host-files use case genuinely needs to
-        // reach outside $HOME (e.g. `/Volumes/*` on macOS).
-        roots.push(PathBuf::from("/"));
-    }
-
     let mut canonical: Vec<PathBuf> = roots
         .into_iter()
         .filter_map(|p| fs::canonicalize(&p).ok().or(Some(p)))

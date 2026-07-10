@@ -130,19 +130,26 @@ async fn read_file_unicode_content() {
 }
 
 #[tokio::test]
-async fn read_file_with_extra_workspace_root_outside_home() {
+async fn read_file_rejects_request_scoped_workspace_outside_allowed_roots() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let file = workspace.path().join("outside.txt");
     fs::write(&file, "workspace content").unwrap();
 
     let svc = make_service(sandbox.path());
-    let result = svc
+    let error = svc
         .read_file(file.to_str().unwrap(), Some(workspace.path()))
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.as_deref(), Some("workspace content"));
+    assert!(matches!(
+        error,
+        FileError::PathOutsideSandbox {
+            field: Some("workspace"),
+            operation: Some("access"),
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -196,14 +203,15 @@ async fn read_file_rejects_directory() {
 #[tokio::test]
 async fn read_file_buffer_with_extra_workspace_root() {
     let sandbox = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    let file = workspace.path().join("outside.bin");
+    let workspace = sandbox.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let file = workspace.join("inside.bin");
     let bytes = vec![1, 2, 3, 4];
     fs::write(&file, &bytes).unwrap();
 
     let svc = make_service(sandbox.path());
     let result = svc
-        .read_file_buffer(file.to_str().unwrap(), Some(workspace.path()))
+        .read_file_buffer(file.to_str().unwrap(), Some(&workspace))
         .await
         .unwrap();
 
@@ -213,12 +221,13 @@ async fn read_file_buffer_with_extra_workspace_root() {
 #[tokio::test]
 async fn read_file_nonexistent_inside_workspace_prefix_returns_none() {
     let sandbox = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    let missing = workspace.path().join("missing.txt");
+    let workspace = sandbox.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let missing = workspace.join("missing.txt");
 
     let svc = make_service(sandbox.path());
     let result = svc
-        .read_file(missing.to_str().unwrap(), Some(workspace.path()))
+        .read_file(missing.to_str().unwrap(), Some(&workspace))
         .await
         .unwrap();
 

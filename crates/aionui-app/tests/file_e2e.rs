@@ -218,7 +218,7 @@ async fn read_file_nonexistent_returns_null() {
 }
 
 #[tokio::test]
-async fn read_file_with_workspace_field_accepts_non_home_path() {
+async fn read_file_workspace_field_cannot_expand_allowed_roots() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
@@ -238,10 +238,10 @@ async fn read_file_with_workspace_field_accepts_non_home_path() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     let json = body_json(resp).await;
-    assert_eq!(json["data"], "# hello");
+    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
 }
 
 #[tokio::test]
@@ -291,7 +291,7 @@ async fn read_file_non_existent_within_sandbox_returns_null() {
 }
 
 #[tokio::test]
-async fn image_base64_with_workspace_field_accepts_non_home_path() {
+async fn image_base64_workspace_field_cannot_expand_allowed_roots() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
@@ -311,10 +311,10 @@ async fn image_base64_with_workspace_field_accepts_non_home_path() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     let json = body_json(resp).await;
-    assert!(json["data"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
 }
 
 #[tokio::test]

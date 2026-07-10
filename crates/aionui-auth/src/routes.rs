@@ -134,6 +134,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
         local: false,
+        local_capability: None,
     };
 
     // Auth rate limited routes (login, qr-login)

@@ -6,6 +6,7 @@ mod csrf;
 mod error;
 mod extract;
 mod jwt;
+mod local_capability;
 pub mod middleware;
 mod password;
 pub mod qr_token;
@@ -19,6 +20,9 @@ pub use error::AuthError;
 
 // JWT service
 pub use jwt::{JwtService, TokenPayload, generate_random_secret_string, resolve_jwt_secret};
+
+// Per-launch local embedded-server capability
+pub use local_capability::{LocalCapabilityError, LocalCapabilityVerifier};
 
 // Password service
 pub use password::{
@@ -36,7 +40,8 @@ pub use rate_limit::{
 
 // Token / IP extraction
 pub use extract::{
-    extract_client_ip, extract_client_ip_from_headers, extract_cookie_value, extract_token_from_headers,
+    LOCAL_CAPABILITY_HEADER, extract_bearer_token_from_headers, extract_client_ip, extract_client_ip_from_headers,
+    extract_cookie_value, extract_local_capability_from_headers, extract_token_from_headers,
     extract_token_from_ws_headers,
 };
 
@@ -50,7 +55,7 @@ pub use security::security_headers_middleware;
 pub use csrf::csrf_middleware;
 
 // Auth middleware
-pub use middleware::{AuthState, CurrentUser, auth_middleware, local_auth_middleware};
+pub use middleware::{AuthState, CurrentUser, auth_middleware};
 
 // QR token store
 pub use qr_token::QrTokenStore;

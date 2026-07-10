@@ -8,7 +8,7 @@ use aionui_ai_agent::{
     build_agent_factory,
 };
 use aionui_api_types::GuideMcpConfig;
-use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
+use aionui_auth::{CookieConfig, JwtService, LocalCapabilityVerifier, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
@@ -46,8 +46,11 @@ pub struct AppServices {
     pub jwt_secret_raw: String,
     pub data_dir: PathBuf,
     pub work_dir: PathBuf,
-    /// When `true`, skip JWT authentication and use a fixed default user.
+    /// When `true`, use the per-launch embedded-server capability.
     pub local: bool,
+    pub local_capability: Option<LocalCapabilityVerifier>,
+    pub local_origins: Vec<String>,
+    pub allowed_roots: Vec<PathBuf>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
@@ -94,6 +97,9 @@ impl AppServices {
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
         let local = config.local;
+        let local_capability = config.local_capability.clone();
+        let local_origins = config.local_origins.clone();
+        let allowed_roots = config.allowed_roots.clone();
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
 
@@ -238,6 +244,9 @@ impl AppServices {
             data_dir,
             work_dir,
             local,
+            local_capability,
+            local_origins,
+            allowed_roots,
             app_version,
             skill_paths,
             skill_repo,

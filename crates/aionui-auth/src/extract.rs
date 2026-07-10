@@ -2,6 +2,8 @@ use axum::http::{HeaderMap, Request, header};
 
 use aionui_common::constants::COOKIE_NAME;
 
+pub const LOCAL_CAPABILITY_HEADER: &str = "x-aionui-local-capability";
+
 /// Extract the client IP address from request headers.
 ///
 /// Priority: `X-Forwarded-For` (first IP) > `X-Real-IP` > `"unknown"`.
@@ -36,7 +38,7 @@ pub fn extract_client_ip_from_headers(headers: &HeaderMap) -> String {
 ///
 /// Priority: `Authorization: Bearer <token>` > `aionui-session` cookie.
 pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(token) = extract_bearer_token(headers) {
+    if let Some(token) = extract_bearer_token_from_headers(headers) {
         return Some(token);
     }
     extract_cookie_value(headers, COOKIE_NAME)
@@ -46,7 +48,7 @@ pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
 ///
 /// Priority: `Authorization` > `Cookie` > `Sec-WebSocket-Protocol` (first value).
 pub fn extract_token_from_ws_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(token) = extract_bearer_token(headers) {
+    if let Some(token) = extract_bearer_token_from_headers(headers) {
         return Some(token);
     }
 
@@ -62,6 +64,19 @@ pub fn extract_token_from_ws_headers(headers: &HeaderMap) -> Option<String> {
             let first = protocols.split(',').next()?.trim();
             if first.is_empty() { None } else { Some(first.to_owned()) }
         })
+}
+
+/// Extract the dedicated per-launch embedded-server capability.
+///
+/// It deliberately does not share `Authorization`: local WebUI requests may
+/// need both this process capability and a normal user JWT at the same time.
+pub fn extract_local_capability_from_headers(headers: &HeaderMap) -> Option<String> {
+    let capability = headers.get(LOCAL_CAPABILITY_HEADER)?.to_str().ok()?;
+    if capability.is_empty() {
+        None
+    } else {
+        Some(capability.to_owned())
+    }
 }
 
 /// Extract a named cookie value from the `Cookie` header.
@@ -82,7 +97,7 @@ pub fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// Extract the bearer token from the `Authorization` header.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+pub fn extract_bearer_token_from_headers(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = auth.strip_prefix("Bearer ")?;
     if token.is_empty() { None } else { Some(token.to_owned()) }
@@ -169,6 +184,21 @@ mod tests {
     fn token_none_for_non_bearer_auth() {
         let headers = headers_with(&[("authorization", "Basic dXNlcjpwYXNz")]);
         assert_eq!(extract_token_from_headers(&headers), None);
+    }
+
+    #[test]
+    fn local_capability_uses_dedicated_header_only() {
+        let headers = headers_with(&[
+            ("authorization", "Bearer user-jwt"),
+            (LOCAL_CAPABILITY_HEADER, "local-capability"),
+        ]);
+        assert_eq!(
+            extract_local_capability_from_headers(&headers),
+            Some("local-capability".into())
+        );
+
+        let bearer_only = headers_with(&[("authorization", "Bearer local-capability")]);
+        assert_eq!(extract_local_capability_from_headers(&bearer_only), None);
     }
 
     // --- extract_token_from_ws_headers ---

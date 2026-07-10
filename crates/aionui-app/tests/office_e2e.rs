@@ -175,7 +175,7 @@ async fn wp4_word_preview_officecli_not_available() {
 }
 
 #[tokio::test]
-async fn wp5_word_preview_with_workspace_accepts_non_sandbox_path() {
+async fn wp5_word_preview_workspace_cannot_expand_allowed_roots() {
     let sandbox = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let file_path = outside.path().join("demo.docx");
@@ -191,10 +191,9 @@ async fn wp5_word_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/word-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
 }
 
 #[tokio::test]
@@ -219,7 +218,7 @@ async fn wp6_word_preview_without_workspace_rejects_non_sandbox_path() {
 }
 
 #[tokio::test]
-async fn ep1_excel_preview_with_workspace_accepts_non_sandbox_path() {
+async fn ep1_excel_preview_workspace_cannot_expand_allowed_roots() {
     let sandbox = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let file_path = outside.path().join("demo.xlsx");
@@ -235,14 +234,13 @@ async fn ep1_excel_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/excel-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
 }
 
 #[tokio::test]
-async fn pp1_ppt_preview_with_workspace_accepts_non_sandbox_path() {
+async fn pp1_ppt_preview_workspace_cannot_expand_allowed_roots() {
     let sandbox = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let file_path = outside.path().join("demo.pptx");
@@ -258,10 +256,9 @@ async fn pp1_ppt_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/ppt-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
 }
 
 // ── SH-1: Save snapshot ─────────────────────────────────────────────

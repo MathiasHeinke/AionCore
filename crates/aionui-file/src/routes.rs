@@ -68,6 +68,13 @@ impl BrowseRoots {
         }
     }
 
+    pub fn from_roots(roots: Vec<PathBuf>) -> Self {
+        Self {
+            roots: Arc::new(OnceLock::new()),
+            resolver: Arc::new(move || roots.clone()),
+        }
+    }
+
     #[cfg(test)]
     fn with_resolver(resolver: impl Fn() -> Vec<PathBuf> + Send + Sync + 'static) -> Self {
         Self {

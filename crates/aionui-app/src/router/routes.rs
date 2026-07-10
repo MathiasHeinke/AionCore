@@ -1,17 +1,19 @@
 //! Top-level router assembly: middleware stack + module route merges.
 
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Request;
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, middleware};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use aionui_ai_agent::{agent_routes, remote_agent_routes};
 use aionui_api_types::ErrorResponse;
@@ -40,6 +42,28 @@ use crate::services::AppServices;
 use super::health::{guide_mcp_status, health_check};
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
 use super::trace::with_access_log;
+
+#[derive(Clone)]
+struct LocalOriginPolicy {
+    origins: Arc<Vec<HeaderValue>>,
+}
+
+impl LocalOriginPolicy {
+    fn from_services(services: &AppServices) -> Self {
+        let origins = services
+            .local_origins
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect();
+        Self {
+            origins: Arc::new(origins),
+        }
+    }
+
+    fn allows(&self, origin: &HeaderValue) -> bool {
+        self.origins.iter().any(|allowed| allowed == origin)
+    }
+}
 
 /// Create the application router with all routes and global middleware.
 ///
@@ -143,6 +167,13 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
         local: services.local,
+        local_capability: services.local_capability.clone(),
+    };
+
+    let auth_router = if services.local {
+        auth_routes(auth_state).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware))
+    } else {
+        auth_routes(auth_state)
     };
 
     // System routes protected by auth middleware
@@ -220,10 +251,15 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let guide_mcp_authenticated = Router::new()
         .route("/api/system/guide-mcp", get(guide_mcp_status))
         .with_state(services.guide_mcp_config.clone())
-        .route_layer(from_fn_with_state(auth_mw_state, auth_middleware));
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
-    // Office proxy routes — exempt from auth (serve iframe content)
-    let office_proxy = office_proxy_routes(states.office);
+    // Local iframe requests receive the same per-launch capability from the
+    // Electron session boundary. Remote WebUI keeps its existing JWT flow.
+    let office_proxy = if services.local {
+        office_proxy_routes(states.office).route_layer(from_fn_with_state(auth_mw_state, auth_middleware))
+    } else {
+        office_proxy_routes(states.office)
+    };
     let public_assets = asset_routes(AssetRouterState::default());
 
     // WebSocket upgrade route — exempt from CSRF (no cookie-based
@@ -233,7 +269,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     let router = Router::new()
         .route("/health", get(health_check))
-        .merge(auth_routes(auth_state))
+        .merge(auth_router)
         .merge(system_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)
@@ -283,8 +319,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     );
 
     if services.local {
+        let origin_policy = LocalOriginPolicy::from_services(services);
         let cors = CorsLayer::new()
-            .allow_origin(Any)
+            .allow_origin(AllowOrigin::list(origin_policy.origins.iter().cloned()))
             .allow_methods([
                 Method::GET,
                 Method::POST,
@@ -293,11 +330,31 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 Method::DELETE,
                 Method::OPTIONS,
             ])
-            .allow_headers(Any);
-        router.layer(cors)
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                header::ACCEPT,
+                axum::http::HeaderName::from_static(aionui_auth::LOCAL_CAPABILITY_HEADER),
+            ]);
+        router
+            .layer(middleware::from_fn_with_state(origin_policy, local_origin_middleware))
+            .layer(cors)
     } else {
         router
     }
+}
+
+async fn local_origin_middleware(
+    axum::extract::State(policy): axum::extract::State<LocalOriginPolicy>,
+    request: Request,
+    next: Next,
+) -> Result<Response, aionui_common::ApiError> {
+    if let Some(origin) = request.headers().get(header::ORIGIN)
+        && !policy.allows(origin)
+    {
+        return Err(aionui_common::ApiError::Forbidden("Origin is not allowed".into()));
+    }
+    Ok(next.run(request).await)
 }
 
 async fn normalize_boundary_error_response(request: Request, next: Next) -> Response {

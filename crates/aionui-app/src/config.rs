@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use aionui_auth::LocalCapabilityVerifier;
 use sha2::{Digest, Sha256};
 
 /// Application configuration parsed from CLI arguments.
@@ -12,8 +13,11 @@ pub struct AppConfig {
     pub data_dir: PathBuf,
     pub work_dir: PathBuf,
     pub app_version: String,
-    /// Run in local embedded mode (skip authentication, use system_default_user).
+    /// Run in local embedded mode with a per-launch capability.
     pub local: bool,
+    pub local_capability: Option<LocalCapabilityVerifier>,
+    pub local_origins: Vec<String>,
+    pub allowed_roots: Vec<PathBuf>,
 }
 
 impl AppConfig {
@@ -37,6 +41,9 @@ impl Default for AppConfig {
             work_dir: PathBuf::from("data"),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             local: false,
+            local_capability: None,
+            local_origins: vec!["null".to_owned()],
+            allowed_roots: Vec::new(),
         }
     }
 }

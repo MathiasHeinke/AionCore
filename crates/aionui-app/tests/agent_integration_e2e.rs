@@ -648,7 +648,7 @@ async fn agent_overrides_roundtrip_and_management_summary() {
     assert_eq!(row["has_command_override"], true);
     assert_eq!(row["env_override_key_count"], 1); // PATH excluded
     assert!(
-        row["env"].as_array().map_or(true, |arr| arr.is_empty()),
+        row["env"].as_array().is_none_or(|arr| arr.is_empty()),
         "management row env must be empty or absent"
     );
     assert!(

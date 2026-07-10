@@ -10,7 +10,8 @@ use aionui_common::ApiError;
 use aionui_db::IUserRepository;
 
 use crate::JwtService;
-use crate::extract::extract_token_from_headers;
+use crate::LocalCapabilityVerifier;
+use crate::extract::{extract_local_capability_from_headers, extract_token_from_headers};
 
 /// Authenticated user injected into request extensions by the auth middleware.
 ///
@@ -29,8 +30,9 @@ pub struct CurrentUser {
 pub struct AuthState {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
-    /// When `true`, skip JWT verification and inject a fixed default user.
+    /// When `true`, require the per-launch capability and inject the embedded user.
     pub local: bool,
+    pub local_capability: Option<LocalCapabilityVerifier>,
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -49,8 +51,18 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // In local mode, skip JWT verification and inject a fixed default user.
+    // Local mode is reachable over loopback and must not be an authentication
+    // bypass. User JWTs and cookies are separate from this process boundary.
     if state.local {
+        let verifier = state
+            .local_capability
+            .as_ref()
+            .ok_or_else(|| ApiError::Unauthorized("Local capability is not configured".into()))?;
+        let token = extract_local_capability_from_headers(request.headers())
+            .ok_or_else(|| ApiError::Unauthorized("Local capability is required".into()))?;
+        if !verifier.verify(&token) {
+            return Err(ApiError::Unauthorized("Invalid local capability".into()));
+        }
         request.extensions_mut().insert(CurrentUser {
             id: "system_default_user".to_string(),
             username: "system_default_user".to_string(),
@@ -84,18 +96,6 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
-/// Local-mode authentication middleware that skips JWT verification.
-///
-/// Injects a fixed `CurrentUser` with id and username `system_default_user`.
-/// Used when the server runs as an embedded subprocess inside Electron.
-pub async fn local_auth_middleware(mut request: Request, next: Next) -> Response {
-    request.extensions_mut().insert(CurrentUser {
-        id: "system_default_user".to_string(),
-        username: "system_default_user".to_string(),
-    });
-    next.run(request).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,13 +111,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_local_auth_middleware_injects_default_user() {
+    async fn local_auth_requires_matching_bearer_and_injects_default_user() {
+        let capability = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let state = AuthState {
+            jwt_service: Arc::new(JwtService::new("test-secret".into())),
+            user_repo: Arc::new(aionui_db::SqliteUserRepository::new(db.pool().clone())),
+            local: true,
+            local_capability: Some(LocalCapabilityVerifier::new(capability).unwrap()),
+        };
         let app = Router::new()
             .route("/test", get(echo_user))
-            .route_layer(axum::middleware::from_fn(local_auth_middleware));
+            .route_layer(axum::middleware::from_fn_with_state(state, auth_middleware));
+
+        let missing = app
+            .clone()
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
         let response = app
-            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header(crate::LOCAL_CAPABILITY_HEADER, capability)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
