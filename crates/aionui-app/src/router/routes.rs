@@ -16,7 +16,7 @@ use axum::{Router, middleware};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use aionui_ai_agent::{agent_routes, remote_agent_routes};
-use aionui_api_types::ErrorResponse;
+use aionui_api_types::{ErrorResponse, WebSocketMessage};
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
@@ -32,16 +32,43 @@ use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
-use aionui_realtime::{WsHandlerState, ws_upgrade_handler};
+use aionui_realtime::{WebSocketManager, WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_system::{connection_test_routes, system_routes};
 use aionui_team::team_routes;
+use tokio::sync::broadcast;
 
 use crate::services::AppServices;
 
 use super::health::{guide_mcp_status, health_check};
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
 use super::trace::with_access_log;
+
+async fn forward_event_bus_to_websockets(
+    mut event_rx: broadcast::Receiver<WebSocketMessage<serde_json::Value>>,
+    ws_manager: Arc<WebSocketManager>,
+) {
+    loop {
+        match event_rx.recv().await {
+            Ok(event) => ws_manager.broadcast_all(event),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    code = "REALTIME_EVENT_BUS_LAGGED",
+                    skipped,
+                    "WebSocket event forwarder lagged; requesting client reconciliation"
+                );
+                ws_manager.broadcast_all(WebSocketMessage::new(
+                    "realtime.resync_required",
+                    serde_json::json!({ "reason": "event_bus_lag" }),
+                ));
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                tracing::info!("WebSocket event forwarder stopped because the event bus closed");
+                break;
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct LocalOriginPolicy {
@@ -77,13 +104,9 @@ pub async fn create_router(services: &AppServices) -> Result<Router, RouterBuild
 
     // Bridge event bus → WebSocket manager: forward all broadcast events
     // to connected WebSocket clients.
-    let mut event_rx = services.event_bus.subscribe();
+    let event_rx = services.event_bus.subscribe();
     let ws_manager = services.ws_manager.clone();
-    tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
-            ws_manager.broadcast_all(event);
-        }
-    });
+    tokio::spawn(forward_event_bus_to_websockets(event_rx, ws_manager));
 
     let (states, channel_components) = build_module_states(services).await?;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
@@ -412,9 +435,12 @@ fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'stat
 
 #[cfg(test)]
 mod tests {
+    use aionui_api_types::WebSocketMessage;
+    use aionui_realtime::{BroadcastEventBus, EventBroadcaster, WebSocketManager, WsOutbound};
     use axum::http::StatusCode;
+    use tokio::sync::mpsc;
 
-    use super::boundary_error_for_status;
+    use super::{boundary_error_for_status, forward_event_bus_to_websockets};
 
     #[test]
     fn boundary_error_for_status_covers_common_fallback_statuses() {
@@ -439,5 +465,40 @@ mod tests {
             let (_, actual_code) = boundary_error_for_status(status).expect("status should be normalized");
             assert_eq!(actual_code, code);
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_event_forwarder_survives_lag_and_forwards_later_events() {
+        let bus = std::sync::Arc::new(BroadcastEventBus::new(2));
+        let event_rx = bus.subscribe();
+        let ws_manager = std::sync::Arc::new(WebSocketManager::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        ws_manager.add_client("test-token".into(), client_tx);
+
+        for seq in 1..=3 {
+            bus.broadcast(WebSocketMessage::new("test.event", serde_json::json!({ "seq": seq })));
+        }
+
+        let forwarder = tokio::spawn(forward_event_bus_to_websockets(event_rx, ws_manager));
+        tokio::task::yield_now().await;
+        bus.broadcast(WebSocketMessage::new("test.event", serde_json::json!({ "seq": 4 })));
+
+        let saw_latest = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while let Some(outbound) = client_rx.recv().await {
+                let WsOutbound::Text(text) = outbound else {
+                    continue;
+                };
+                let event: WebSocketMessage<serde_json::Value> = serde_json::from_str(&text).unwrap();
+                if event.name == "test.event" && event.data["seq"] == 4 {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("latest event should arrive before timeout");
+
+        assert!(saw_latest, "forwarder must keep running after a lagged receive");
+        forwarder.abort();
     }
 }

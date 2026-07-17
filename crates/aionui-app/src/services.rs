@@ -23,6 +23,8 @@ use aionui_team::GuideMcpServer;
 
 use crate::config::{AppConfig, derive_encryption_key};
 
+const APP_EVENT_BUS_CAPACITY: usize = 4_096;
+
 pub struct AppServices {
     pub database: Database,
     pub jwt_service: Arc<JwtService>,
@@ -130,7 +132,7 @@ impl AppServices {
         let encryption_key = derive_encryption_key(&secret);
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
-        let event_bus = Arc::new(BroadcastEventBus::new(256));
+        let event_bus = Arc::new(BroadcastEventBus::new(APP_EVENT_BUS_CAPACITY));
         let http_client = reqwest::Client::new();
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).

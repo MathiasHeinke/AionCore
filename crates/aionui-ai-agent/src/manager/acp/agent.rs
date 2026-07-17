@@ -60,6 +60,7 @@ use super::mode_normalize::normalize_requested_mode;
 /// Grace period before force-killing an ACP process (ms).
 const ACP_KILL_GRACE_MS: u64 = 500;
 const OBSERVED_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
+const ACP_STREAM_EVENT_BUFFER_CAPACITY: usize = 16_384;
 
 /// Decompose a child `ExitStatus` (or its absence) into the
 /// `(exit_code, signal)` pair that `AcpError::StartupCrash` /
@@ -376,7 +377,11 @@ impl AcpAgentManager {
         let (notification_tx, notification_rx) = mpsc::channel::<SessionNotification>(256);
         let (domain_event_tx, domain_event_rx) = mpsc::channel(256);
         let (permission_tx, permission_rx) = mpsc::channel(32);
-        let runtime = AgentRuntime::new(params.conversation_id.clone(), params.workspace.path.clone(), 256);
+        let runtime = AgentRuntime::new(
+            params.conversation_id.clone(),
+            params.workspace.path.clone(),
+            ACP_STREAM_EVENT_BUFFER_CAPACITY,
+        );
 
         // Race the handshake against process exit. The SDK's stdout EOF
         // detection can lag (observed: 30s on Windows when the agent dies

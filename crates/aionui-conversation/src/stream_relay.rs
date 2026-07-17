@@ -17,12 +17,32 @@ use crate::stream_persistence::{
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
-use tokio::sync::broadcast::error::TryRecvError;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
+
+type RelayIngressItem = Result<AgentStreamEvent, broadcast::error::RecvError>;
+
+fn spawn_stream_ingress(
+    mut source: broadcast::Receiver<AgentStreamEvent>,
+) -> mpsc::UnboundedReceiver<RelayIngressItem> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let item = source.recv().await;
+            let terminal = matches!(
+                &item,
+                Ok(AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) | Err(broadcast::error::RecvError::Closed)
+            );
+            if tx.send(item).is_err() || terminal {
+                break;
+            }
+        }
+    });
+    rx
+}
 
 /// Conservative summary of what happened during one agent send attempt.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -201,9 +221,13 @@ impl StreamRelay {
 
     async fn consume_inner(
         self,
-        mut rx: broadcast::Receiver<AgentStreamEvent>,
+        rx: broadcast::Receiver<AgentStreamEvent>,
         mut send_error_rx: Option<oneshot::Receiver<AgentSendError>>,
     ) -> RelayOutcome {
+        // Drain the broadcast receiver independently from persistence. Database
+        // writes may be slow, but they must never make the sole durable relay
+        // subscriber fall behind and lose generated text or terminal events.
+        let mut ingress_rx = spawn_stream_ingress(rx);
         let started_at = now_ms();
         info!(
             conversation_id = %self.conversation_id,
@@ -226,8 +250,8 @@ impl StreamRelay {
         loop {
             let recv_result = if send_error_done {
                 if let Some(send_error) = pending_send_error.take() {
-                    match rx.try_recv() {
-                        Ok(event) => {
+                    match ingress_rx.try_recv() {
+                        Ok(Ok(event)) => {
                             if !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
                                 pending_send_error = Some(send_error);
                             } else {
@@ -235,7 +259,13 @@ impl StreamRelay {
                             }
                             Ok(event)
                         }
-                        Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => {
+                        Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                            pending_send_error = Some(send_error);
+                            Err(broadcast::error::RecvError::Lagged(n))
+                        }
+                        Ok(Err(broadcast::error::RecvError::Closed))
+                        | Err(mpsc::error::TryRecvError::Empty)
+                        | Err(mpsc::error::TryRecvError::Disconnected) => {
                             warn!(
                                 code = ?send_error.code(),
                                 ownership = ?send_error.ownership(),
@@ -243,14 +273,16 @@ impl StreamRelay {
                             );
                             Ok(AgentStreamEvent::Error(send_error.into_stream_error()))
                         }
-                        Err(TryRecvError::Lagged(n)) => Err(broadcast::error::RecvError::Lagged(n)),
                     }
                 } else {
-                    rx.recv().await
+                    ingress_rx
+                        .recv()
+                        .await
+                        .unwrap_or(Err(broadcast::error::RecvError::Closed))
                 }
             } else {
                 tokio::select! {
-                    recv = rx.recv() => recv,
+                    recv = ingress_rx.recv() => recv.unwrap_or(Err(broadcast::error::RecvError::Closed)),
                     send_error = send_error_rx.as_mut().expect("send_error_rx exists while pending") => {
                         send_error_done = true;
                         match send_error {
@@ -864,6 +896,35 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "cron");
         assert_eq!(concrete.requested.lock().unwrap().as_slice(), ["cron"]);
+    }
+
+    #[tokio::test]
+    async fn stream_ingress_drains_while_persistence_consumer_is_slow() {
+        let (tx, rx) = broadcast::channel(64);
+        let mut ingress = spawn_stream_ingress(rx);
+        let producer = tokio::spawn(async move {
+            for index in 0..2_000 {
+                tx.send(AgentStreamEvent::Text(TextEventData {
+                    content: index.to_string(),
+                }))
+                .unwrap();
+                tokio::task::yield_now().await;
+            }
+            tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        });
+
+        producer.await.unwrap();
+        let mut text_events = 0;
+        loop {
+            match ingress.recv().await.expect("ingress stays open through terminal") {
+                Ok(AgentStreamEvent::Text(_)) => text_events += 1,
+                Ok(AgentStreamEvent::Finish(_)) => break,
+                Ok(_) => {}
+                Err(error) => panic!("unexpected ingress loss: {error}"),
+            }
+        }
+
+        assert_eq!(text_events, 2_000);
     }
 
     #[tokio::test]
