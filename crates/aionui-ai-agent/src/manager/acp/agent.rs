@@ -702,7 +702,20 @@ impl AcpAgentManager {
                     method = "session/set_mode",
                     "acp_config_option_command_ack"
                 );
-                self.ensure_session_unchanged(&session_id, "mode").await?;
+                {
+                    let mut session = self.session.write().await;
+                    if session.session_id() != Some(session_id.as_str()) {
+                        return Err(AgentError::conflict("Active ACP session changed while applying mode"));
+                    }
+                    // Legacy `session/set_mode` has no payload containing the
+                    // resulting mode. A successful synchronous response is the
+                    // protocol's authoritative acknowledgement, so align both
+                    // desired and observed state here. Without this confirmation
+                    // the config-options route waits ten seconds and then reports
+                    // a false timeout even though Hermes already changed mode.
+                    session.confirm_mode(ModeId::new(value));
+                    self.commit_session_changes(&mut session).await;
+                }
                 self.wait_for_observed_config_option("mode", value, OBSERVED_CONFIRMATION_TIMEOUT)
                     .await
             }
@@ -732,7 +745,18 @@ impl AcpAgentManager {
                     method = "session/set_model",
                     "acp_config_option_command_ack"
                 );
-                self.ensure_session_unchanged(&session_id, "model").await?;
+                {
+                    let mut session = self.session.write().await;
+                    if session.session_id() != Some(session_id.as_str()) {
+                        return Err(AgentError::conflict("Active ACP session changed while applying model"));
+                    }
+                    // `session/set_model` follows the same legacy acknowledgement
+                    // contract as mode switching. Confirm it immediately so the
+                    // stable config-options API does not fail after a successful
+                    // backend switch or reconcile back to the previous model.
+                    session.confirm_model(ModelId::new(value));
+                    self.commit_session_changes(&mut session).await;
+                }
                 self.wait_for_observed_config_option("model", value, OBSERVED_CONFIRMATION_TIMEOUT)
                     .await
             }
@@ -741,24 +765,6 @@ impl AcpAgentManager {
             confirmation: ConfigOptionConfirmation::Observed,
             config_options: Some(snapshot.options),
         })
-    }
-
-    async fn ensure_session_unchanged(&self, session_id: &str, field: &str) -> Result<(), AgentError> {
-        let session = self.session.read().await;
-        if session.session_id() == Some(session_id) {
-            return Ok(());
-        }
-        warn!(
-            conversation_id = %self.params.conversation_id,
-            agent_backend = ?self.params.metadata.backend,
-            config_id = %field,
-            confirmed_session_id = %session_id,
-            active_session_id = ?session.session_id(),
-            "acp_config_option_session_changed"
-        );
-        Err(AgentError::conflict(
-            "Active ACP session changed while applying config option",
-        ))
     }
 
     async fn wait_for_observed_config_option(
