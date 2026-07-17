@@ -19,6 +19,9 @@ use super::agent_close::STDERR_PEEK_LINES;
 use super::error_mapping::{AcpSendFailure, is_acp_session_not_found};
 use tracing::warn;
 
+const UNRENDERED_STDERR_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+const UNRENDERED_STDERR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 #[derive(Debug)]
 pub(super) enum PromptOutcome {
     Completed { session_id: String },
@@ -262,8 +265,10 @@ impl AcpAgentManager {
             .await
             .map_err(AcpSendFailure::from)?;
 
-        let empty_turn = is_empty_turn(&mut probe_rx);
-        if empty_turn && let Some(error) = self.empty_turn_terminal_error().await {
+        let turn_summary = summarize_turn(&mut probe_rx);
+        if turn_summary.should_probe_stderr()
+            && let Some(error) = self.empty_turn_terminal_error().await
+        {
             return Ok(PromptOutcome::TerminalError {
                 session_id: sid.to_owned(),
                 error,
@@ -273,7 +278,7 @@ impl AcpAgentManager {
         Ok(prompt_outcome_from_stop_reason(
             sid,
             prompt_response.stop_reason,
-            empty_turn,
+            turn_summary.is_empty(),
             matched_command,
         ))
     }
@@ -336,53 +341,86 @@ impl AcpAgentManager {
     }
 
     async fn empty_turn_terminal_error(&self) -> Option<ErrorEventData> {
-        let tail = self.process.peek_stderr_tail(STDERR_PEEK_LINES).await;
-        let detail = super::stderr_error_extractor::extract_error_message(&tail)?;
+        let detail = wait_for_stderr_error_detail(|| self.process.peek_stderr_tail(STDERR_PEEK_LINES)).await?;
         Some(classify_empty_turn_stderr_error(&detail))
     }
 }
 
-/// Drain the supplied turn-scoped receiver and return `true` when the turn
-/// produced neither agent text nor any tool-call activity.
-///
-/// Used by `prompt_existing_session` to detect the "blank reply" scenario
-/// (ELECTRON-1JG): the ACP backend returned `StopReason::EndTurn` (or
-/// similar terminal reason) without ever emitting a `Text` /
-/// `Thinking` / `ToolCall` / `AcpToolCall` chunk. We treat presence of
-/// any of those as a non-empty turn.
-///
-/// `Lagged` is treated as non-empty: the broadcast buffer overflowed,
-/// meaning many events flew by — definitely not an empty turn.
-fn is_empty_turn(rx: &mut tokio::sync::broadcast::Receiver<AgentStreamEvent>) -> bool {
+async fn wait_for_stderr_error_detail<F, Fut>(mut read_stderr: F) -> Option<String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = String>,
+{
+    let deadline = tokio::time::Instant::now() + UNRENDERED_STDERR_SETTLE_WINDOW;
     loop {
-        match rx.try_recv() {
-            Ok(event) => {
-                if event_is_user_visible_output(&event) {
-                    return false;
-                }
-            }
-            Err(TryRecvError::Empty) => return true,
-            Err(TryRecvError::Closed) => return true,
-            // Buffer overflow: many events occurred — turn was clearly not empty.
-            Err(TryRecvError::Lagged(_)) => return false,
+        let tail = read_stderr().await;
+        if let Some(detail) = super::stderr_error_extractor::extract_error_message(&tail) {
+            return Some(detail);
         }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        tokio::time::sleep(remaining.min(UNRENDERED_STDERR_POLL_INTERVAL)).await;
     }
 }
 
-/// Whether a stream event represents user-visible output produced by the
-/// model during a turn. Anything that would render in chat counts.
-fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
-    matches!(
-        event,
-        AgentStreamEvent::Text(_)
-            | AgentStreamEvent::Thinking(_)
-            | AgentStreamEvent::ToolCall(_)
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TurnProbeSummary {
+    saw_rendered_content: bool,
+    saw_tool_or_side_effect: bool,
+}
+
+impl TurnProbeSummary {
+    fn observe(&mut self, event: &AgentStreamEvent) {
+        match event {
+            AgentStreamEvent::Text(data) => self.saw_rendered_content |= !data.content.is_empty(),
+            AgentStreamEvent::Thinking(data) => self.saw_rendered_content |= !data.content.is_empty(),
+            AgentStreamEvent::Plan(_) => self.saw_rendered_content = true,
+            AgentStreamEvent::ToolCall(_)
             | AgentStreamEvent::AcpToolCall(_)
             | AgentStreamEvent::ToolGroup(_)
-            | AgentStreamEvent::Plan(_)
             | AgentStreamEvent::Permission(_)
-            | AgentStreamEvent::AcpPermission(_)
-    )
+            | AgentStreamEvent::AcpPermission(_) => self.saw_tool_or_side_effect = true,
+            _ => {}
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        !self.saw_rendered_content && !self.saw_tool_or_side_effect
+    }
+
+    fn should_probe_stderr(self) -> bool {
+        !self.saw_rendered_content
+    }
+}
+
+/// Drain the supplied turn-scoped receiver and summarize rendered content
+/// separately from tool or permission activity.
+///
+/// Used by `prompt_existing_session` to detect the "blank reply" scenario
+/// (ELECTRON-1JG): the ACP backend returned `StopReason::EndTurn` (or
+/// similar terminal reason) without emitting content. Keeping tool activity
+/// separate lets valid tool-only turns complete while still checking stderr
+/// for a real runtime failure after a tool call.
+///
+/// `Lagged` is treated conservatively as both kinds of activity: the broadcast
+/// buffer overflowed, so the turn must not be reclassified from incomplete data.
+fn summarize_turn(rx: &mut tokio::sync::broadcast::Receiver<AgentStreamEvent>) -> TurnProbeSummary {
+    let mut summary = TurnProbeSummary::default();
+    loop {
+        match rx.try_recv() {
+            Ok(event) => summary.observe(&event),
+            Err(TryRecvError::Empty | TryRecvError::Closed) => return summary,
+            Err(TryRecvError::Lagged(_)) => {
+                return TurnProbeSummary {
+                    saw_rendered_content: true,
+                    saw_tool_or_side_effect: true,
+                };
+            }
+        }
+    }
 }
 
 fn prompt_outcome_from_stop_reason(
@@ -638,7 +676,7 @@ mod tests {
     /// contract: the helper has to look past Start before declaring
     /// the turn empty.
     #[tokio::test]
-    async fn is_empty_turn_returns_true_when_only_lifecycle_events() {
+    async fn summarize_turn_is_empty_when_only_lifecycle_events() {
         let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
         let mut rx = tx.subscribe();
         tx.send(AgentStreamEvent::Start(StartEventData {
@@ -650,13 +688,15 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(super::is_empty_turn(&mut rx));
+        let summary = super::summarize_turn(&mut rx);
+        assert!(summary.is_empty());
+        assert!(summary.should_probe_stderr());
     }
 
     /// A single Text chunk is enough to mark the turn non-empty,
     /// even when sandwiched between lifecycle events.
     #[tokio::test]
-    async fn is_empty_turn_returns_false_when_text_emitted() {
+    async fn summarize_turn_records_rendered_text() {
         let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
         let mut rx = tx.subscribe();
         tx.send(AgentStreamEvent::Start(StartEventData::default())).unwrap();
@@ -664,13 +704,29 @@ mod tests {
             .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
 
-        assert!(!super::is_empty_turn(&mut rx));
+        let summary = super::summarize_turn(&mut rx);
+        assert!(summary.saw_rendered_content);
+        assert!(!summary.is_empty());
+        assert!(!summary.should_probe_stderr());
     }
 
-    /// Tool calls also count as visible output — even if the model
-    /// produced no Text, executing a tool means the turn was not blank.
     #[tokio::test]
-    async fn is_empty_turn_returns_false_when_tool_call_emitted() {
+    async fn summarize_turn_ignores_empty_text_chunks() {
+        let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
+        let mut rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Start(StartEventData::default())).unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData { content: String::new() }))
+            .unwrap();
+
+        let summary = super::summarize_turn(&mut rx);
+        assert!(summary.is_empty());
+        assert!(summary.should_probe_stderr());
+    }
+
+    /// Tool calls make the turn non-empty without claiming rendered content,
+    /// so valid tool-only turns finish normally while stderr is still checked.
+    #[tokio::test]
+    async fn summarize_turn_preserves_tool_only_turn_and_still_probes_stderr() {
         let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
         let mut rx = tx.subscribe();
         tx.send(AgentStreamEvent::Start(StartEventData::default())).unwrap();
@@ -685,14 +741,24 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(!super::is_empty_turn(&mut rx));
+        let summary = super::summarize_turn(&mut rx);
+        assert!(!summary.saw_rendered_content);
+        assert!(summary.saw_tool_or_side_effect);
+        assert!(!summary.is_empty(), "valid tool-only turns are not blank");
+        assert!(
+            summary.should_probe_stderr(),
+            "tool-only turns still need real failure detection"
+        );
+
+        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, summary.is_empty(), None);
+        assert!(matches!(outcome, super::PromptOutcome::Completed { .. }));
     }
 
     /// Thinking-only output (no final reply) still counts: the user
     /// saw something happen, even though the model didn't commit
     /// to a response. We don't want to double-up the diagnostic.
     #[tokio::test]
-    async fn is_empty_turn_returns_false_when_only_thinking_emitted() {
+    async fn summarize_turn_records_rendered_thinking() {
         let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
         let mut rx = tx.subscribe();
         tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
@@ -703,7 +769,10 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(!super::is_empty_turn(&mut rx));
+        let summary = super::summarize_turn(&mut rx);
+        assert!(summary.saw_rendered_content);
+        assert!(!summary.is_empty());
+        assert!(!summary.should_probe_stderr());
     }
 
     /// Each empty-finish stop reason maps to a stable tip code so the UI can
@@ -833,5 +902,23 @@ mod tests {
         assert_eq!(error.code, Some(AgentErrorCode::UserLlmProviderBillingRequired));
         assert_eq!(error.retryable, Some(false));
         assert_eq!(error.feedback_recommended, Some(false));
+    }
+
+    #[tokio::test]
+    async fn stderr_failure_can_arrive_after_prompt_completion() {
+        let mut tails =
+            std::collections::VecDeque::from([String::new(), "ERROR provider: HTTP 402 billing required".to_owned()]);
+
+        let detail = super::wait_for_stderr_error_detail(|| {
+            let tail = tails.pop_front().unwrap_or_default();
+            async move { tail }
+        })
+        .await
+        .expect("the delayed provider failure should be observed inside the settle window");
+
+        assert_eq!(detail, "HTTP 402 billing required");
+        let error = super::classify_empty_turn_stderr_error(&detail);
+        assert_eq!(error.code, Some(AgentErrorCode::UserLlmProviderBillingRequired));
+        assert_eq!(error.retryable, Some(false));
     }
 }
