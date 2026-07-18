@@ -17,9 +17,11 @@ use super::tool_call::{
 };
 use super::{AgentStreamEvent, TextEventData};
 
-const INTERNAL_HERMES_STEER_ACK_PREFIXES: [&str; 2] = [
+const INTERNAL_HERMES_STEER_ACK_PREFIXES: [&str; 4] = [
     "⏩ Steer queued for the active turn:",
     "No active turn — queued for the next turn.",
+    "Correction accepted for the active turn:",
+    "No active turn - correction queued as the next turn.",
 ];
 
 fn is_internal_hermes_steer_ack(text: &str) -> bool {
@@ -36,7 +38,8 @@ pub(crate) fn session_notification_to_events(notif: &SessionNotification) -> Vec
     match &notif.update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = &chunk.content {
-                // Hermes acknowledges the concurrent `/steer` control prompt
+                // Hermes acknowledges concurrent `/steer` and `/correct`
+                // control prompts
                 // through the ordinary assistant stream. The correction is
                 // already persisted as a user message by the conversation
                 // service, so exposing this transport receipt would corrupt

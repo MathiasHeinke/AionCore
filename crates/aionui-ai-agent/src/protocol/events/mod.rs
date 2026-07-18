@@ -288,6 +288,8 @@ mod tests {
         for receipt in [
             "⏩ Steer queued for the active turn: use the corrected figure",
             "No active turn — queued for the next turn. (1 queued)",
+            "Correction accepted for the active turn: use the corrected figure",
+            "No active turn - correction queued as the next turn.",
         ] {
             let notif: SessionNotification = serde_json::from_value(json!({
                 "sessionId": "sess-1",

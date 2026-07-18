@@ -855,8 +855,8 @@ impl AcpAgentManager {
     /// Deliver a correction to Hermes while its ordinary prompt is still running.
     ///
     /// This deliberately does not take `session_lock`: the active prompt owns
-    /// that lock until it finishes, while Hermes' `/steer` command is designed
-    /// to arrive concurrently and inject guidance after the current tool batch.
+    /// that lock until it finishes, while Hermes' internal `/correct` command
+    /// interrupts that prompt and schedules the correction as the next turn.
     pub async fn steer_active_turn(&self, content: &str) -> Result<(), AgentError> {
         if self.backend() != Some("hermes") {
             return Err(AgentError::bad_request(
@@ -885,7 +885,7 @@ impl AcpAgentManager {
         self.protocol
             .prompt(PromptRequest::new(
                 SessionId::new(session_id),
-                vec![ContentBlock::from(format!("/steer {content}"))],
+                vec![ContentBlock::from(format!("/correct {content}"))],
             ))
             .await?;
         self.runtime.bump_activity();
