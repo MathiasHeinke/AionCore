@@ -882,15 +882,32 @@ impl AcpAgentManager {
                 .ok_or_else(|| AgentError::conflict("Hermes session has no active session id"))?
         };
 
+        let correction = normalize_hermes_correction_content(content)?;
         self.protocol
             .prompt(PromptRequest::new(
                 SessionId::new(session_id),
-                vec![ContentBlock::from(format!("/correct {content}"))],
+                vec![ContentBlock::from(format!("/correct {correction}"))],
             ))
             .await?;
         self.runtime.bump_activity();
         Ok(())
     }
+}
+
+fn normalize_hermes_correction_content(content: &str) -> Result<&str, AgentError> {
+    let trimmed = content.trim();
+    let correction = match trimmed.strip_prefix("/steer") {
+        Some(rest) if rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace) => rest.trim(),
+        _ => trimmed,
+    };
+
+    if correction.is_empty() {
+        return Err(AgentError::bad_request(
+            "Active-turn correction content cannot be empty",
+        ));
+    }
+
+    Ok(correction)
 }
 
 impl AcpAgentManager {
@@ -1294,7 +1311,7 @@ impl AcpAgentManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_status_parts, user_facing_message};
+    use super::{exit_status_parts, normalize_hermes_correction_content, user_facing_message};
     use crate::agent_runtime::AgentRuntime;
     use crate::error::AgentError;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
@@ -1343,6 +1360,23 @@ mod tests {
     #[test]
     fn exit_status_parts_handles_missing_status() {
         assert_eq!(exit_status_parts(None), (None, None));
+    }
+
+    #[test]
+    fn hermes_correction_normalizes_ui_command_without_touching_plain_text() {
+        assert_eq!(
+            normalize_hermes_correction_content(" /steer  use the corrected segment ").unwrap(),
+            "use the corrected segment"
+        );
+        assert_eq!(
+            normalize_hermes_correction_content("use the corrected segment").unwrap(),
+            "use the corrected segment"
+        );
+        assert_eq!(
+            normalize_hermes_correction_content("/steering remains literal").unwrap(),
+            "/steering remains literal"
+        );
+        assert!(normalize_hermes_correction_content("/steer   ").is_err());
     }
 
     #[cfg(unix)]
