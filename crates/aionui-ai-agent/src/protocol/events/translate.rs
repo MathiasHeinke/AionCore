@@ -17,11 +17,13 @@ use super::tool_call::{
 };
 use super::{AgentStreamEvent, TextEventData};
 
-const INTERNAL_HERMES_STEER_ACK_PREFIXES: [&str; 4] = [
+const INTERNAL_HERMES_STEER_ACK_PREFIXES: [&str; 6] = [
     "⏩ Steer queued for the active turn:",
     "No active turn — queued for the next turn.",
     "Correction accepted for the active turn:",
     "No active turn - correction queued as the next turn.",
+    "Correction queued after active-turn interruption failed.",
+    "Correction failed:",
 ];
 
 fn is_internal_hermes_steer_ack(text: &str) -> bool {
