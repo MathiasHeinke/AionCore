@@ -22,7 +22,7 @@ use aionui_api_types::{
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
-    SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
+    SendMessageRequest, SteerConversationRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
@@ -2067,6 +2067,7 @@ struct MockAgent {
     set_config_option_calls: Arc<Mutex<Vec<(String, String)>>>,
     set_config_option_error: Arc<Mutex<Option<AgentError>>>,
     set_config_option_response: Arc<Mutex<Option<SetConfigOptionResponse>>>,
+    steer_calls: Arc<Mutex<Vec<String>>>,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
     allow_direct_confirm: bool,
@@ -2106,6 +2107,7 @@ impl MockAgent {
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
+            steer_calls: Arc::new(Mutex::new(Vec::new())),
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -2125,6 +2127,7 @@ impl MockAgent {
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
+            steer_calls: Arc::new(Mutex::new(Vec::new())),
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -2144,6 +2147,7 @@ impl MockAgent {
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
+            steer_calls: Arc::new(Mutex::new(Vec::new())),
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: true,
@@ -2164,6 +2168,10 @@ impl MockAgent {
     fn with_set_config_option_error(self, error: AgentError) -> Self {
         *self.set_config_option_error.lock().unwrap() = Some(error);
         self
+    }
+
+    fn steer_calls(&self) -> Vec<String> {
+        self.steer_calls.lock().unwrap().clone()
     }
 }
 
@@ -2205,6 +2213,11 @@ impl IAgentTask for MockAgent {
 
 #[async_trait::async_trait]
 impl IMockAgent for MockAgent {
+    async fn steer_active_turn(&self, content: &str) -> Result<(), AgentError> {
+        self.steer_calls.lock().unwrap().push(content.to_owned());
+        Ok(())
+    }
+
     fn get_confirmations(&self) -> Vec<Confirmation> {
         self.confirmations.lock().unwrap().clone()
     }
@@ -4722,6 +4735,87 @@ async fn send_message_auto_replay_stops_after_second_retryable_failure() {
     assert_eq!(tips.len(), 1, "second failure is final and visible");
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
     assert_eq!(content["content"], "temporary provider failure two");
+}
+
+// ── active-turn steer tests ────────────────────────────────────────
+
+#[tokio::test]
+async fn steer_active_turn_is_idempotent_and_persists_once() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(MockAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let _turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-1").unwrap();
+    broadcaster.take_events();
+
+    let request = SteerConversationRequest {
+        turn_id: "turn-1".into(),
+        request_id: "request-1".into(),
+        content: "/steer Correct this result".into(),
+    };
+    let first = svc
+        .steer_active_turn("user_1", &conv.id, request.clone(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    let duplicate = svc
+        .steer_active_turn("user_1", &conv.id, request, &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    assert!(first.accepted);
+    assert!(!duplicate.accepted);
+    assert_eq!(duplicate.msg_id, first.msg_id);
+    assert_eq!(agent.steer_calls(), vec!["Correct this result"]);
+
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    assert_eq!(messages.len(), 1);
+    let content: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+    assert_eq!(content["content"], "Correct this result");
+    assert_eq!(content["control_mode"], "steer");
+    assert_eq!(content["turn_id"], "turn-1");
+    assert_eq!(content["request_id"], "request-1");
+
+    let user_events: Vec<_> = broadcaster
+        .take_events()
+        .into_iter()
+        .filter(|event| event.name == "message.userCreated")
+        .collect();
+    assert_eq!(user_events.len(), 1);
+    assert_eq!(user_events[0].data["msg_id"], first.msg_id);
+    assert_eq!(user_events[0].data["control_mode"], "steer");
+}
+
+#[tokio::test]
+async fn steer_active_turn_rejects_stale_turn_without_side_effects() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(MockAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let _turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-current").unwrap();
+    broadcaster.take_events();
+
+    let error = svc
+        .steer_active_turn(
+            "user_1",
+            &conv.id,
+            SteerConversationRequest {
+                turn_id: "turn-stale".into(),
+                request_id: "request-stale".into(),
+                content: "Do not send this".into(),
+            },
+            &task_mgr_dyn,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    assert!(agent.steer_calls().is_empty());
+    assert!(repo_messages_asc(&repo, &conv.id, 20).await.is_empty());
+    assert!(broadcaster.take_events().is_empty());
 }
 
 // ── stop_stream tests ───────────────────────────────────────────

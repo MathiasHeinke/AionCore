@@ -135,6 +135,11 @@ pub trait IMockAgent: IAgentTask {
             answer: None,
         })
     }
+    async fn steer_active_turn(&self, _content: &str) -> Result<(), AgentError> {
+        Err(AgentError::bad_request(
+            "Active-turn steering is not supported for this mock",
+        ))
+    }
 }
 
 /// Concrete, closed-set dispatcher for runnable agent variants.
@@ -218,6 +223,18 @@ impl AgentInstance {
     /// Cancel the current streaming response without killing the agent.
     pub async fn cancel(&self) -> Result<(), AgentError> {
         self.as_task().cancel().await
+    }
+
+    /// Inject a correction into the currently running Hermes turn.
+    pub async fn steer_active_turn(&self, content: &str) -> Result<(), AgentError> {
+        match self {
+            Self::Acp(m) => m.steer_active_turn(content).await,
+            Self::Aionrs(_) => Err(AgentError::bad_request(
+                "Active-turn steering is only supported by the Hermes ACP backend",
+            )),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.steer_active_turn(content).await,
+        }
     }
 
     /// Terminate the agent process.

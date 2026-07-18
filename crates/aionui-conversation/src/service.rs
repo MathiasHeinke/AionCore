@@ -11,7 +11,7 @@ use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::response_middleware::ICronService;
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
-use crate::runtime_state::ConversationRuntimeStateService;
+use crate::runtime_state::{ConversationRuntimeStateService, SteerRequestRegistration};
 use aionui_api_types::{
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
@@ -19,7 +19,8 @@ use aionui_api_types::{
     ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
     SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
-    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    SteerConversationRequest, SteerConversationResponse, TeamSessionBinding, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -55,6 +56,8 @@ use std::sync::RwLock;
 
 pub(crate) const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
 const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_STEER_CONTENT_BYTES: usize = 32 * 1024;
+const MAX_STEER_CORRELATION_ID_BYTES: usize = 128;
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
@@ -2646,6 +2649,154 @@ impl ConversationService {
         })
     }
 
+    /// Inject a correction into the exact active Hermes turn.
+    ///
+    /// Unlike `send_message`, this path never claims a second turn. The
+    /// client-supplied request id is registered against the active turn before
+    /// crossing the ACP boundary so transport retries cannot inject twice.
+    #[tracing::instrument(
+        skip_all,
+        fields(user_id = %user_id, conversation_id = %conversation_id, turn_id = %req.turn_id, request_id = %req.request_id)
+    )]
+    pub async fn steer_active_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SteerConversationRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<SteerConversationResponse, ConversationError> {
+        let raw_content = req.content.trim();
+        let content = raw_content
+            .strip_prefix("/steer")
+            .filter(|rest| rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
+            .map(str::trim)
+            .unwrap_or(raw_content);
+        if content.is_empty() {
+            return Err(ConversationError::bad_request("Correction content must not be empty"));
+        }
+        if content.len() > MAX_STEER_CONTENT_BYTES {
+            return Err(ConversationError::bad_request(format!(
+                "Correction content exceeds {MAX_STEER_CONTENT_BYTES} bytes"
+            )));
+        }
+        if !is_valid_steer_correlation_id(&req.turn_id) {
+            return Err(ConversationError::bad_request("Invalid correction turn id"));
+        }
+        if !is_valid_steer_correlation_id(&req.request_id) {
+            return Err(ConversationError::bad_request("Invalid correction request id"));
+        }
+
+        let row = self
+            .conversation_repo
+            .get(conversation_id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if let Some(team_id) = team_id_from_extra(&row.extra) {
+            info!(
+                conversation_id,
+                team_id, "Active-turn steer rejected for team-owned conversation"
+            );
+            return Err(ConversationError::Forbidden {
+                reason: "Team-owned conversations must be controlled through Team API".into(),
+            });
+        }
+        reject_deprecated_runtime_row(&row)?;
+
+        let proposed_msg_id = Self::mint_msg_id();
+        let registration = self.runtime_state.register_steer_request(
+            conversation_id,
+            &req.turn_id,
+            &req.request_id,
+            &proposed_msg_id,
+        )?;
+        let msg_id = match registration {
+            SteerRequestRegistration::Duplicate { msg_id } => {
+                info!(conversation_id, turn_id = %req.turn_id, request_id = %req.request_id, "Duplicate steer request ignored");
+                return Ok(SteerConversationResponse {
+                    msg_id,
+                    turn_id: req.turn_id,
+                    accepted: false,
+                    runtime: self.runtime_summary_for(conversation_id).await,
+                });
+            }
+            SteerRequestRegistration::Accepted { msg_id } => msg_id,
+        };
+
+        let Some(agent) = task_manager.get_task(conversation_id) else {
+            self.runtime_state
+                .forget_steer_request(conversation_id, &req.request_id, &msg_id);
+            return Err(ConversationError::ActiveAgentNotFound {
+                conversation_id: conversation_id.to_owned(),
+            });
+        };
+        if let Err(error) = agent.steer_active_turn(content).await {
+            self.runtime_state
+                .forget_steer_request(conversation_id, &req.request_id, &msg_id);
+            return Err(error.into());
+        }
+        self.runtime_state
+            .mark_steer_request_accepted(conversation_id, &req.request_id, &msg_id);
+
+        let created_at = now_ms();
+        let user_message = MessageRow {
+            id: msg_id.clone(),
+            conversation_id: conversation_id.to_owned(),
+            msg_id: Some(msg_id.clone()),
+            r#type: "text".into(),
+            content: serde_json::json!({
+                "content": content,
+                "control_mode": "steer",
+                "turn_id": req.turn_id,
+                "request_id": req.request_id,
+            })
+            .to_string(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at,
+        };
+        if self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::UserMessage)
+        {
+            match self.conversation_repo.insert_message(&user_message).await {
+                Ok(()) => {
+                    self.broadcaster.broadcast(WebSocketMessage::new(
+                        "message.userCreated",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "msg_id": &msg_id,
+                            "content": content,
+                            "position": "right",
+                            "status": "finish",
+                            "hidden": false,
+                            "created_at": created_at,
+                            "control_mode": "steer",
+                            "turn_id": &req.turn_id,
+                        }),
+                    ));
+                }
+                Err(error) => {
+                    // Hermes already accepted the correction. Returning an
+                    // error here could make a client retry with a new request
+                    // id and inject it twice, so retain idempotency and log.
+                    warn!(conversation_id, msg_id, error = %ErrorChain(&error), "Steer accepted but message persistence failed");
+                }
+            }
+        }
+
+        info!(conversation_id, turn_id = %req.turn_id, request_id = %req.request_id, msg_id, "Active Hermes turn steered");
+        Ok(SteerConversationResponse {
+            msg_id,
+            turn_id: req.turn_id,
+            accepted: true,
+            runtime: self.runtime_summary_for(conversation_id).await,
+        })
+    }
+
     pub(crate) async fn persist_and_broadcast_send_failure_tip(
         &self,
         conversation_id: &str,
@@ -2842,6 +2993,14 @@ impl ConversationService {
         debug!("Agent warmed up");
         Ok(())
     }
+}
+
+fn is_valid_steer_correlation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_STEER_CORRELATION_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 // ── Internal Helpers ────────────────────────────────────────────────

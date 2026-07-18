@@ -17,6 +17,17 @@ use super::tool_call::{
 };
 use super::{AgentStreamEvent, TextEventData};
 
+const INTERNAL_HERMES_STEER_ACK_PREFIXES: [&str; 2] = [
+    "⏩ Steer queued for the active turn:",
+    "No active turn — queued for the next turn.",
+];
+
+fn is_internal_hermes_steer_ack(text: &str) -> bool {
+    INTERNAL_HERMES_STEER_ACK_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
 /// Convert an SDK [`SessionNotification`] into zero or more [`AgentStreamEvent`]s.
 pub(crate) fn session_notification_to_events(notif: &SessionNotification) -> Vec<AgentStreamEvent> {
     let session_id = notif.session_id.to_string();
@@ -25,6 +36,14 @@ pub(crate) fn session_notification_to_events(notif: &SessionNotification) -> Vec
     match &notif.update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = &chunk.content {
+                // Hermes acknowledges the concurrent `/steer` control prompt
+                // through the ordinary assistant stream. The correction is
+                // already persisted as a user message by the conversation
+                // service, so exposing this transport receipt would corrupt
+                // the in-flight assistant response.
+                if is_internal_hermes_steer_ack(&text.text) {
+                    return events;
+                }
                 events.push(AgentStreamEvent::Text(TextEventData {
                     content: text.text.clone(),
                 }));

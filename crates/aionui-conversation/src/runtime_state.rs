@@ -19,6 +19,7 @@ pub struct ConversationRuntimeStateService {
 #[derive(Debug, Default)]
 struct ConversationRuntimeState {
     active_turns: HashMap<String, String>,
+    accepted_steer_requests: HashMap<String, HashMap<String, RegisteredSteerRequest>>,
     deleting_conversations: HashSet<String>,
     cancelling_conversations: HashSet<String>,
     shutting_down: bool,
@@ -38,6 +39,26 @@ pub enum RuntimeLifecycleState {
     Deleting,
     Cancelling,
     ShuttingDown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SteerRequestRegistration {
+    Accepted { msg_id: String },
+    Duplicate { msg_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegisteredSteerRequest {
+    Pending { msg_id: String },
+    Accepted { msg_id: String },
+}
+
+impl RegisteredSteerRequest {
+    fn msg_id(&self) -> &str {
+        match self {
+            Self::Pending { msg_id } | Self::Accepted { msg_id } => msg_id,
+        }
+    }
 }
 
 impl ConversationRuntimeStateService {
@@ -112,6 +133,119 @@ impl ConversationRuntimeStateService {
             .lock()
             .ok()
             .and_then(|state| state.active_turns.get(conversation_id).cloned())
+    }
+
+    pub fn register_steer_request(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        request_id: &str,
+        proposed_msg_id: &str,
+    ) -> Result<SteerRequestRegistration, ConversationError> {
+        let mut state = self.state.lock().map_err(|_| {
+            warn!(
+                conversation_id,
+                turn_id, "conversation runtime state lock poisoned while registering steer request"
+            );
+            ConversationError::internal("conversation runtime state lock poisoned")
+        })?;
+
+        if state.shutting_down {
+            return Err(ConversationError::Busy {
+                reason: "conversation runtime is shutting down".into(),
+            });
+        }
+        if state.deleting_conversations.contains(conversation_id) {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} is being deleted"),
+            });
+        }
+        if state.cancelling_conversations.contains(conversation_id) {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} is being cancelled"),
+            });
+        }
+
+        match state.active_turns.get(conversation_id) {
+            Some(active_turn_id) if active_turn_id == turn_id => {}
+            Some(active_turn_id) => {
+                return Err(ConversationError::Busy {
+                    reason: format!("active turn changed from {turn_id} to {active_turn_id}; correction was not sent"),
+                });
+            }
+            None => {
+                return Err(ConversationError::Busy {
+                    reason: "the requested turn is no longer running; correction was not sent".into(),
+                });
+            }
+        }
+
+        let requests = state
+            .accepted_steer_requests
+            .entry(conversation_id.to_owned())
+            .or_default();
+        if let Some(request) = requests.get(request_id) {
+            return match request {
+                RegisteredSteerRequest::Pending { .. } => Err(ConversationError::Busy {
+                    reason: "the same correction request is still being processed".into(),
+                }),
+                RegisteredSteerRequest::Accepted { msg_id } => {
+                    Ok(SteerRequestRegistration::Duplicate { msg_id: msg_id.clone() })
+                }
+            };
+        }
+        requests.insert(
+            request_id.to_owned(),
+            RegisteredSteerRequest::Pending {
+                msg_id: proposed_msg_id.to_owned(),
+            },
+        );
+        Ok(SteerRequestRegistration::Accepted {
+            msg_id: proposed_msg_id.to_owned(),
+        })
+    }
+
+    pub fn mark_steer_request_accepted(&self, conversation_id: &str, request_id: &str, msg_id: &str) {
+        let Ok(mut state) = self.state.lock() else {
+            warn!(
+                conversation_id,
+                request_id, "conversation runtime state lock poisoned while completing steer"
+            );
+            return;
+        };
+        let Some(request) = state
+            .accepted_steer_requests
+            .get_mut(conversation_id)
+            .and_then(|requests| requests.get_mut(request_id))
+        else {
+            return;
+        };
+        if request.msg_id() == msg_id {
+            *request = RegisteredSteerRequest::Accepted {
+                msg_id: msg_id.to_owned(),
+            };
+        }
+    }
+
+    pub fn forget_steer_request(&self, conversation_id: &str, request_id: &str, msg_id: &str) {
+        let Ok(mut state) = self.state.lock() else {
+            warn!(
+                conversation_id,
+                request_id, "conversation runtime state lock poisoned while forgetting steer"
+            );
+            return;
+        };
+        let remove_conversation = if let Some(requests) = state.accepted_steer_requests.get_mut(conversation_id) {
+            if requests.get(request_id).map(RegisteredSteerRequest::msg_id) == Some(msg_id) {
+                requests.remove(request_id);
+            }
+            requests.is_empty()
+        } else {
+            false
+        };
+        if remove_conversation {
+            state.accepted_steer_requests.remove(conversation_id);
+        }
     }
 
     pub async fn wait_until_unclaimed(&self, conversation_id: &str) {
@@ -291,6 +425,7 @@ impl ConversationRuntimeStateService {
                 let removed = match state.active_turns.get(conversation_id) {
                     Some(active_turn_id) if active_turn_id == turn_id => {
                         state.active_turns.remove(conversation_id);
+                        state.accepted_steer_requests.remove(conversation_id);
                         true
                     }
                     Some(active_turn_id) => {
@@ -415,6 +550,61 @@ mod tests {
             .try_claim_turn("conv-1", "turn-2")
             .expect_err("second claim should fail");
         assert!(err.to_string().contains("already running"));
+    }
+
+    #[test]
+    fn steer_registration_is_bound_to_active_turn_and_idempotent() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect("claim should be created");
+
+        assert_eq!(
+            state
+                .register_steer_request("conv-1", "turn-1", "request-1", "msg-1")
+                .unwrap(),
+            SteerRequestRegistration::Accepted { msg_id: "msg-1".into() }
+        );
+        let err = state
+            .register_steer_request("conv-1", "turn-1", "request-1", "msg-other")
+            .unwrap_err();
+        assert!(err.to_string().contains("still being processed"));
+
+        state.mark_steer_request_accepted("conv-1", "request-1", "msg-1");
+        assert_eq!(
+            state
+                .register_steer_request("conv-1", "turn-1", "request-1", "msg-other")
+                .unwrap(),
+            SteerRequestRegistration::Duplicate { msg_id: "msg-1".into() }
+        );
+    }
+
+    #[test]
+    fn steer_registration_rejects_stale_turn_and_clears_after_release() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let mut claim = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect("claim should be created");
+
+        let err = state
+            .register_steer_request("conv-1", "turn-stale", "request-1", "msg-1")
+            .unwrap_err();
+        assert!(err.to_string().contains("active turn changed"));
+
+        state
+            .register_steer_request("conv-1", "turn-1", "request-1", "msg-1")
+            .unwrap();
+        assert!(!claim.release());
+
+        let _next_claim = state
+            .try_claim_turn("conv-1", "turn-2")
+            .expect("next turn should be claimable");
+        assert_eq!(
+            state
+                .register_steer_request("conv-1", "turn-2", "request-1", "msg-2")
+                .unwrap(),
+            SteerRequestRegistration::Accepted { msg_id: "msg-2".into() }
+        );
     }
 
     #[test]

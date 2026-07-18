@@ -15,8 +15,9 @@ use crate::registry::CatalogSender;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::{
-    AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionModelState,
-    SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
+    AvailableCommand, CancelNotification, ContentBlock, PromptRequest, SessionConfigOptionCategory, SessionId,
+    SessionModelState, SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    SetSessionModelRequest, UsageUpdate,
 };
 use aionui_api_types::{
     AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse,
@@ -849,6 +850,46 @@ impl AcpAgentManager {
     /// Whether the configured agent supports side questions.
     pub fn supports_side_question(&self) -> bool {
         self.params.metadata.behavior_policy.supports_side_question
+    }
+
+    /// Deliver a correction to Hermes while its ordinary prompt is still running.
+    ///
+    /// This deliberately does not take `session_lock`: the active prompt owns
+    /// that lock until it finishes, while Hermes' `/steer` command is designed
+    /// to arrive concurrently and inject guidance after the current tool batch.
+    pub async fn steer_active_turn(&self, content: &str) -> Result<(), AgentError> {
+        if self.backend() != Some("hermes") {
+            return Err(AgentError::bad_request(
+                "Active-turn steering is only supported by the Hermes ACP backend",
+            ));
+        }
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(AgentError::bad_request("Correction content must not be empty"));
+        }
+        self.ensure_protocol_connected_for_operation("steer_active_turn")?;
+
+        let session_id = {
+            let session = self.session.read().await;
+            if !session.is_opened() {
+                return Err(AgentError::conflict(
+                    "Hermes session is not ready for active-turn steering",
+                ));
+            }
+            session
+                .session_id()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| AgentError::conflict("Hermes session has no active session id"))?
+        };
+
+        self.protocol
+            .prompt(PromptRequest::new(
+                SessionId::new(session_id),
+                vec![ContentBlock::from(format!("/steer {content}"))],
+            ))
+            .await?;
+        self.runtime.bump_activity();
+        Ok(())
     }
 }
 

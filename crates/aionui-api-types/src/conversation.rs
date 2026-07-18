@@ -105,6 +105,26 @@ pub struct SendMessageResponse {
     pub runtime: ConversationRuntimeSummary,
 }
 
+/// Body for `POST /api/conversations/:id/steer`.
+///
+/// `turn_id` binds the correction to the exact active turn. `request_id`
+/// makes retries idempotent so a transport retry cannot steer Hermes twice.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SteerConversationRequest {
+    pub turn_id: String,
+    pub request_id: String,
+    pub content: String,
+}
+
+/// Response for `POST /api/conversations/:id/steer`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteerConversationResponse {
+    pub msg_id: String,
+    pub turn_id: String,
+    pub accepted: bool,
+    pub runtime: ConversationRuntimeSummary,
+}
+
 /// Body for `POST /api/conversations/:id/cancel`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CancelConversationRequest {

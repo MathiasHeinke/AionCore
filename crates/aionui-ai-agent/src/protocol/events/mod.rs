@@ -284,6 +284,46 @@ mod tests {
     }
 
     #[test]
+    fn internal_hermes_steer_receipts_do_not_reach_the_assistant_stream() {
+        for receipt in [
+            "⏩ Steer queued for the active turn: use the corrected figure",
+            "No active turn — queued for the next turn. (1 queued)",
+        ] {
+            let notif: SessionNotification = serde_json::from_value(json!({
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": receipt }
+                }
+            }))
+            .unwrap();
+
+            assert!(session_notification_to_events(&notif).is_empty());
+        }
+    }
+
+    #[test]
+    fn ordinary_agent_message_that_mentions_steering_still_streams() {
+        let notif: SessionNotification = serde_json::from_value(json!({
+            "sessionId": "sess-1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "I applied the steering guidance to the draft."
+                }
+            }
+        }))
+        .unwrap();
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(json["type"], "content");
+        assert_eq!(json["data"]["content"], "I applied the steering guidance to the draft.");
+    }
+
+    #[test]
     fn session_tool_call_maps_to_acp_tool_call_event() {
         let notif = SessionNotification::new(
             "sess-1",

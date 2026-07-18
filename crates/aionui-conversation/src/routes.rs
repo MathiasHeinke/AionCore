@@ -11,8 +11,8 @@ use aionui_api_types::{
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SteerConversationRequest,
+    SteerConversationResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -100,6 +100,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
+        .route("/api/conversations/{id}/steer", post(steer))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
@@ -249,6 +250,21 @@ async fn send_msg(
     let response = state
         .service
         .send_message(&user.id, &id, req, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+}
+
+async fn steer(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<SteerConversationRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<SteerConversationResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
+        .service
+        .steer_active_turn(&user.id, &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
