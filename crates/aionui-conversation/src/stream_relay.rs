@@ -1,5 +1,11 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
+use aionui_ai_agent::protocol::events::tool_call::{
+    AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
+};
 use aionui_ai_agent::protocol::events::{ErrorEventData, TipType};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
@@ -246,6 +252,8 @@ impl StreamRelay {
         let mut send_error_done = send_error_rx.is_none();
         let mut pending_send_error: Option<AgentSendError> = None;
         let mut attempt = TurnAttemptSummary::default();
+        let mut open_acp_tool_calls: HashMap<String, AcpToolCallEventData> = HashMap::new();
+        let mut terminal_acp_tool_call_ids: HashSet<String> = HashSet::new();
 
         loop {
             let recv_result = if send_error_done {
@@ -445,6 +453,7 @@ impl StreamRelay {
                                     },
                                 )
                                 .await;
+                                self.fail_open_acp_tool_calls(&mut open_acp_tool_calls).await;
                             }
                             self.forward_to_websocket(&event);
                             if let AgentStreamEvent::Error(data) = &event {
@@ -485,6 +494,17 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&event);
                             self.adapter.persist_acp_tool_call(data).await;
+                            match data.update.status {
+                                Some(AcpToolCallStatus::Completed | AcpToolCallStatus::Failed) => {
+                                    open_acp_tool_calls.remove(&data.update.tool_call_id);
+                                    terminal_acp_tool_call_ids.insert(data.update.tool_call_id.clone());
+                                }
+                                Some(AcpToolCallStatus::Pending | AcpToolCallStatus::InProgress) | None => {
+                                    if !terminal_acp_tool_call_ids.contains(&data.update.tool_call_id) {
+                                        open_acp_tool_calls.insert(data.update.tool_call_id.clone(), data.clone());
+                                    }
+                                }
+                            }
                         }
                         AgentStreamEvent::ToolGroup(entries) => {
                             attempt.saw_tool_or_side_effect = true;
@@ -529,6 +549,7 @@ impl StreamRelay {
                         self.complete_active_thinking(&mut active_thinking).await;
                         self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                             .await;
+                        self.fail_open_acp_tool_calls(&mut open_acp_tool_calls).await;
                     }
                     // Channel closed without finish/error — still finalize
                     let mut outcome = if deleting {
@@ -568,6 +589,16 @@ impl StreamRelay {
         self.runtime_state
             .as_ref()
             .is_some_and(|state| state.is_deleting(&self.conversation_id))
+    }
+
+    async fn fail_open_acp_tool_calls(&self, open_tool_calls: &mut HashMap<String, AcpToolCallEventData>) {
+        for (_, mut data) in open_tool_calls.drain() {
+            data.update.session_update = AcpToolCallSessionUpdateKind::ToolCallUpdate;
+            data.update.status = Some(AcpToolCallStatus::Failed);
+            let event = AgentStreamEvent::AcpToolCall(data.clone());
+            self.forward_to_websocket(&event);
+            self.adapter.persist_acp_tool_call(&data).await;
+        }
     }
 
     fn event_kind(event: &AgentStreamEvent) -> &'static str {
@@ -1832,6 +1863,11 @@ mod tests {
         assert_eq!(msg.status.as_deref(), Some("work"));
 
         let updates = repo.take_updates();
+        assert_eq!(
+            updates.len(),
+            1,
+            "completed ACP calls must not be failed again at turn end"
+        );
         let acp_update = updates.iter().find(|(id, _)| id == "atc-001");
         assert!(acp_update.is_some());
         let (_, upd) = acp_update.unwrap();
@@ -1858,6 +1894,116 @@ mod tests {
             update_obj.get("raw_output").is_some(),
             "raw_output must be present after merge"
         );
+    }
+
+    #[tokio::test]
+    async fn run_acp_tool_call_finish_fails_still_open_call() {
+        use aionui_ai_agent::protocol::events::tool_call::{
+            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallUpdateData,
+        };
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+            session_id: "sess-1".into(),
+            update: AcpToolCallUpdateData {
+                session_update: AcpToolCallSessionUpdateKind::ToolCall,
+                tool_call_id: "atc-open".into(),
+                status: Some(AcpToolCallStatus::InProgress),
+                title: Some("Bash".into()),
+                kind: None,
+                raw_input: Some(json!({"command": "sleep 120"})),
+                raw_output: None,
+                content: None,
+                locations: None,
+            },
+            meta: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let updates = repo.take_updates();
+        assert_eq!(updates.len(), 1);
+        let (_, update) = &updates[0];
+        assert_eq!(update.status, Some(Some("error".to_owned())));
+        let content: serde_json::Value = serde_json::from_str(update.content.as_deref().unwrap()).unwrap();
+        assert_eq!(content["update"]["status"], "failed");
+
+        let mut saw_failed_stream_update = false;
+        while let Ok(event) = ws_rx.try_recv() {
+            if event.name == "message.stream"
+                && event.data["type"] == "acp_tool_call"
+                && event.data["data"]["update"]["tool_call_id"] == "atc-open"
+                && event.data["data"]["update"]["status"] == "failed"
+            {
+                saw_failed_stream_update = true;
+            }
+        }
+        assert!(
+            saw_failed_stream_update,
+            "the live UI must receive the terminal tool status"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_acp_tool_call_channel_close_fails_still_open_call() {
+        use aionui_ai_agent::protocol::events::tool_call::{
+            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallUpdateData,
+        };
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+            session_id: "sess-1".into(),
+            update: AcpToolCallUpdateData {
+                session_update: AcpToolCallSessionUpdateKind::ToolCall,
+                tool_call_id: "atc-closed".into(),
+                status: Some(AcpToolCallStatus::Pending),
+                title: Some("Bash".into()),
+                kind: None,
+                raw_input: Some(json!({"command": "sleep 120"})),
+                raw_output: None,
+                content: None,
+                locations: None,
+            },
+            meta: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::ChannelClosed);
+
+        let updates = repo.take_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].1.status, Some(Some("error".to_owned())));
     }
 
     #[tokio::test]
