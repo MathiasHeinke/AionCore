@@ -56,6 +56,8 @@ use std::sync::RwLock;
 
 pub(crate) const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
 const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+const ACP_STEER_AGENT_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const ACP_STEER_AGENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_STEER_CONTENT_BYTES: usize = 32 * 1024;
 const MAX_STEER_CORRELATION_ID_BYTES: usize = 128;
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
@@ -2725,12 +2727,26 @@ impl ConversationService {
             SteerRequestRegistration::Accepted { msg_id } => msg_id,
         };
 
-        let Some(agent) = task_manager.get_task(conversation_id) else {
-            self.runtime_state
-                .forget_steer_request(conversation_id, &req.request_id, &msg_id);
-            return Err(ConversationError::ActiveAgentNotFound {
-                conversation_id: conversation_id.to_owned(),
-            });
+        let agent_wait_deadline = tokio::time::Instant::now() + ACP_STEER_AGENT_WAIT_TIMEOUT;
+        let agent = loop {
+            if self.runtime_state.active_turn_id_for(conversation_id).as_deref() != Some(req.turn_id.as_str()) {
+                self.runtime_state
+                    .forget_steer_request(conversation_id, &req.request_id, &msg_id);
+                return Err(ConversationError::Busy {
+                    reason: "the requested turn is no longer running; correction was not sent".into(),
+                });
+            }
+            if let Some(agent) = task_manager.get_task(conversation_id) {
+                break agent;
+            }
+            if tokio::time::Instant::now() >= agent_wait_deadline {
+                self.runtime_state
+                    .forget_steer_request(conversation_id, &req.request_id, &msg_id);
+                return Err(ConversationError::ActiveAgentNotFound {
+                    conversation_id: conversation_id.to_owned(),
+                });
+            }
+            tokio::time::sleep(ACP_STEER_AGENT_POLL_INTERVAL).await;
         };
         if let Err(error) = agent.steer_active_turn(content).await {
             self.runtime_state

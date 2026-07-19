@@ -4821,6 +4821,110 @@ async fn steer_active_turn_rejects_stale_turn_without_side_effects() {
 // ── stop_stream tests ───────────────────────────────────────────
 
 #[tokio::test]
+async fn steer_active_turn_waits_for_agent_registration() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(MockAgent::new(&conv.id));
+    let _turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-delayed").unwrap();
+    broadcaster.take_events();
+
+    let delayed_task_mgr = task_mgr.clone();
+    let delayed_conversation_id = conv.id.clone();
+    let delayed_agent = agent.clone();
+    let insert_agent = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        delayed_task_mgr.insert_agent(&delayed_conversation_id, AgentInstance::Mock(delayed_agent));
+    });
+
+    let response = svc
+        .steer_active_turn(
+            "user_1",
+            &conv.id,
+            SteerConversationRequest {
+                turn_id: "turn-delayed".into(),
+                request_id: "request-delayed".into(),
+                content: "Use the corrected direction".into(),
+            },
+            &task_mgr_dyn,
+        )
+        .await
+        .unwrap();
+    insert_agent.await.unwrap();
+
+    assert!(response.accepted);
+    assert_eq!(agent.steer_calls(), vec!["Use the corrected direction"]);
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(broadcaster.take_events().len(), 1);
+}
+
+#[tokio::test]
+async fn steer_active_turn_stops_waiting_when_turn_ends() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-ending").unwrap();
+    broadcaster.take_events();
+
+    let release_turn = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(turn_claim);
+    });
+    let error = svc
+        .steer_active_turn(
+            "user_1",
+            &conv.id,
+            SteerConversationRequest {
+                turn_id: "turn-ending".into(),
+                request_id: "request-ending".into(),
+                content: "Do not deliver after the turn ends".into(),
+            },
+            &task_mgr_dyn,
+        )
+        .await
+        .unwrap_err();
+    release_turn.await.unwrap();
+
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    assert!(repo_messages_asc(&repo, &conv.id, 20).await.is_empty());
+    assert!(broadcaster.take_events().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn steer_active_turn_timeout_allows_same_request_to_retry() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-timeout").unwrap();
+    let request = SteerConversationRequest {
+        turn_id: "turn-timeout".into(),
+        request_id: "request-timeout".into(),
+        content: "Retry this correction".into(),
+    };
+
+    let error = svc
+        .steer_active_turn("user_1", &conv.id, request.clone(), &task_mgr_dyn)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::ActiveAgentNotFound { .. }));
+
+    let agent = Arc::new(MockAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let response = svc
+        .steer_active_turn("user_1", &conv.id, request, &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    assert!(response.accepted);
+    assert_eq!(agent.steer_calls(), vec!["Retry this correction"]);
+    assert_eq!(repo_messages_asc(&repo, &conv.id, 20).await.len(), 1);
+}
+
+#[tokio::test]
 async fn stop_stream_with_active_agent() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
