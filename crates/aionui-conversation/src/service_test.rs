@@ -4893,6 +4893,42 @@ async fn steer_active_turn_stops_waiting_when_turn_ends() {
     assert!(broadcaster.take_events().is_empty());
 }
 
+#[tokio::test]
+async fn steer_active_turn_stops_waiting_when_cancellation_begins() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-cancelling").unwrap();
+    broadcaster.take_events();
+
+    let runtime_state = svc.runtime_state().clone();
+    let conversation_id = conv.id.clone();
+    let begin_cancel = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        runtime_state.mark_cancelling(&conversation_id);
+    });
+
+    let error = svc
+        .steer_active_turn(
+            "user_1",
+            &conv.id,
+            SteerConversationRequest {
+                turn_id: "turn-cancelling".into(),
+                request_id: "request-cancelling".into(),
+                content: "Do not deliver during cancellation".into(),
+            },
+            &task_mgr_dyn,
+        )
+        .await
+        .unwrap_err();
+    begin_cancel.await.unwrap();
+
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    assert!(repo_messages_asc(&repo, &conv.id, 20).await.is_empty());
+    assert!(broadcaster.take_events().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn steer_active_turn_timeout_allows_same_request_to_retry() {
     let task_mgr = Arc::new(MockTaskManager::new());

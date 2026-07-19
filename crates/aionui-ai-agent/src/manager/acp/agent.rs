@@ -17,7 +17,7 @@ use crate::types::SendMessageData;
 use agent_client_protocol::schema::{
     AvailableCommand, CancelNotification, ContentBlock, PromptRequest, SessionConfigOptionCategory, SessionId,
     SessionModelState, SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    SetSessionModelRequest, UsageUpdate,
+    SetSessionModelRequest, StopReason, UsageUpdate,
 };
 use aionui_api_types::{
     AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse,
@@ -868,6 +868,7 @@ impl AcpAgentManager {
             return Err(AgentError::bad_request("Correction content must not be empty"));
         }
         self.ensure_protocol_connected_for_operation("steer_active_turn")?;
+        ensure_active_turn_is_running(self.runtime.status())?;
 
         let session_id = {
             let session = self.session.read().await;
@@ -883,13 +884,37 @@ impl AcpAgentManager {
         };
 
         let correction = normalize_hermes_correction_content(content)?;
-        self.protocol
-            .prompt(PromptRequest::new(
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.protocol.prompt(PromptRequest::new(
                 SessionId::new(session_id),
                 vec![ContentBlock::from(format!("/correct {correction}"))],
-            ))
-            .await?;
+            )),
+        )
+        .await
+        .map_err(|_| AgentError::timeout("Hermes did not acknowledge the active-turn correction in time"))??;
+        ensure_correction_was_accepted(response.stop_reason)?;
         self.runtime.bump_activity();
+        Ok(())
+    }
+}
+
+fn ensure_active_turn_is_running(status: Option<ConversationStatus>) -> Result<(), AgentError> {
+    if status == Some(ConversationStatus::Running) {
+        Ok(())
+    } else {
+        Err(AgentError::conflict(
+            "The active turn already finished; correction was not sent",
+        ))
+    }
+}
+
+fn ensure_correction_was_accepted(stop_reason: StopReason) -> Result<(), AgentError> {
+    if matches!(stop_reason, StopReason::Refusal) {
+        Err(AgentError::conflict(
+            "The active turn already finished; correction was not sent",
+        ))
+    } else {
         Ok(())
     }
 }
@@ -1317,7 +1342,8 @@ mod tests {
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::{AcpError, CloseReason};
     use crate::shared_kernel::{ConfigKey, ConfigValue, SessionId as DomainSessionId};
-    use agent_client_protocol::schema::{AvailableCommand, SessionConfigOptionCategory};
+    use agent_client_protocol::schema::{AvailableCommand, SessionConfigOptionCategory, StopReason};
+    use aionui_common::ConversationStatus;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -1621,6 +1647,19 @@ mod tests {
             Some(aionui_api_types::SlashCommandCompletionBehavior::NeutralTipOnEmpty)
         );
         assert_eq!(matched.empty_turn_tip_code.as_deref(), None);
+    }
+
+    #[test]
+    fn active_turn_correction_requires_running_runtime() {
+        assert!(super::ensure_active_turn_is_running(Some(ConversationStatus::Running)).is_ok());
+        assert!(super::ensure_active_turn_is_running(Some(ConversationStatus::Finished)).is_err());
+        assert!(super::ensure_active_turn_is_running(None).is_err());
+    }
+
+    #[test]
+    fn refused_hermes_correction_is_not_reported_as_accepted() {
+        assert!(super::ensure_correction_was_accepted(StopReason::EndTurn).is_ok());
+        assert!(super::ensure_correction_was_accepted(StopReason::Refusal).is_err());
     }
 
     #[test]

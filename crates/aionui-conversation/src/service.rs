@@ -2729,6 +2729,13 @@ impl ConversationService {
 
         let agent_wait_deadline = tokio::time::Instant::now() + ACP_STEER_AGENT_WAIT_TIMEOUT;
         let agent = loop {
+            if self.runtime_state.is_cancelling(conversation_id) {
+                self.runtime_state
+                    .forget_steer_request(conversation_id, &req.request_id, &msg_id);
+                return Err(ConversationError::Busy {
+                    reason: "the requested turn is being cancelled; correction was not sent".into(),
+                });
+            }
             if self.runtime_state.active_turn_id_for(conversation_id).as_deref() != Some(req.turn_id.as_str()) {
                 self.runtime_state
                     .forget_steer_request(conversation_id, &req.request_id, &msg_id);
