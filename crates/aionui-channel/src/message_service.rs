@@ -212,6 +212,7 @@ impl ChannelMessageService {
             }),
             // Events that don't produce user-facing messages
             AgentStreamEvent::Start(_)
+            | AgentStreamEvent::CorrectionBoundary(_)
             | AgentStreamEvent::Tips(_)
             | AgentStreamEvent::ToolGroup(_)
             | AgentStreamEvent::AgentStatus(_)
@@ -425,8 +426,8 @@ fn channel_conversation_name(
 mod tests {
     use super::*;
     use aionui_ai_agent::protocol::events::{
-        ErrorEventData, FinishEventData, StartEventData, TextEventData, ThinkingEventData, ToolCallEventData,
-        ToolCallStatus,
+        CorrectionBoundaryEventData, ErrorEventData, FinishEventData, StartEventData, TextEventData, ThinkingEventData,
+        ToolCallEventData, ToolCallStatus,
     };
     use aionui_common::ProviderWithModel;
 
@@ -550,6 +551,12 @@ mod tests {
     #[test]
     fn start_event_produces_none() {
         let event = AgentStreamEvent::Start(StartEventData { session_id: None });
+        assert!(ChannelMessageService::process_stream_event(&event).is_none());
+    }
+
+    #[test]
+    fn correction_boundary_stays_internal() {
+        let event = AgentStreamEvent::CorrectionBoundary(CorrectionBoundaryEventData::default());
         assert!(ChannelMessageService::process_stream_event(&event).is_none());
     }
 

@@ -245,6 +245,35 @@ async fn read_file_workspace_field_cannot_expand_allowed_roots() {
 }
 
 #[tokio::test]
+async fn read_file_workspace_field_rejects_sibling_inside_allowed_root() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = sandbox.path().join("workspace");
+    let sibling = sandbox.path().join("sibling");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    let file_path = sibling.join("secret.md");
+    std::fs::write(&file_path, "# private sibling").unwrap();
+
+    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let req = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({
+            "path": file_path.to_str().unwrap(),
+            "workspace": workspace.to_str().unwrap()
+        }),
+        &token,
+        &csrf,
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
+}
+
+#[tokio::test]
 async fn read_file_without_workspace_rejects_non_sandbox_path() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();

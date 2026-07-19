@@ -89,11 +89,10 @@ impl FileService {
     }
 
     fn allowed_roots_with_extra<'a>(&'a self, extra_root: Option<&'a Path>) -> Vec<&'a Path> {
-        let mut roots = self.allowed_roots_refs();
         if let Some(extra_root) = extra_root {
-            roots.push(extra_root);
+            return vec![extra_root];
         }
-        roots
+        self.allowed_roots_refs()
     }
 
     fn path_uses_allowed_root(&self, path: &Path, extra_root: Option<&Path>) -> bool {
@@ -106,10 +105,13 @@ impl FileService {
             }
         };
 
-        self.allowed_roots
-            .iter()
-            .map(PathBuf::as_path)
-            .chain(extra_root)
+        let scoped_roots: Vec<&Path> = match extra_root {
+            Some(root) => vec![root],
+            None => self.allowed_roots.iter().map(PathBuf::as_path).collect(),
+        };
+
+        scoped_roots
+            .into_iter()
             .filter_map(|root| std::fs::canonicalize(root).ok())
             .any(|root| candidate.starts_with(root))
     }

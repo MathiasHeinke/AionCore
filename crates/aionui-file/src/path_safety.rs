@@ -37,13 +37,12 @@ pub fn validate_path(path: &str, allowed_roots: &[&Path]) -> Result<PathBuf, Fil
     }
 }
 
-/// Like [`validate_path`], but also accepts a request-scoped extra root.
+/// Like [`validate_path`], but narrows access to a request-scoped workspace root.
 pub fn validate_path_with_extra_root(
     path: &str,
     base_roots: &[&Path],
     extra: Option<&Path>,
 ) -> Result<PathBuf, FileError> {
-    let mut allowed_roots = base_roots.to_vec();
     if let Some(extra_root) = extra {
         let canonical_extra = std::fs::canonicalize(extra_root)
             .map_err(|e| FileError::BadRequest(format!("cannot resolve workspace root: {}", e)))?;
@@ -58,10 +57,9 @@ pub fn validate_path_with_extra_root(
                 operation: Some("access"),
             });
         }
-        allowed_roots.push(canonical_extra.as_path());
-        return validate_path(path, &allowed_roots);
+        return validate_path(path, &[canonical_extra.as_path()]);
     }
-    validate_path(path, &allowed_roots)
+    validate_path(path, base_roots)
 }
 
 /// Like [`validate_path`] but the target does not need to exist yet.
@@ -294,6 +292,27 @@ mod tests {
         let result = validate_path_with_extra_root(file.to_str().unwrap(), &[sandbox.path()], Some(&workspace));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), fs::canonicalize(file).unwrap());
+    }
+
+    #[test]
+    fn validate_path_rejects_sibling_inside_base_when_workspace_is_scoped() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let workspace = sandbox.path().join("workspace");
+        let sibling = sandbox.path().join("sibling");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        let file = sibling.join("secret.txt");
+        fs::write(&file, "secret").unwrap();
+
+        let result = validate_path_with_extra_root(file.to_str().unwrap(), &[sandbox.path()], Some(&workspace));
+
+        assert!(matches!(
+            result,
+            Err(FileError::PathOutsideSandbox {
+                field: Some("path"),
+                ..
+            })
+        ));
     }
 
     #[test]
