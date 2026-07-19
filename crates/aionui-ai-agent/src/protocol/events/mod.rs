@@ -291,6 +291,7 @@ mod tests {
             "Correction accepted for the active turn: use the corrected figure",
             "No active turn - correction queued as the next turn.",
             "Correction queued after active-turn interruption failed.",
+            "Correction could not interrupt the active turn.",
             "Correction failed: transport details must stay internal",
         ] {
             let notif: SessionNotification = serde_json::from_value(json!({
