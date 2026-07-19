@@ -15,7 +15,7 @@ use super::tool_call::{
     AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallTextBlock, AcpToolCallTextBlockType,
     AcpToolCallUpdateData,
 };
-use super::{AgentStreamEvent, TextEventData};
+use super::{AgentStreamEvent, CorrectionBoundaryEventData, TextEventData};
 
 const INTERNAL_HERMES_STEER_ACK_PREFIXES: [&str; 7] = [
     "⏩ Steer queued for the active turn:",
@@ -67,7 +67,19 @@ pub(crate) fn session_notification_to_events(notif: &SessionNotification) -> Vec
             }
         }
 
-        SessionUpdate::UserMessageChunk(_chunk) => {}
+        SessionUpdate::UserMessageChunk(chunk) => {
+            let is_authoritative_correction = chunk
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("command_eve_control"))
+                .and_then(serde_json::Value::as_str)
+                == Some("authoritative_correction");
+            if is_authoritative_correction {
+                events.push(AgentStreamEvent::CorrectionBoundary(
+                    CorrectionBoundaryEventData::default(),
+                ));
+            }
+        }
 
         SessionUpdate::ToolCall(tc) => {
             events.push(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {

@@ -83,6 +83,20 @@ const ACP_VENDOR_LABELS: &[&str] = &[
     "snow",
 ];
 
+fn steer_failure_is_definitive(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::BadRequest(_)
+            | AgentError::Unauthorized(_)
+            | AgentError::Forbidden(_)
+            | AgentError::NotFound(_)
+            | AgentError::Conflict(_)
+            | AgentError::RateLimited
+            | AgentError::ConversationArchived(_)
+            | AgentError::WorkspacePathRuntimeUnavailable(_)
+    )
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct AssistantConversationOverrides {
     #[serde(default)]
@@ -2755,10 +2769,43 @@ impl ConversationService {
             }
             tokio::time::sleep(ACP_STEER_AGENT_POLL_INTERVAL).await;
         };
-        if let Err(error) = agent.steer_active_turn(content).await {
+
+        if self.runtime_state.is_cancelling(conversation_id)
+            || self.runtime_state.active_turn_id_for(conversation_id).as_deref() != Some(req.turn_id.as_str())
+        {
             self.runtime_state
                 .forget_steer_request(conversation_id, &req.request_id, &msg_id);
+            return Err(ConversationError::Busy {
+                reason: "the requested turn changed before correction delivery; correction was not sent".into(),
+            });
+        }
+        if let Err(error) = agent.steer_active_turn(content).await {
+            if steer_failure_is_definitive(&error) {
+                self.runtime_state
+                    .forget_steer_request(conversation_id, &req.request_id, &msg_id);
+            } else {
+                warn!(
+                    conversation_id,
+                    turn_id = %req.turn_id,
+                    request_id = %req.request_id,
+                    error = %error,
+                    "Steer delivery outcome is ambiguous; retaining request id to prevent duplicate injection"
+                );
+            }
             return Err(error.into());
+        }
+
+        let post_delivery_cancelling = self.runtime_state.is_cancelling(conversation_id);
+        let post_delivery_turn = self.runtime_state.active_turn_id_for(conversation_id);
+        if post_delivery_cancelling || post_delivery_turn.as_deref() != Some(req.turn_id.as_str()) {
+            warn!(
+                conversation_id,
+                turn_id = %req.turn_id,
+                request_id = %req.request_id,
+                post_delivery_cancelling,
+                active_turn_id = post_delivery_turn.as_deref(),
+                "Steer was accepted while the runtime transitioned; persisting the accepted control receipt"
+            );
         }
         self.runtime_state
             .mark_steer_request_accepted(conversation_id, &req.request_id, &msg_id);
@@ -2781,33 +2828,28 @@ impl ConversationService {
             hidden: false,
             created_at,
         };
-        if self
-            .runtime_persistence()
-            .allows(conversation_id, RuntimeWriteKind::UserMessage)
-        {
-            match self.conversation_repo.insert_message(&user_message).await {
-                Ok(()) => {
-                    self.broadcaster.broadcast(WebSocketMessage::new(
-                        "message.userCreated",
-                        serde_json::json!({
-                            "conversation_id": conversation_id,
-                            "msg_id": &msg_id,
-                            "content": content,
-                            "position": "right",
-                            "status": "finish",
-                            "hidden": false,
-                            "created_at": created_at,
-                            "control_mode": "steer",
-                            "turn_id": &req.turn_id,
-                        }),
-                    ));
-                }
-                Err(error) => {
-                    // Hermes already accepted the correction. Returning an
-                    // error here could make a client retry with a new request
-                    // id and inject it twice, so retain idempotency and log.
-                    warn!(conversation_id, msg_id, error = %ErrorChain(&error), "Steer accepted but message persistence failed");
-                }
+        match self.conversation_repo.insert_message(&user_message).await {
+            Ok(()) => {
+                self.broadcaster.broadcast(WebSocketMessage::new(
+                    "message.userCreated",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "msg_id": &msg_id,
+                        "content": content,
+                        "position": "right",
+                        "status": "finish",
+                        "hidden": false,
+                        "created_at": created_at,
+                        "control_mode": "steer",
+                        "turn_id": &req.turn_id,
+                    }),
+                ));
+            }
+            Err(error) => {
+                // Hermes already accepted the correction. Returning an error
+                // here could make a client retry with a new request id and
+                // inject it twice, so retain idempotency and log.
+                warn!(conversation_id, msg_id, error = %ErrorChain(&error), "Steer accepted but message persistence failed");
             }
         }
 

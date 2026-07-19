@@ -383,6 +383,24 @@ impl StreamRelay {
                                 segment.flush_counter = 0;
                             }
                         }
+                        AgentStreamEvent::CorrectionBoundary(_) => {
+                            self.complete_active_thinking(&mut active_thinking).await;
+                            self.close_active_text_segment(&mut active_text, &mut text_segments, "superseded")
+                                .await;
+                            let overrides = self
+                                .adapter
+                                .persist_final_text(&text_segments, "superseded", "", true, true)
+                                .await;
+                            for override_event in overrides {
+                                self.send_final_text_override(
+                                    &override_event.msg_id,
+                                    &override_event.text,
+                                    override_event.hidden,
+                                );
+                            }
+                            full_text_buffer.clear();
+                            text_segments.clear();
+                        }
                         AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_) => {
                             let elapsed_ms = now_ms() - started_at;
                             let event_type = if matches!(event, AgentStreamEvent::Finish(_)) {
@@ -622,6 +640,7 @@ impl StreamRelay {
             AgentStreamEvent::AcpSessionInfo(_) => "AcpSessionInfo",
             AgentStreamEvent::AcpContextUsage(_) => "AcpContextUsage",
             AgentStreamEvent::AcpPromptHookWarning(_) => "AcpPromptHookWarning",
+            AgentStreamEvent::CorrectionBoundary(_) => "CorrectionBoundary",
             AgentStreamEvent::SlashCommandsUpdated(_) => "SlashCommandsUpdated",
             AgentStreamEvent::AvailableCommands(_) => "AvailableCommands",
             AgentStreamEvent::Finish(_) => "Finish",
@@ -869,7 +888,9 @@ mod tests {
     use super::*;
     use crate::stream_persistence::StreamPersistenceAdapter;
     use aionui_ai_agent::AgentError;
-    use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData, TextEventData, ThinkingEventData};
+    use aionui_ai_agent::protocol::events::{
+        CorrectionBoundaryEventData, ErrorEventData, FinishEventData, TextEventData, ThinkingEventData,
+    };
     use aionui_db::DbError;
     use aionui_db::models::MessageRow;
     use std::sync::Mutex;
@@ -1002,6 +1023,71 @@ mod tests {
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Hello World");
+    }
+
+    #[tokio::test]
+    async fn authoritative_correction_hides_interrupted_partial_text() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "stale partial".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::CorrectionBoundary(
+            CorrectionBoundaryEventData::default(),
+        ))
+        .unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "corrected answer".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let text_rows: Vec<_> = inserts.iter().filter(|row| row.r#type == "text").collect();
+        assert_eq!(text_rows.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text_rows[0].content).unwrap()["content"],
+            "stale partial"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text_rows[1].content).unwrap()["content"],
+            "corrected answer"
+        );
+
+        let updates = repo.take_updates();
+        assert!(updates.iter().any(|(id, update)| {
+            id == "asst-1"
+                && update.hidden == Some(true)
+                && update.status.as_ref().and_then(|status| status.as_deref()) == Some("superseded")
+        }));
+
+        let mut stale_hidden_on_wire = false;
+        while let Ok(event) = ws_rx.try_recv() {
+            if event.name == "message.stream"
+                && event.data["msg_id"] == "asst-1"
+                && event.data["replace"] == true
+                && event.data["hidden"] == true
+            {
+                stale_hidden_on_wire = true;
+            }
+        }
+        assert!(stale_hidden_on_wire);
     }
 
     #[tokio::test]

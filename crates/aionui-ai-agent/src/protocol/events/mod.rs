@@ -46,6 +46,9 @@ pub enum AgentStreamEvent {
     AcpSessionInfo(serde_json::Value),
     AcpContextUsage(serde_json::Value),
     AcpPromptHookWarning(serde_json::Value),
+    /// Internal boundary emitted when Hermes starts an accepted correction turn.
+    /// Conversation persistence consumes this event; it is not user-visible.
+    CorrectionBoundary(CorrectionBoundaryEventData),
     SlashCommandsUpdated(serde_json::Value),
     AvailableCommands(AvailableCommandsEventData),
     Finish(FinishEventData),
@@ -73,6 +76,11 @@ pub struct SessionAssignedEventData {
 pub struct TextEventData {
     pub content: String,
 }
+
+/// Marks that subsequent assistant output supersedes partial text from the
+/// interrupted turn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CorrectionBoundaryEventData {}
 
 /// Data for the `Tips` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +313,24 @@ mod tests {
 
             assert!(session_notification_to_events(&notif).is_empty());
         }
+    }
+
+    #[test]
+    fn authoritative_hermes_correction_emits_an_internal_boundary() {
+        let notif: SessionNotification = serde_json::from_value(json!({
+            "sessionId": "sess-1",
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "corrected direction" },
+                "_meta": { "command_eve_control": "authoritative_correction" }
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            session_notification_to_events(&notif).as_slice(),
+            [AgentStreamEvent::CorrectionBoundary(_)]
+        ));
     }
 
     #[test]

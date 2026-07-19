@@ -2068,6 +2068,10 @@ struct MockAgent {
     set_config_option_error: Arc<Mutex<Option<AgentError>>>,
     set_config_option_response: Arc<Mutex<Option<SetConfigOptionResponse>>>,
     steer_calls: Arc<Mutex<Vec<String>>>,
+    steer_error: Arc<Mutex<Option<AgentError>>>,
+    block_steer: bool,
+    steer_started: Arc<Notify>,
+    steer_release: Arc<Notify>,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
     allow_direct_confirm: bool,
@@ -2108,6 +2112,10 @@ impl MockAgent {
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
             steer_calls: Arc::new(Mutex::new(Vec::new())),
+            steer_error: Arc::new(Mutex::new(None)),
+            block_steer: false,
+            steer_started: Arc::new(Notify::new()),
+            steer_release: Arc::new(Notify::new()),
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -2128,6 +2136,10 @@ impl MockAgent {
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
             steer_calls: Arc::new(Mutex::new(Vec::new())),
+            steer_error: Arc::new(Mutex::new(None)),
+            block_steer: false,
+            steer_started: Arc::new(Notify::new()),
+            steer_release: Arc::new(Notify::new()),
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -2148,6 +2160,10 @@ impl MockAgent {
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
             steer_calls: Arc::new(Mutex::new(Vec::new())),
+            steer_error: Arc::new(Mutex::new(None)),
+            block_steer: false,
+            steer_started: Arc::new(Notify::new()),
+            steer_release: Arc::new(Notify::new()),
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: true,
@@ -2172,6 +2188,16 @@ impl MockAgent {
 
     fn steer_calls(&self) -> Vec<String> {
         self.steer_calls.lock().unwrap().clone()
+    }
+
+    fn with_steer_error(self, error: AgentError) -> Self {
+        *self.steer_error.lock().unwrap() = Some(error);
+        self
+    }
+
+    fn with_blocking_steer(mut self) -> Self {
+        self.block_steer = true;
+        self
     }
 }
 
@@ -2215,6 +2241,13 @@ impl IAgentTask for MockAgent {
 impl IMockAgent for MockAgent {
     async fn steer_active_turn(&self, content: &str) -> Result<(), AgentError> {
         self.steer_calls.lock().unwrap().push(content.to_owned());
+        if self.block_steer {
+            self.steer_started.notify_one();
+            self.steer_release.notified().await;
+        }
+        if let Some(error) = self.steer_error.lock().unwrap().take() {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -4785,6 +4818,107 @@ async fn steer_active_turn_is_idempotent_and_persists_once() {
     assert_eq!(user_events.len(), 1);
     assert_eq!(user_events[0].data["msg_id"], first.msg_id);
     assert_eq!(user_events[0].data["control_mode"], "steer");
+}
+
+#[tokio::test]
+async fn steer_active_turn_retains_idempotency_after_ambiguous_timeout() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(MockAgent::new(&conv.id).with_steer_error(AgentError::timeout("delivery outcome is unknown")));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let _turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-timeout").unwrap();
+    let request = SteerConversationRequest {
+        turn_id: "turn-timeout".into(),
+        request_id: "request-timeout".into(),
+        content: "Do not inject this twice".into(),
+    };
+
+    let first = svc
+        .steer_active_turn("user_1", &conv.id, request.clone(), &task_mgr_dyn)
+        .await
+        .unwrap_err();
+    let duplicate = svc
+        .steer_active_turn("user_1", &conv.id, request, &task_mgr_dyn)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(first, ConversationError::Timeout { .. }));
+    assert!(matches!(duplicate, ConversationError::Busy { .. }));
+    assert_eq!(agent.steer_calls(), vec!["Do not inject this twice"]);
+    assert!(repo_messages_asc(&repo, &conv.id, 20).await.is_empty());
+}
+
+#[tokio::test]
+async fn steer_active_turn_definitive_rejection_allows_same_request_retry() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent =
+        Arc::new(MockAgent::new(&conv.id).with_steer_error(AgentError::conflict("correction was not accepted")));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let _turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-retry").unwrap();
+    let request = SteerConversationRequest {
+        turn_id: "turn-retry".into(),
+        request_id: "request-retry".into(),
+        content: "Retry after refusal".into(),
+    };
+
+    let first = svc
+        .steer_active_turn("user_1", &conv.id, request.clone(), &task_mgr_dyn)
+        .await
+        .unwrap_err();
+    let retry = svc
+        .steer_active_turn("user_1", &conv.id, request, &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    assert!(matches!(first, ConversationError::Busy { .. }));
+    assert!(retry.accepted);
+    assert_eq!(agent.steer_calls(), vec!["Retry after refusal", "Retry after refusal"]);
+    assert_eq!(repo_messages_asc(&repo, &conv.id, 20).await.len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_steer_receipt_persists_when_cancel_starts_during_delivery() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(MockAgent::new(&conv.id).with_blocking_steer());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let _turn_claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn-cancel-race")
+        .unwrap();
+    broadcaster.take_events();
+    let started = agent.steer_started.clone();
+    let release = agent.steer_release.clone();
+    let runtime_state = svc.runtime_state().clone();
+    let request = SteerConversationRequest {
+        turn_id: "turn-cancel-race".into(),
+        request_id: "request-cancel-race".into(),
+        content: "Accepted before cancellation".into(),
+    };
+
+    let steer = svc.steer_active_turn("user_1", &conv.id, request, &task_mgr_dyn);
+    let cancel = async {
+        started.notified().await;
+        runtime_state.mark_cancelling(&conv.id);
+        release.notify_one();
+    };
+    let (response, ()) = tokio::join!(steer, cancel);
+
+    assert!(response.unwrap().accepted);
+    assert_eq!(repo_messages_asc(&repo, &conv.id, 20).await.len(), 1);
+    let user_events: Vec<_> = broadcaster
+        .take_events()
+        .into_iter()
+        .filter(|event| event.name == "message.userCreated")
+        .collect();
+    assert_eq!(user_events.len(), 1);
 }
 
 #[tokio::test]
