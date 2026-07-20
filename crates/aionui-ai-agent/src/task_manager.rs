@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aionui_common::{
     AgentKillReason, AgentType, ConversationStatus, ErrorChain, OnConversationDelete, TimestampMs, now_ms,
@@ -11,7 +13,7 @@ use tracing::{info, warn};
 
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
-use crate::types::BuildTaskOptions;
+use crate::types::{BuildTaskOptions, ProjectRuntimeContext};
 
 /// Factory function that creates an [`AgentInstance`] from build options.
 ///
@@ -68,15 +70,64 @@ pub trait IWorkerTaskManager: Send + Sync {
     fn collect_idle(&self, idle_threshold_ms: TimestampMs) -> Vec<String>;
 }
 
-/// Per-conversation slot: an [`OnceCell`] that the first concurrent caller
-/// initialises by running the factory, and that every subsequent caller
-/// awaits. Failed initialisations leave the cell empty so the next caller
-/// may retry; the slot itself is only removed on `kill` / `clear`.
-type TaskSlot = Arc<OnceCell<AgentInstance>>;
+/// Per-conversation single-flight slot plus the pathless project runtime
+/// identity it was built for. Invalidation fences a late factory result after
+/// kill/remap so the spawned process cannot leak outside the map.
+type TaskTerminationFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+struct TaskSlot {
+    project_runtime_context: Option<ProjectRuntimeContext>,
+    instance: OnceCell<AgentInstance>,
+    invalidated: AtomicBool,
+    cleanup_started: AtomicBool,
+    prior_termination: Mutex<Option<TaskTerminationFuture>>,
+}
+
+impl TaskSlot {
+    fn new(
+        project_runtime_context: Option<ProjectRuntimeContext>,
+        prior_termination: Option<TaskTerminationFuture>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            project_runtime_context,
+            instance: OnceCell::new(),
+            invalidated: AtomicBool::new(false),
+            cleanup_started: AtomicBool::new(false),
+            prior_termination: Mutex::new(prior_termination),
+        })
+    }
+
+    fn get(&self) -> Option<&AgentInstance> {
+        self.instance.get()
+    }
+
+    fn mark_invalidated(&self) {
+        self.invalidated.store(true, Ordering::Release);
+    }
+
+    fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::Acquire)
+    }
+
+    fn start_cleanup(&self) -> bool {
+        self.cleanup_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn take_prior_termination(&self) -> Result<Option<TaskTerminationFuture>, AgentError> {
+        self.prior_termination
+            .lock()
+            .map(|mut guard| guard.take())
+            .map_err(|_| AgentError::internal("Project runtime termination fence is unavailable"))
+    }
+}
+
+type SharedTaskSlot = Arc<TaskSlot>;
 
 /// Default implementation of [`IWorkerTaskManager`] using a concurrent hash map.
 pub struct WorkerTaskManagerImpl {
-    tasks: DashMap<String, TaskSlot>,
+    tasks: DashMap<String, SharedTaskSlot>,
     factory: AgentFactory,
 }
 
@@ -92,6 +143,50 @@ impl WorkerTaskManagerImpl {
     fn initialised_instance(&self, conversation_id: &str) -> Option<AgentInstance> {
         self.tasks.get(conversation_id).and_then(|slot| slot.get().cloned())
     }
+
+    fn select_slot(
+        &self,
+        conversation_id: &str,
+        requested_context: Option<ProjectRuntimeContext>,
+    ) -> Result<SharedTaskSlot, AgentError> {
+        use dashmap::mapref::entry::Entry;
+
+        match self.tasks.entry(conversation_id.to_owned()) {
+            Entry::Vacant(entry) => {
+                let slot = TaskSlot::new(requested_context, None);
+                entry.insert(Arc::clone(&slot));
+                Ok(slot)
+            }
+            Entry::Occupied(mut entry) => {
+                let existing = Arc::clone(entry.get());
+                match (existing.project_runtime_context.as_ref(), requested_context.as_ref()) {
+                    (None, None) => return Ok(existing),
+                    (Some(previous), Some(requested)) if previous.same_runtime_as(requested) => {
+                        return Ok(existing);
+                    }
+                    _ => {}
+                }
+
+                let (Some(previous), Some(requested)) =
+                    (existing.project_runtime_context.as_ref(), requested_context.as_ref())
+                else {
+                    return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+                };
+                let Some(agent) = existing.get() else {
+                    return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+                };
+                if agent.status() != Some(ConversationStatus::Finished) || !requested.is_strictly_newer_than(previous) {
+                    return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+                }
+
+                existing.mark_invalidated();
+                let prior_termination = existing.start_cleanup().then(|| agent.kill_and_wait(None));
+                let replacement = TaskSlot::new(requested_context, prior_termination);
+                entry.insert(Arc::clone(&replacement));
+                Ok(replacement)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -105,22 +200,36 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
-        // Atomically obtain the per-conversation slot. `DashMap::entry` is
-        // synchronous and side-effect-free — only an empty OnceCell is
-        // allocated on the miss path, so concurrent callers for the same id
-        // all end up holding the same `Arc<OnceCell>`.
-        let slot: TaskSlot = self
-            .tasks
-            .entry(conversation_id.to_owned())
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone();
+        let project_runtime = options.project_runtime_context.is_some();
+        let slot = self.select_slot(conversation_id, options.project_runtime_context.clone())?;
 
         // `OnceCell::get_or_try_init` serialises concurrent initialisers:
         // the first caller to reach it runs the factory, every other caller
         // awaits the same future and ends up with the same instance. On
         // failure the cell stays empty so a later caller can retry.
         let factory = self.factory.clone();
-        let instance = slot.get_or_try_init(|| async move { factory(options).await }).await?;
+        let slot_for_initialisation = Arc::clone(&slot);
+        let instance = slot
+            .instance
+            .get_or_try_init(|| async move {
+                if let Some(prior_termination) = slot_for_initialisation.take_prior_termination()? {
+                    prior_termination.await;
+                }
+                factory(options).await
+            })
+            .await
+            .map_err(|error| match error {
+                AgentError::WorkspacePathRuntimeUnavailable(_) if project_runtime => {
+                    AgentError::bad_request("PROJECT_RUNTIME_PATH_UNAVAILABLE")
+                }
+                other => other,
+            })?;
+        if slot.is_invalidated() {
+            if slot.start_cleanup() {
+                let _ = instance.kill(None);
+            }
+            return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"));
+        }
         Ok(instance.clone())
     }
 
@@ -137,7 +246,10 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             } else {
                 info!(conversation_id = %id, ?reason, "Killing agent task");
             }
-            if let Some(agent) = slot.get() {
+            slot.mark_invalidated();
+            if let Some(agent) = slot.get()
+                && slot.start_cleanup()
+            {
                 agent.kill(reason)?;
             }
         }
@@ -161,7 +273,10 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             } else {
                 info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
             }
-            if let Some(agent) = slot.get() {
+            slot.mark_invalidated();
+            if let Some(agent) = slot.get()
+                && slot.start_cleanup()
+            {
                 return agent.kill_and_wait(reason);
             }
         }
@@ -174,7 +289,10 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         for key in keys {
             if let Some((id, slot)) = self.tasks.remove(&key) {
                 info!(conversation_id = %id, "Clearing agent task");
-                if let Some(agent) = slot.get() {
+                slot.mark_invalidated();
+                if let Some(agent) = slot.get()
+                    && slot.start_cleanup()
+                {
                     waits.push(agent.kill_and_wait(None));
                 }
             }
@@ -244,11 +362,11 @@ mod tests {
     use crate::session_context::{
         AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
     };
-    use crate::types::SendMessageData;
+    use crate::types::{ProjectRuntimeContext, SendMessageData};
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, ProviderWithModel};
     use futures_util::FutureExt;
-    use std::sync::atomic::{AtomicI64, Ordering};
-    use tokio::sync::broadcast;
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use tokio::sync::{Notify, broadcast};
 
     /// A minimal mock agent for testing task manager logic. Lives behind
     /// the `AgentInstance::Mock` trait-object variant so we don't have to
@@ -261,6 +379,7 @@ mod tests {
         status: Option<ConversationStatus>,
         last_activity: AtomicI64,
         event_tx: broadcast::Sender<AgentStreamEvent>,
+        kill_calls: Option<Arc<AtomicUsize>>,
     }
 
     impl MockAgent {
@@ -273,6 +392,7 @@ mod tests {
                 status,
                 last_activity: AtomicI64::new(now_ms()),
                 event_tx,
+                kill_calls: None,
             }
         }
 
@@ -283,6 +403,11 @@ mod tests {
 
         fn with_last_activity(mut self, ts: TimestampMs) -> Self {
             self.last_activity = AtomicI64::new(ts);
+            self
+        }
+
+        fn with_kill_counter(mut self, kill_calls: Arc<AtomicUsize>) -> Self {
+            self.kill_calls = Some(kill_calls);
             self
         }
     }
@@ -317,6 +442,9 @@ mod tests {
             Ok(())
         }
         fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            if let Some(kill_calls) = &self.kill_calls {
+                kill_calls.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(())
         }
     }
@@ -351,6 +479,37 @@ mod tests {
                 session_snapshot: None,
             })),
         })
+    }
+
+    fn project_context(
+        runtime: &str,
+        hint: &str,
+        root_generation: u64,
+        backend_generation: u64,
+    ) -> ProjectRuntimeContext {
+        ProjectRuntimeContext {
+            runtime_fingerprint: runtime.to_owned(),
+            environment_hint_fingerprint: hint.to_owned(),
+            backend_generation: format!("bg1:{backend_generation}"),
+            root_catalog_revision: root_generation,
+            root_ownership_revision: root_generation,
+            project_catalog_revision: root_generation,
+        }
+    }
+
+    fn make_project_options(
+        conversation_id: &str,
+        runtime: &str,
+        hint: &str,
+        root_generation: u64,
+        backend_generation: u64,
+    ) -> BuildTaskOptions {
+        BuildTaskOptions::new(make_options(conversation_id).context).with_project_runtime_context(project_context(
+            runtime,
+            hint,
+            root_generation,
+            backend_generation,
+        ))
     }
 
     fn mock_instance(agent: MockAgent) -> AgentInstance {
@@ -409,6 +568,13 @@ mod tests {
         }
     }
 
+    fn expect_agent_error(result: Result<AgentInstance, AgentError>) -> AgentError {
+        match result {
+            Ok(_) => panic!("expected agent error"),
+            Err(error) => error,
+        }
+    }
+
     #[test]
     fn get_task_returns_none_when_empty() {
         let mgr = make_manager();
@@ -430,6 +596,302 @@ mod tests {
         let h2 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
         assert!(same_mock(&h1, &h2));
         assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_task_reuses_only_the_exact_attested_runtime_context() {
+        let mgr = make_manager();
+        let first = mgr
+            .get_or_build_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-a", "hint-a", 1, 1),
+            )
+            .await
+            .unwrap();
+        let second = mgr
+            .get_or_build_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-a", "hint-a", 99, 1),
+            )
+            .await
+            .unwrap();
+
+        assert!(same_mock(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn project_task_rejects_context_change_while_active() {
+        let mgr = make_manager();
+        mgr.get_or_build_task(
+            "conv-project",
+            make_project_options("conv-project", "runtime-a", "hint-a", 1, 1),
+        )
+        .await
+        .unwrap();
+
+        let error = expect_agent_error(
+            mgr.get_or_build_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-b", "hint-a", 2, 1),
+            )
+            .await,
+        );
+        assert!(matches!(error, AgentError::Conflict(reason) if reason == "PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+    }
+
+    #[tokio::test]
+    async fn finished_project_task_rebuilds_for_strictly_newer_generation_and_kills_old() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let builds = Arc::clone(&builds);
+            let kills = Arc::clone(&kills);
+            Arc::new(move |options: BuildTaskOptions| {
+                let builds = Arc::clone(&builds);
+                let kills = Arc::clone(&kills);
+                async move {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Ok(mock_instance(
+                        MockAgent::new(options.conversation_id(), Some(ConversationStatus::Finished))
+                            .with_kill_counter(kills),
+                    ))
+                }
+                .boxed()
+            })
+        };
+        let mgr = WorkerTaskManagerImpl::new(factory);
+        let first = mgr
+            .get_or_build_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-a", "hint-a", 1, 1),
+            )
+            .await
+            .unwrap();
+        let second = mgr
+            .get_or_build_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-b", "hint-b", 2, 1),
+            )
+            .await
+            .unwrap();
+
+        assert!(!same_mock(&first, &second));
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn finished_project_task_rejects_stale_aba_and_same_generation_hint_drift() {
+        let factory: AgentFactory = Arc::new(|options: BuildTaskOptions| {
+            async move {
+                Ok(mock_instance(MockAgent::new(
+                    options.conversation_id(),
+                    Some(ConversationStatus::Finished),
+                )))
+            }
+            .boxed()
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory);
+        mgr.get_or_build_task(
+            "conv-project",
+            make_project_options("conv-project", "runtime-a", "hint-a", 2, 2),
+        )
+        .await
+        .unwrap();
+
+        for options in [
+            make_project_options("conv-project", "runtime-old", "hint-old", 1, 1),
+            make_project_options("conv-project", "runtime-a", "hint-drift", 2, 2),
+        ] {
+            let error = expect_agent_error(mgr.get_or_build_task("conv-project", options).await);
+            assert!(matches!(error, AgentError::Conflict(reason) if reason == "PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_project_task_rejects_cross_backend_generation_even_with_newer_catalog_revisions() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let builds = Arc::clone(&builds);
+            Arc::new(move |options: BuildTaskOptions| {
+                let builds = Arc::clone(&builds);
+                async move {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Ok(mock_instance(MockAgent::new(
+                        options.conversation_id(),
+                        Some(ConversationStatus::Finished),
+                    )))
+                }
+                .boxed()
+            })
+        };
+        let mgr = WorkerTaskManagerImpl::new(factory);
+        mgr.get_or_build_task(
+            "conv-project",
+            make_project_options("conv-project", "runtime-a", "hint-a", 1, 1),
+        )
+        .await
+        .unwrap();
+
+        let error = expect_agent_error(
+            mgr.get_or_build_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-b", "hint-b", 99, 2),
+            )
+            .await,
+        );
+
+        assert!(matches!(error, AgentError::Conflict(reason) if reason == "PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_manager_after_backend_restart_accepts_only_its_new_generation() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let builds = Arc::clone(&builds);
+            Arc::new(move |options: BuildTaskOptions| {
+                let builds = Arc::clone(&builds);
+                async move {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Ok(mock_instance(MockAgent::new(options.conversation_id(), None)))
+                }
+                .boxed()
+            })
+        };
+
+        let before_restart = WorkerTaskManagerImpl::new(Arc::clone(&factory));
+        before_restart
+            .get_or_build_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-a", "hint-a", 7, 1),
+            )
+            .await
+            .unwrap();
+
+        let after_restart = WorkerTaskManagerImpl::new(factory);
+        after_restart
+            .get_or_build_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-b", "hint-b", 1, 2),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(before_restart.active_count(), 1);
+        assert_eq!(after_restart.active_count(), 1);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn project_root_remap_is_rejected_while_single_flight_build_is_in_progress() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let factory: AgentFactory = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move |options: BuildTaskOptions| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(mock_instance(MockAgent::new(options.conversation_id(), None)))
+                }
+                .boxed()
+            })
+        };
+        let mgr = Arc::new(WorkerTaskManagerImpl::new(factory));
+        let first = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_build_task(
+                    "conv-project",
+                    make_project_options("conv-project", "runtime-a", "hint-a", 1, 1),
+                )
+                .await
+            })
+        };
+        entered.notified().await;
+
+        let remap = expect_agent_error(
+            mgr.get_or_build_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-b", "hint-b", 2, 2),
+            )
+            .await,
+        );
+        assert!(matches!(remap, AgentError::Conflict(reason) if reason == "PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+        release.notify_waiters();
+        first.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn kill_during_project_build_invalidates_and_kills_late_factory_result() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let kills = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let kills = Arc::clone(&kills);
+            Arc::new(move |options: BuildTaskOptions| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let kills = Arc::clone(&kills);
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(mock_instance(
+                        MockAgent::new(options.conversation_id(), None).with_kill_counter(kills),
+                    ))
+                }
+                .boxed()
+            })
+        };
+        let mgr = Arc::new(WorkerTaskManagerImpl::new(factory));
+        let build = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_build_task(
+                    "conv-project",
+                    make_project_options("conv-project", "runtime-a", "hint-a", 1, 1),
+                )
+                .await
+            })
+        };
+        entered.notified().await;
+        mgr.kill("conv-project", None).unwrap();
+        release.notify_waiters();
+
+        let error = expect_agent_error(build.await.unwrap());
+        assert!(matches!(error, AgentError::Conflict(reason) if reason == "PROJECT_RUNTIME_CONTEXT_INVALIDATED"));
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        assert_eq!(mgr.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn project_factory_workspace_error_is_pathless_but_legacy_error_is_preserved() {
+        let secret_path = "/private/seat-owner/project-alpha";
+        let factory: AgentFactory = Arc::new(move |_| {
+            let secret_path = secret_path.to_owned();
+            async move { Err(AgentError::WorkspacePathRuntimeUnavailable(secret_path)) }.boxed()
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory);
+
+        let project_error = expect_agent_error(
+            mgr.get_or_build_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-a", "hint-a", 1, 1),
+            )
+            .await,
+        );
+        assert!(
+            matches!(project_error, AgentError::BadRequest(reason) if reason == "PROJECT_RUNTIME_PATH_UNAVAILABLE")
+        );
+
+        let legacy_error = expect_agent_error(mgr.get_or_build_task("conv-legacy", make_options("conv-legacy")).await);
+        assert!(matches!(legacy_error, AgentError::WorkspacePathRuntimeUnavailable(path) if path == secret_path));
     }
 
     #[tokio::test]
@@ -543,9 +1005,9 @@ mod tests {
 
         // Helper: insert a pre-initialised slot bypassing the async factory path.
         let insert = |id: &str, instance: AgentInstance| {
-            let cell: OnceCell<AgentInstance> = OnceCell::new();
-            cell.set(instance).ok();
-            mgr.tasks.insert(id.into(), Arc::new(cell));
+            let slot = TaskSlot::new(None, None);
+            slot.instance.set(instance).ok();
+            mgr.tasks.insert(id.into(), slot);
         };
 
         // ACP + Finished + old activity → should be collected
@@ -596,8 +1058,8 @@ mod tests {
         let now = now_ms();
         let agent =
             Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)).with_last_activity(now - 10_000));
-        let slot = Arc::new(OnceCell::new());
-        assert!(slot.set(AgentInstance::Mock(agent)).is_ok());
+        let slot = TaskSlot::new(None, None);
+        assert!(slot.instance.set(AgentInstance::Mock(agent)).is_ok());
         manager.tasks.insert("conv_idle".to_owned(), slot);
 
         let captured = capture_logs(tracing::Level::INFO, || {
@@ -620,8 +1082,8 @@ mod tests {
             async { Err(AgentError::bad_gateway("not used")) }.boxed()
         }));
         let agent = Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)));
-        let slot = Arc::new(OnceCell::new());
-        assert!(slot.set(AgentInstance::Mock(agent)).is_ok());
+        let slot = TaskSlot::new(None, None);
+        assert!(slot.instance.set(AgentInstance::Mock(agent)).is_ok());
         manager.tasks.insert("conv_idle".to_owned(), slot);
 
         let captured = capture_logs(tracing::Level::INFO, || {

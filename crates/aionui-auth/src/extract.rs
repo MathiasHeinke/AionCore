@@ -3,6 +3,12 @@ use axum::http::{HeaderMap, Request, header};
 use aionui_common::constants::COOKIE_NAME;
 
 pub const LOCAL_CAPABILITY_HEADER: &str = "x-aionui-local-capability";
+pub const PROJECT_RUNTIME_ATTESTATION_HEADER: &str = "x-aionui-project-runtime-attestation";
+const MAX_PROJECT_RUNTIME_ATTESTATION_HEADER_BYTES: usize = 4_096;
+
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[error("invalid project runtime attestation header")]
+pub struct ProjectRuntimeAttestationHeaderError;
 
 /// Extract the client IP address from request headers.
 ///
@@ -77,6 +83,26 @@ pub fn extract_local_capability_from_headers(headers: &HeaderMap) -> Option<Stri
     } else {
         Some(capability.to_owned())
     }
+}
+
+/// Extract exactly one reserved project-runtime attestation header without
+/// ever falling back to Authorization, cookies, or renderer-controlled body
+/// fields.
+pub fn extract_project_runtime_attestation_from_headers(
+    headers: &HeaderMap,
+) -> Result<Option<String>, ProjectRuntimeAttestationHeaderError> {
+    let mut values = headers.get_all(PROJECT_RUNTIME_ATTESTATION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ProjectRuntimeAttestationHeaderError);
+    }
+    let value = value.to_str().map_err(|_| ProjectRuntimeAttestationHeaderError)?;
+    if value.is_empty() || value.len() > MAX_PROJECT_RUNTIME_ATTESTATION_HEADER_BYTES {
+        return Err(ProjectRuntimeAttestationHeaderError);
+    }
+    Ok(Some(value.to_owned()))
 }
 
 /// Extract a named cookie value from the `Cookie` header.
@@ -199,6 +225,27 @@ mod tests {
 
         let bearer_only = headers_with(&[("authorization", "Bearer local-capability")]);
         assert_eq!(extract_local_capability_from_headers(&bearer_only), None);
+    }
+
+    #[test]
+    fn project_attestation_requires_one_bounded_reserved_header() {
+        let headers = headers_with(&[(PROJECT_RUNTIME_ATTESTATION_HEADER, "header.payload.signature")]);
+        assert_eq!(
+            extract_project_runtime_attestation_from_headers(&headers).unwrap(),
+            Some("header.payload.signature".into())
+        );
+        assert_eq!(
+            extract_project_runtime_attestation_from_headers(&HeaderMap::new()).unwrap(),
+            None
+        );
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(PROJECT_RUNTIME_ATTESTATION_HEADER, HeaderValue::from_static("one"));
+        duplicate.append(PROJECT_RUNTIME_ATTESTATION_HEADER, HeaderValue::from_static("two"));
+        assert!(extract_project_runtime_attestation_from_headers(&duplicate).is_err());
+
+        let oversized = headers_with(&[(PROJECT_RUNTIME_ATTESTATION_HEADER, &"a".repeat(4_097))]);
+        assert!(extract_project_runtime_attestation_from_headers(&oversized).is_err());
     }
 
     // --- extract_token_from_ws_headers ---

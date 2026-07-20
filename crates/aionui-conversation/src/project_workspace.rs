@@ -6,8 +6,10 @@
 
 use std::path::Path;
 
-use aionui_api_types::ProjectRuntimeWorkspaceRequest;
-use aionui_db::models::ConversationRow;
+use aionui_ai_agent::AgentError;
+use aionui_api_types::AgentStreamErrorData;
+use aionui_api_types::{ProjectBindingExpectation, ProjectRuntimeWorkspaceRequest};
+use aionui_db::{ConversationProjectBindingExpectation, models::ConversationRow};
 use uuid::Uuid;
 
 use crate::ConversationError;
@@ -16,6 +18,9 @@ const PROJECT_BINDING_INCOMPLETE: &str = "PROJECT_BINDING_INCOMPLETE";
 const PROJECT_BINDING_INVALID: &str = "PROJECT_BINDING_INVALID";
 pub(crate) const PROJECT_BINDING_PATH_FORBIDDEN: &str = "PROJECT_BINDING_PATH_FORBIDDEN";
 const PROJECT_BINDING_UPDATE_REQUIRES_PAIR: &str = "PROJECT_BINDING_UPDATE_REQUIRES_PAIR";
+pub(crate) const PROJECT_BINDING_EXPECTATION_REQUIRED: &str = "PROJECT_BINDING_EXPECTATION_REQUIRED";
+const PROJECT_BINDING_EXPECTATION_INVALID: &str = "PROJECT_BINDING_EXPECTATION_INVALID";
+const PROJECT_BINDING_EXPECTATION_UNEXPECTED: &str = "PROJECT_BINDING_EXPECTATION_UNEXPECTED";
 pub(crate) const PROJECT_BINDING_INTERNAL_MUTATION_FORBIDDEN: &str = "PROJECT_BINDING_INTERNAL_MUTATION_FORBIDDEN";
 pub(crate) const PROJECT_RUNTIME_BINDING_REQUIRED: &str = "PROJECT_RUNTIME_BINDING_REQUIRED";
 pub(crate) const PROJECT_RUNTIME_BINDING_UNEXPECTED: &str = "PROJECT_RUNTIME_BINDING_UNEXPECTED";
@@ -23,6 +28,7 @@ pub(crate) const PROJECT_RUNTIME_BINDING_MISMATCH: &str = "PROJECT_RUNTIME_BINDI
 const PROJECT_RUNTIME_PATH_NOT_ABSOLUTE: &str = "PROJECT_RUNTIME_PATH_NOT_ABSOLUTE";
 const PROJECT_RUNTIME_PATH_NOT_CANONICAL: &str = "PROJECT_RUNTIME_PATH_NOT_CANONICAL";
 const PROJECT_RUNTIME_PATH_UNAVAILABLE: &str = "PROJECT_RUNTIME_PATH_UNAVAILABLE";
+const PROJECT_RUNTIME_REDACTED: &str = "[project workspace redacted]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectConversationBinding {
@@ -148,6 +154,37 @@ pub(crate) fn merge_and_validate_project_update(
     Ok((merged, existing_binding != merged_binding))
 }
 
+pub(crate) fn project_binding_expectation_for_update(
+    project_touched: bool,
+    expected: Option<&ProjectBindingExpectation>,
+) -> Result<Option<ConversationProjectBindingExpectation>, ConversationError> {
+    if !project_touched {
+        return if expected.is_some() {
+            Err(project_bad_request(PROJECT_BINDING_EXPECTATION_UNEXPECTED))
+        } else {
+            Ok(None)
+        };
+    }
+    let Some(expected) = expected else {
+        return Err(project_bad_request(PROJECT_BINDING_EXPECTATION_REQUIRED));
+    };
+    match (&expected.project_id, &expected.workspace_root_ref) {
+        (None, None) => Ok(Some(ConversationProjectBindingExpectation::unbound())),
+        (Some(project_id), Some(workspace_root_ref)) => {
+            let candidate = serde_json::json!({
+                "project_id": project_id,
+                "workspace_root_ref": workspace_root_ref,
+            });
+            parse_project_binding(&candidate).map_err(|_| project_bad_request(PROJECT_BINDING_EXPECTATION_INVALID))?;
+            Ok(Some(ConversationProjectBindingExpectation::bound(
+                project_id,
+                workspace_root_ref,
+            )))
+        }
+        _ => Err(project_bad_request(PROJECT_BINDING_EXPECTATION_INVALID)),
+    }
+}
+
 pub(crate) fn validate_project_runtime_path(
     request: &ProjectRuntimeWorkspaceRequest,
 ) -> Result<String, ConversationError> {
@@ -176,4 +213,46 @@ pub(crate) fn map_project_runtime_build_error(error: ConversationError) -> Conve
         }
         other => other,
     }
+}
+
+pub(crate) fn redact_project_runtime_error(
+    data: &AgentStreamErrorData,
+    canonical_workspace_path: Option<&str>,
+) -> AgentStreamErrorData {
+    let mut redacted = data.clone();
+    let reported_workspace_path = redacted.workspace_path.take();
+    for sensitive in [canonical_workspace_path, reported_workspace_path.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_empty())
+    {
+        redacted.message = redact_project_runtime_text(redacted.message, sensitive);
+        redacted.detail = redacted
+            .detail
+            .map(|detail| redact_project_runtime_text(detail, sensitive));
+    }
+    redacted
+}
+
+pub(crate) fn redact_project_runtime_agent_error(error: AgentError, canonical_workspace_path: &str) -> AgentError {
+    let redact = |value| redact_project_runtime_text(value, canonical_workspace_path);
+    match error {
+        AgentError::BadRequest(value) => AgentError::BadRequest(redact(value)),
+        AgentError::Unauthorized(value) => AgentError::Unauthorized(redact(value)),
+        AgentError::Forbidden(value) => AgentError::Forbidden(redact(value)),
+        AgentError::NotFound(value) => AgentError::NotFound(redact(value)),
+        AgentError::Conflict(value) => AgentError::Conflict(redact(value)),
+        AgentError::BadGateway(value) => AgentError::BadGateway(redact(value)),
+        AgentError::Timeout(value) => AgentError::Timeout(redact(value)),
+        AgentError::RateLimited => AgentError::RateLimited,
+        AgentError::ConversationArchived(value) => AgentError::ConversationArchived(redact(value)),
+        AgentError::WorkspacePathRuntimeUnavailable(_) => AgentError::bad_request(PROJECT_RUNTIME_PATH_UNAVAILABLE),
+        AgentError::Internal(value) => AgentError::Internal(redact(value)),
+        AgentError::Acp(value) => AgentError::bad_gateway(redact(value.to_string())),
+        _ => AgentError::internal("Project runtime failed"),
+    }
+}
+
+fn redact_project_runtime_text(value: String, sensitive: &str) -> String {
+    value.replace(sensitive, PROJECT_RUNTIME_REDACTED)
 }

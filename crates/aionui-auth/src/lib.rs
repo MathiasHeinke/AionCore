@@ -9,6 +9,7 @@ mod jwt;
 mod local_capability;
 pub mod middleware;
 mod password;
+mod project_runtime_attestation;
 pub mod qr_token;
 mod rate_limit;
 mod routes;
@@ -22,7 +23,17 @@ pub use error::AuthError;
 pub use jwt::{JwtService, TokenPayload, generate_random_secret_string, resolve_jwt_secret};
 
 // Per-launch local embedded-server capability
+#[cfg(any(test, feature = "test-support"))]
+pub use local_capability::sign_local_capability_attestation;
 pub use local_capability::{LocalCapabilityError, LocalCapabilityVerifier};
+pub use project_runtime_attestation::{
+    DEFAULT_PROJECT_RUNTIME_NONCE_CAPACITY, ProjectRuntimeAttestationError, ProjectRuntimeAttestationPurpose,
+    ProjectRuntimeAttestationVerifier, VerifiedProjectRuntimeAttestation,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use project_runtime_attestation::{
+    ProjectRuntimeAttestationClaims, ProjectRuntimeAttestationSigningError, sign_project_runtime_attestation,
+};
 
 // Password service
 pub use password::{
@@ -40,9 +51,10 @@ pub use rate_limit::{
 
 // Token / IP extraction
 pub use extract::{
-    LOCAL_CAPABILITY_HEADER, extract_bearer_token_from_headers, extract_client_ip, extract_client_ip_from_headers,
-    extract_cookie_value, extract_local_capability_from_headers, extract_token_from_headers,
-    extract_token_from_ws_headers,
+    LOCAL_CAPABILITY_HEADER, PROJECT_RUNTIME_ATTESTATION_HEADER, ProjectRuntimeAttestationHeaderError,
+    extract_bearer_token_from_headers, extract_client_ip, extract_client_ip_from_headers, extract_cookie_value,
+    extract_local_capability_from_headers, extract_project_runtime_attestation_from_headers,
+    extract_token_from_headers, extract_token_from_ws_headers,
 };
 
 // Cookie configuration

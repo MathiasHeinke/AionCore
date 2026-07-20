@@ -27,6 +27,26 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing.
     async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
+    /// Atomically updates a conversation only while its portable project
+    /// binding equals `expected`. SQLite overrides this with a single
+    /// conditional UPDATE; the default keeps custom test repositories source
+    /// compatible while still failing closed on a mismatched observation.
+    async fn update_project_binding_cas(
+        &self,
+        id: &str,
+        updates: &ConversationRowUpdate,
+        expected: &ConversationProjectBindingExpectation,
+    ) -> Result<(), DbError> {
+        let row = self
+            .get(id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("Conversation '{id}' not found")))?;
+        if !expected.matches_extra(&row.extra) {
+            return Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned()));
+        }
+        self.update(id, updates).await
+    }
+
     /// Deletes a conversation (messages cascade via FK).
     /// Returns `DbError::NotFound` if ID is missing.
     async fn delete(&self, id: &str) -> Result<(), DbError>;
@@ -262,6 +282,45 @@ pub struct ConversationRowUpdate {
     pub extra: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<TimestampMs>,
+}
+
+pub const PROJECT_BINDING_CONFLICT: &str = "PROJECT_BINDING_CONFLICT";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationProjectBindingExpectation {
+    pub project_id: Option<String>,
+    pub workspace_root_ref: Option<String>,
+}
+
+impl ConversationProjectBindingExpectation {
+    pub fn unbound() -> Self {
+        Self {
+            project_id: None,
+            workspace_root_ref: None,
+        }
+    }
+
+    pub fn bound(project_id: impl Into<String>, workspace_root_ref: impl Into<String>) -> Self {
+        Self {
+            project_id: Some(project_id.into()),
+            workspace_root_ref: Some(workspace_root_ref.into()),
+        }
+    }
+
+    fn matches_extra(&self, extra: &str) -> bool {
+        let Ok(extra) = serde_json::from_str::<serde_json::Value>(extra) else {
+            return false;
+        };
+        let project_id = extra.get("project_id").and_then(serde_json::Value::as_str);
+        let workspace_root_ref = extra.get("workspace_root_ref").and_then(serde_json::Value::as_str);
+        match (&self.project_id, &self.workspace_root_ref) {
+            (None, None) => project_id.is_none() && workspace_root_ref.is_none(),
+            (Some(expected_project), Some(expected_root)) => {
+                project_id == Some(expected_project.as_str()) && workspace_root_ref == Some(expected_root.as_str())
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Partial update payload for a message row.

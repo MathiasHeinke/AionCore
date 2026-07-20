@@ -14,6 +14,7 @@ use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
+use crate::project_workspace::redact_project_runtime_error;
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
@@ -131,6 +132,7 @@ pub struct StreamRelay {
     runtime_state: Option<Arc<ConversationRuntimeStateService>>,
     persistence: Option<RuntimePersistenceCoordinator>,
     adapter: StreamPersistenceAdapter,
+    project_runtime_workspace_path: Option<String>,
     complete_turn: bool,
     defer_clean_terminal_errors: bool,
 }
@@ -158,6 +160,7 @@ impl StreamRelay {
             runtime_state: None,
             persistence: None,
             adapter,
+            project_runtime_workspace_path: None,
             complete_turn: true,
             defer_clean_terminal_errors: false,
         }
@@ -186,6 +189,11 @@ impl StreamRelay {
 
     pub fn with_turn_completion(mut self, enabled: bool) -> Self {
         self.complete_turn = enabled;
+        self
+    }
+
+    pub fn with_project_runtime_redaction(mut self, canonical_workspace_path: Option<String>) -> Self {
+        self.project_runtime_workspace_path = canonical_workspace_path;
         self
     }
 
@@ -306,6 +314,15 @@ impl StreamRelay {
 
             match recv_result {
                 Ok(event) => {
+                    let event = match event {
+                        AgentStreamEvent::Error(data) if self.project_runtime_workspace_path.is_some() => {
+                            AgentStreamEvent::Error(redact_project_runtime_error(
+                                &data,
+                                self.project_runtime_workspace_path.as_deref(),
+                            ))
+                        }
+                        other => other,
+                    };
                     let deleting = self.is_deleting();
                     if deleting && !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
                         debug!(

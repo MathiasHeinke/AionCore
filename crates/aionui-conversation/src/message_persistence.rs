@@ -3,6 +3,7 @@ use aionui_common::{ErrorChain, now_ms};
 use aionui_db::models::MessageRow;
 use tracing::warn;
 
+use crate::project_workspace::{parse_project_binding_from_row, redact_project_runtime_error};
 use crate::runtime_persistence::RuntimeWriteKind;
 use crate::service::ConversationService;
 
@@ -20,7 +21,13 @@ impl ConversationService {
             return None;
         }
 
-        let stream_error = err.stream_error();
+        let project_bound = match self.conversation_repo().get(conversation_id).await {
+            Ok(Some(row)) => parse_project_binding_from_row(&row).is_ok_and(|binding| binding.is_some()),
+            Ok(None) => false,
+            Err(_) => err.stream_error().workspace_path.is_some(),
+        };
+        let redacted_stream_error = project_bound.then(|| redact_project_runtime_error(err.stream_error(), None));
+        let stream_error = redacted_stream_error.as_ref().unwrap_or_else(|| err.stream_error());
         let code = top_level_code.map(str::to_owned).or_else(|| {
             stream_error
                 .code

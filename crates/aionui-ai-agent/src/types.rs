@@ -27,11 +27,49 @@ pub struct SendMessageData {
 #[derive(Debug, Clone)]
 pub struct BuildTaskOptions {
     pub context: AgentSessionContext,
+    /// Pathless, attested identity for a project runtime. `None` preserves
+    /// the legacy non-project cache semantics.
+    pub project_runtime_context: Option<ProjectRuntimeContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRuntimeContext {
+    pub runtime_fingerprint: String,
+    pub environment_hint_fingerprint: String,
+    pub backend_generation: String,
+    pub root_catalog_revision: u64,
+    pub root_ownership_revision: u64,
+    pub project_catalog_revision: u64,
+}
+
+impl ProjectRuntimeContext {
+    pub fn same_runtime_as(&self, other: &Self) -> bool {
+        self.runtime_fingerprint == other.runtime_fingerprint
+            && self.environment_hint_fingerprint == other.environment_hint_fingerprint
+    }
+
+    pub fn is_strictly_newer_than(&self, previous: &Self) -> bool {
+        self.backend_generation == previous.backend_generation
+            && self.root_catalog_revision >= previous.root_catalog_revision
+            && self.root_ownership_revision >= previous.root_ownership_revision
+            && self.project_catalog_revision >= previous.project_catalog_revision
+            && (self.root_catalog_revision > previous.root_catalog_revision
+                || self.root_ownership_revision > previous.root_ownership_revision
+                || self.project_catalog_revision > previous.project_catalog_revision)
+    }
 }
 
 impl BuildTaskOptions {
     pub fn new(context: AgentSessionContext) -> Self {
-        Self { context }
+        Self {
+            context,
+            project_runtime_context: None,
+        }
+    }
+
+    pub fn with_project_runtime_context(mut self, context: ProjectRuntimeContext) -> Self {
+        self.project_runtime_context = Some(context);
+        self
     }
 
     pub fn conversation_id(&self) -> &str {

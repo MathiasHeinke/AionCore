@@ -252,7 +252,10 @@ impl AgentInstance {
             Self::Acp(m) => m.kill_and_wait(reason),
             Self::Aionrs(m) => m.kill_and_wait(reason),
             #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(_) => Box::pin(std::future::ready(())),
+            Self::Mock(m) => {
+                let _ = m.kill(reason);
+                Box::pin(std::future::ready(()))
+            }
         }
     }
 

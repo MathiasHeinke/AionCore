@@ -4,8 +4,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
-use aionui_ai_agent::types::BuildTaskOptions;
+use aionui_ai_agent::types::{BuildTaskOptions, ProjectRuntimeContext};
 use aionui_ai_agent::{AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
+use aionui_auth::{
+    ProjectRuntimeAttestationPurpose, ProjectRuntimeAttestationVerifier, VerifiedProjectRuntimeAttestation,
+};
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::response_middleware::ICronService;
@@ -52,7 +55,8 @@ use crate::project_workspace::{
     PROJECT_BINDING_INTERNAL_MUTATION_FORBIDDEN, PROJECT_BINDING_PATH_FORBIDDEN, PROJECT_RUNTIME_BINDING_MISMATCH,
     PROJECT_RUNTIME_BINDING_REQUIRED, PROJECT_RUNTIME_BINDING_UNEXPECTED, map_project_runtime_build_error,
     merge_and_validate_project_update, normalize_project_create_extra, parse_project_binding,
-    parse_project_binding_from_row, project_bad_request, validate_project_runtime_path,
+    parse_project_binding_from_row, project_bad_request, project_binding_expectation_for_update,
+    redact_project_runtime_agent_error, validate_project_runtime_path,
 };
 use crate::session_context::SessionContextBuilder;
 use crate::skill_resolver::SkillResolver;
@@ -355,6 +359,7 @@ pub struct ConversationService {
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
+    project_runtime_attestation_verifier: Arc<RwLock<Option<Arc<ProjectRuntimeAttestationVerifier>>>>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -422,6 +427,7 @@ impl ConversationService {
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
+            project_runtime_attestation_verifier: Arc::new(RwLock::new(None)),
 
             conversation_repo,
             agent_metadata_repo,
@@ -432,6 +438,12 @@ impl ConversationService {
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = runtime_state;
         self
+    }
+
+    pub fn with_project_runtime_attestation_verifier(&self, verifier: Option<Arc<ProjectRuntimeAttestationVerifier>>) {
+        if let Ok(mut guard) = self.project_runtime_attestation_verifier.write() {
+            *guard = verifier;
+        }
     }
 
     pub fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, ConversationError> {
@@ -665,6 +677,7 @@ impl ConversationService {
     ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
+
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
         let mut extra = req.extra;
@@ -1782,6 +1795,14 @@ impl ConversationService {
 
         let now = now_ms();
 
+        let project_touched = req.extra.as_ref().is_some_and(|extra| {
+            extra
+                .as_object()
+                .is_some_and(|object| object.contains_key("project_id") || object.contains_key("workspace_root_ref"))
+        });
+        let project_binding_expectation =
+            project_binding_expectation_for_update(project_touched, req.expected_project_binding.as_ref())?;
+
         // Merge extra if provided. For aionrs, strip `extra.model` post-merge
         // so the row keeps a single canonical model source (top-level column).
         let mut project_binding_changed = false;
@@ -1835,7 +1856,13 @@ impl ConversationService {
             updated_at: Some(now),
         };
 
-        self.conversation_repo.update(id, &updates).await?;
+        if let Some(expectation) = project_binding_expectation.as_ref() {
+            self.conversation_repo
+                .update_project_binding_cas(id, &updates, expectation)
+                .await?;
+        } else {
+            self.conversation_repo.update(id, &updates).await?;
+        }
 
         if let Some(model) = req.model.as_ref() {
             let selected_model = model.use_model.as_deref().unwrap_or(model.model.as_str());
@@ -2461,6 +2488,18 @@ impl ConversationService {
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<SendMessageResponse, ConversationError> {
+        self.send_message_with_project_attestation(user_id, conversation_id, req, None, task_manager)
+            .await
+    }
+
+    pub async fn send_message_with_project_attestation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        project_attestation: Option<&str>,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<SendMessageResponse, ConversationError> {
         if req.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Message content must not be empty".into(),
@@ -2496,12 +2535,24 @@ impl ConversationService {
         // Project conversations must validate the portable identity and the
         // request-only path before claiming a turn or persisting a message.
         let project_build_opts = match (parse_project_binding_from_row(&row)?, req.runtime_workspace.as_ref()) {
-            (Some(_), Some(runtime_workspace)) => Some(
-                self.build_task_options_with_project_workspace(&row, runtime_workspace)
-                    .await?,
-            ),
+            (Some(binding), Some(runtime_workspace)) => {
+                let verified = self.verify_project_runtime_attestation(
+                    project_attestation,
+                    conversation_id,
+                    ProjectRuntimeAttestationPurpose::Send,
+                    &binding,
+                    runtime_workspace,
+                )?;
+                Some(
+                    self.build_task_options_with_project_workspace(&row, runtime_workspace, &verified)
+                        .await?,
+                )
+            }
             (Some(_), None) => return Err(project_bad_request(PROJECT_RUNTIME_BINDING_REQUIRED)),
             (None, Some(_)) => return Err(project_bad_request(PROJECT_RUNTIME_BINDING_UNEXPECTED)),
+            (None, None) if project_attestation.is_some() => {
+                return Err(ConversationError::ProjectRuntimeAttestationMismatch);
+            }
             (None, None) => None,
         };
 
@@ -2633,6 +2684,10 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+
+        if parse_project_binding_from_row(&row)?.is_some() {
+            return Err(project_bad_request(PROJECT_RUNTIME_BINDING_REQUIRED));
+        }
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
@@ -3073,6 +3128,18 @@ impl ConversationService {
         runtime_workspace: &ProjectRuntimeWorkspaceRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
+        self.warmup_with_project_attestation(user_id, conversation_id, runtime_workspace, None, task_manager)
+            .await
+    }
+
+    pub async fn warmup_with_project_attestation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        runtime_workspace: &ProjectRuntimeWorkspaceRequest,
+        project_attestation: Option<&str>,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), ConversationError> {
         let row = self
             .conversation_repo
             .get(conversation_id)
@@ -3082,8 +3149,18 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
+        let Some(binding) = parse_project_binding_from_row(&row)? else {
+            return Err(project_bad_request(PROJECT_RUNTIME_BINDING_UNEXPECTED));
+        };
+        let verified = self.verify_project_runtime_attestation(
+            project_attestation,
+            conversation_id,
+            ProjectRuntimeAttestationPurpose::Warmup,
+            &binding,
+            runtime_workspace,
+        )?;
         let build_opts = self
-            .build_task_options_with_project_workspace(&row, runtime_workspace)
+            .build_task_options_with_project_workspace(&row, runtime_workspace, &verified)
             .await?;
         self.warmup_with_options(conversation_id, task_manager, row, build_opts)
             .await
@@ -3099,9 +3176,17 @@ impl ConversationService {
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
+        let project_runtime_workspace_path = build_opts
+            .project_runtime_context
+            .as_ref()
+            .map(|_| build_opts.context.workspace.path.clone());
         let agent = match task_manager.get_or_build_task(conversation_id, build_opts).await {
             Ok(agent) => agent,
             Err(err) => {
+                let err = match project_runtime_workspace_path.as_deref() {
+                    Some(path) => redact_project_runtime_agent_error(err, path),
+                    None => err,
+                };
                 let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref());
                 if send_error.is_openclaw_gateway_unreachable() {
                     warn!(
@@ -3199,6 +3284,7 @@ impl ConversationService {
         &self,
         row: &aionui_db::models::ConversationRow,
         runtime_workspace: &ProjectRuntimeWorkspaceRequest,
+        verified: &VerifiedProjectRuntimeAttestation,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let Some(binding) = parse_project_binding_from_row(row)? else {
@@ -3206,14 +3292,52 @@ impl ConversationService {
         };
         if binding.project_id != runtime_workspace.project_id
             || binding.workspace_root_ref != runtime_workspace.workspace_root_ref
+            || !verified.matches_runtime_workspace(runtime_workspace)
         {
             return Err(project_bad_request(PROJECT_RUNTIME_BINDING_MISMATCH));
         }
         let runtime_path = validate_project_runtime_path(runtime_workspace)?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, Some(&runtime_path))
-            .await
-            .map_err(map_project_runtime_build_error)
+        let options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options_with_workspace_override(row, Some(&runtime_path))
+                .await
+                .map_err(map_project_runtime_build_error)?;
+        Ok(options.with_project_runtime_context(ProjectRuntimeContext {
+            runtime_fingerprint: verified.runtime_fingerprint().to_owned(),
+            environment_hint_fingerprint: verified.environment_hint_fingerprint().to_owned(),
+            backend_generation: verified.backend_generation().to_owned(),
+            root_catalog_revision: verified.root_catalog_revision(),
+            root_ownership_revision: verified.root_ownership_revision(),
+            project_catalog_revision: verified.project_catalog_revision(),
+        }))
+    }
+
+    fn verify_project_runtime_attestation(
+        &self,
+        compact_jws: Option<&str>,
+        conversation_id: &str,
+        purpose: ProjectRuntimeAttestationPurpose,
+        persisted_binding: &crate::project_workspace::ProjectConversationBinding,
+        runtime_workspace: &ProjectRuntimeWorkspaceRequest,
+    ) -> Result<VerifiedProjectRuntimeAttestation, ConversationError> {
+        let verifier = self
+            .project_runtime_attestation_verifier
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(verifier) = verifier else {
+            return Err(ConversationError::ProjectRuntimeAttestationUnavailable);
+        };
+        verifier
+            .verify_and_consume(
+                compact_jws,
+                conversation_id,
+                purpose,
+                &persisted_binding.project_id,
+                &persisted_binding.workspace_root_ref,
+                runtime_workspace,
+            )
+            .map_err(Into::into)
     }
 
     /// Ensure native skill links exist in the runtime workspace. Auto

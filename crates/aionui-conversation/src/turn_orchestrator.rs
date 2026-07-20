@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
+use crate::project_workspace::redact_project_runtime_error;
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
 use crate::service::{
@@ -85,6 +86,11 @@ impl ConversationTurnOrchestrator {
         let build_started_at = now_ms();
         let availability_agent_id = availability_agent_id(&input.build_options);
         let backend = acp_backend_from_build_options(&input.build_options).map(str::to_owned);
+        let project_runtime_workspace_path = input
+            .build_options
+            .project_runtime_context
+            .as_ref()
+            .map(|_| input.build_options.context.workspace.path.clone());
         info!(
             conversation_id = %input.conv_id,
             turn_id = %input.turn_id,
@@ -99,7 +105,10 @@ impl ConversationTurnOrchestrator {
             Ok(agent) => agent,
             Err(err) => {
                 let top_level_code = agent_error_top_level_code(&err);
-                let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref());
+                let send_error = redact_project_send_error(
+                    AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref()),
+                    project_runtime_workspace_path.as_deref(),
+                );
                 let top_level_code = if send_error.is_openclaw_gateway_unreachable() {
                     "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE"
                 } else {
@@ -116,14 +125,24 @@ impl ConversationTurnOrchestrator {
                         "OpenClaw Gateway unreachable during ACP startup"
                     );
                 }
-                error!(
-                    conversation_id = %input.conv_id,
-                    turn_id = %input.turn_id,
-                    error_code = ?send_error.code(),
-                    error = %ErrorChain(&err),
-                    "Agent task build failed"
-                );
-                let failure_message = err.to_string();
+                let failure_message = availability_failure_message(&send_error);
+                if project_runtime_workspace_path.is_some() {
+                    error!(
+                        conversation_id = %input.conv_id,
+                        turn_id = %input.turn_id,
+                        error_code = ?send_error.code(),
+                        error_detail = %failure_message,
+                        "Agent task build failed"
+                    );
+                } else {
+                    error!(
+                        conversation_id = %input.conv_id,
+                        turn_id = %input.turn_id,
+                        error_code = ?send_error.code(),
+                        error = %ErrorChain(&err),
+                        "Agent task build failed"
+                    );
+                }
                 record_agent_session_failure(
                     &self.service,
                     availability_agent_id.as_deref(),
@@ -207,6 +226,7 @@ impl ConversationTurnOrchestrator {
             .with_allowed_skill_names(input.allowed_skill_names.clone())
             .with_runtime_state(Arc::clone(&runtime_state))
             .with_persistence(persistence.clone())
+            .with_project_runtime_redaction(project_runtime_workspace_path.clone())
             .with_turn_completion(false)
             .with_defer_clean_terminal_errors(defer_clean_terminal_errors);
 
@@ -216,10 +236,12 @@ impl ConversationTurnOrchestrator {
             let turn_id_for_send = input.turn_id.clone();
             let feedback_service = self.service.clone();
             let feedback_agent_id = availability_agent_id.clone();
+            let send_project_runtime_workspace_path = project_runtime_workspace_path.clone();
             let (send_error_tx, send_error_rx) = oneshot::channel();
 
             tokio::spawn(async move {
                 if let Err(e) = send_agent.send_message(current_send).await {
+                    let e = redact_project_send_error(e, send_project_runtime_workspace_path.as_deref());
                     let failure_message = availability_failure_message(&e);
                     record_agent_session_failure(
                         &feedback_service,
@@ -469,6 +491,15 @@ fn availability_failure_message(error: &AgentSendError) -> String {
         .detail
         .clone()
         .unwrap_or_else(|| error.stream_error().message.clone())
+}
+
+fn redact_project_send_error(error: AgentSendError, canonical_workspace_path: Option<&str>) -> AgentSendError {
+    match canonical_workspace_path {
+        Some(path) => {
+            AgentSendError::from_stream_error_data(redact_project_runtime_error(error.stream_error(), Some(path)))
+        }
+        None => error,
+    }
 }
 
 async fn record_agent_session_failure(

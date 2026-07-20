@@ -29,6 +29,27 @@ pub enum ConversationError {
     #[error("Conversation is busy: {reason}")]
     Busy { reason: String },
 
+    #[error("Project binding changed concurrently")]
+    ProjectBindingConflict,
+
+    #[error("Project runtime attestation is required")]
+    ProjectRuntimeAttestationRequired,
+
+    #[error("Project runtime attestation is invalid")]
+    ProjectRuntimeAttestationInvalid,
+
+    #[error("Project runtime attestation does not match the request")]
+    ProjectRuntimeAttestationMismatch,
+
+    #[error("Project runtime attestation was already consumed")]
+    ProjectRuntimeAttestationReplayed,
+
+    #[error("Project runtime attestation nonce cache is full")]
+    ProjectRuntimeAttestationCacheFull,
+
+    #[error("Project runtime attestation is unavailable in this runtime")]
+    ProjectRuntimeAttestationUnavailable,
+
     #[error("Forbidden: {reason}")]
     Forbidden { reason: String },
 
@@ -103,6 +124,15 @@ impl ConversationError {
             Self::Archived { reason, .. } => AgentError::conversation_archived(reason.clone()),
             Self::BadRequest { reason } => AgentError::bad_request(reason.clone()),
             Self::Busy { reason } => AgentError::conflict(reason.clone()),
+            Self::ProjectBindingConflict => AgentError::conflict("PROJECT_BINDING_CONFLICT"),
+            Self::ProjectRuntimeAttestationRequired => AgentError::bad_request("PROJECT_RUNTIME_ATTESTATION_REQUIRED"),
+            Self::ProjectRuntimeAttestationInvalid => AgentError::forbidden("PROJECT_RUNTIME_ATTESTATION_INVALID"),
+            Self::ProjectRuntimeAttestationMismatch => AgentError::conflict("PROJECT_RUNTIME_ATTESTATION_MISMATCH"),
+            Self::ProjectRuntimeAttestationReplayed => AgentError::conflict("PROJECT_RUNTIME_ATTESTATION_REPLAYED"),
+            Self::ProjectRuntimeAttestationCacheFull => AgentError::internal("PROJECT_RUNTIME_ATTESTATION_CACHE_FULL"),
+            Self::ProjectRuntimeAttestationUnavailable => {
+                AgentError::forbidden("PROJECT_RUNTIME_ATTESTATION_UNAVAILABLE")
+            }
             Self::Forbidden { reason } => AgentError::forbidden(reason.clone()),
             Self::NotFoundReason { reason } => AgentError::not_found(reason.clone()),
             Self::Unauthorized { reason } => AgentError::unauthorized(reason.clone()),
@@ -135,6 +165,13 @@ impl ConversationError {
             Self::Unauthorized { .. } => "UNAUTHORIZED",
             Self::Forbidden { .. } => "FORBIDDEN",
             Self::Busy { .. } => "CONFLICT",
+            Self::ProjectBindingConflict => "PROJECT_BINDING_CONFLICT",
+            Self::ProjectRuntimeAttestationRequired => "PROJECT_RUNTIME_ATTESTATION_REQUIRED",
+            Self::ProjectRuntimeAttestationInvalid => "PROJECT_RUNTIME_ATTESTATION_INVALID",
+            Self::ProjectRuntimeAttestationMismatch => "PROJECT_RUNTIME_ATTESTATION_MISMATCH",
+            Self::ProjectRuntimeAttestationReplayed => "PROJECT_RUNTIME_ATTESTATION_REPLAYED",
+            Self::ProjectRuntimeAttestationCacheFull => "PROJECT_RUNTIME_ATTESTATION_CACHE_FULL",
+            Self::ProjectRuntimeAttestationUnavailable => "PROJECT_RUNTIME_ATTESTATION_UNAVAILABLE",
             Self::RateLimited => "RATE_LIMITED",
             Self::Internal { .. } | Self::Acp(_) => "INTERNAL_ERROR",
             Self::BadGateway { .. } => "BAD_GATEWAY",
@@ -179,6 +216,7 @@ impl From<DbError> for ConversationError {
     fn from(error: DbError) -> Self {
         match error {
             DbError::NotFound(reason) => Self::NotFoundReason { reason },
+            DbError::Conflict(reason) if reason == aionui_db::PROJECT_BINDING_CONFLICT => Self::ProjectBindingConflict,
             DbError::Conflict(reason) => Self::Busy { reason },
             DbError::Query(e) => Self::Internal {
                 reason: format!("Database error: {e}"),
@@ -189,6 +227,18 @@ impl From<DbError> for ConversationError {
             DbError::Init(reason) => Self::Internal {
                 reason: format!("Database init error: {reason}"),
             },
+        }
+    }
+}
+
+impl From<aionui_auth::ProjectRuntimeAttestationError> for ConversationError {
+    fn from(error: aionui_auth::ProjectRuntimeAttestationError) -> Self {
+        match error {
+            aionui_auth::ProjectRuntimeAttestationError::Required => Self::ProjectRuntimeAttestationRequired,
+            aionui_auth::ProjectRuntimeAttestationError::Invalid => Self::ProjectRuntimeAttestationInvalid,
+            aionui_auth::ProjectRuntimeAttestationError::Mismatch => Self::ProjectRuntimeAttestationMismatch,
+            aionui_auth::ProjectRuntimeAttestationError::Replayed => Self::ProjectRuntimeAttestationReplayed,
+            aionui_auth::ProjectRuntimeAttestationError::CacheFull => Self::ProjectRuntimeAttestationCacheFull,
         }
     }
 }

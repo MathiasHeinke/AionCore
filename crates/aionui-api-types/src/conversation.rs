@@ -71,6 +71,19 @@ pub struct UpdateConversationRequest {
     pub pinned: Option<bool>,
     pub model: Option<ProviderWithModel>,
     pub extra: Option<serde_json::Value>,
+    /// Compare-and-swap precondition for portable project binding changes.
+    ///
+    /// Legacy PATCH requests that do not touch the project binding may omit
+    /// this field. Binding mutations must provide the exact currently
+    /// observed pair (or two nulls when the conversation is unbound).
+    #[serde(default)]
+    pub expected_project_binding: Option<ProjectBindingExpectation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectBindingExpectation {
+    pub project_id: Option<String>,
+    pub workspace_root_ref: Option<String>,
 }
 
 /// Body for `POST /api/conversations/clone`.
@@ -87,13 +100,14 @@ pub struct CloneConversationRequest {
 ///
 /// `msg_id` is server-generated — clients must not provide one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectRuntimeWorkspaceRequest {
     pub project_id: String,
     pub workspace_root_ref: String,
     pub path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SendMessageRequest {
     pub content: String,
     #[serde(default)]
@@ -467,6 +481,29 @@ mod tests {
         assert!(req.pinned.is_none());
         assert!(req.model.is_none());
         assert!(req.extra.is_none());
+        assert!(req.expected_project_binding.is_none());
+    }
+
+    #[test]
+    fn deserialize_update_request_with_unbound_project_expectation() {
+        let raw = json!({
+            "expected_project_binding": {
+                "project_id": null,
+                "workspace_root_ref": null
+            },
+            "extra": {
+                "project_id": "018f0c00-0000-7000-8000-000000000001",
+                "workspace_root_ref": "root:primary-projects"
+            }
+        });
+        let req: UpdateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            req.expected_project_binding,
+            Some(ProjectBindingExpectation {
+                project_id: None,
+                workspace_root_ref: None,
+            })
+        );
     }
 
     #[test]

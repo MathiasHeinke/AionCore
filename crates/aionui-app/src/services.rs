@@ -8,7 +8,10 @@ use aionui_ai_agent::{
     build_agent_factory,
 };
 use aionui_api_types::GuideMcpConfig;
-use aionui_auth::{CookieConfig, JwtService, LocalCapabilityVerifier, QrTokenStore, resolve_jwt_secret};
+use aionui_auth::{
+    CookieConfig, DEFAULT_PROJECT_RUNTIME_NONCE_CAPACITY, JwtService, LocalCapabilityVerifier,
+    ProjectRuntimeAttestationVerifier, QrTokenStore, resolve_jwt_secret,
+};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
@@ -52,6 +55,7 @@ pub struct AppServices {
     /// When `true`, use the per-launch embedded-server capability.
     pub local: bool,
     pub local_capability: Option<LocalCapabilityVerifier>,
+    project_runtime_attestation_verifier: Option<Arc<ProjectRuntimeAttestationVerifier>>,
     pub local_origins: Vec<String>,
     pub allowed_roots: Vec<PathBuf>,
     pub app_version: String,
@@ -83,6 +87,7 @@ impl AppServices {
             conversation_runtime_state: self.conversation_runtime_state.clone(),
             conversation_repo: self.conversation_repo.clone(),
             task_manager_delete_hook: self.task_manager_delete_hook.clone(),
+            project_runtime_attestation_verifier: self.project_runtime_attestation_verifier.clone(),
         });
         self
     }
@@ -101,6 +106,16 @@ impl AppServices {
         let work_dir = config.work_dir.clone();
         let local = config.local;
         let local_capability = config.local_capability.clone();
+        let project_runtime_attestation_verifier = if local {
+            local_capability.as_ref().map(|capability| {
+                Arc::new(ProjectRuntimeAttestationVerifier::new(
+                    capability,
+                    DEFAULT_PROJECT_RUNTIME_NONCE_CAPACITY,
+                ))
+            })
+        } else {
+            None
+        };
         let local_origins = config.local_origins.clone();
         let allowed_roots = config.allowed_roots.clone();
         let app_version = config.app_version.clone();
@@ -227,6 +242,7 @@ impl AppServices {
             conversation_runtime_state: conversation_runtime_state.clone(),
             conversation_repo: conversation_repo.clone(),
             task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
+            project_runtime_attestation_verifier: project_runtime_attestation_verifier.clone(),
         });
 
         Ok(Self {
@@ -250,6 +266,7 @@ impl AppServices {
             work_dir,
             local,
             local_capability,
+            project_runtime_attestation_verifier,
             local_origins,
             allowed_roots,
             app_version,
@@ -271,6 +288,7 @@ struct ConversationServiceDeps<'a> {
     conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     conversation_repo: Arc<dyn IConversationRepository>,
     task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
+    project_runtime_attestation_verifier: Option<Arc<ProjectRuntimeAttestationVerifier>>,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -288,6 +306,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
     )
     .with_runtime_state(deps.conversation_runtime_state);
+    service.with_project_runtime_attestation_verifier(deps.project_runtime_attestation_verifier);
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
         deps.database.pool().clone(),

@@ -13,6 +13,12 @@ use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{
     AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
 };
+use aionui_auth::{
+    LocalCapabilityVerifier, ProjectRuntimeAttestationClaims, ProjectRuntimeAttestationPurpose,
+    ProjectRuntimeAttestationVerifier, VerifiedProjectRuntimeAttestation, sign_project_runtime_attestation,
+};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
@@ -21,8 +27,9 @@ use aionui_api_types::{
     SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ProjectRuntimeWorkspaceRequest,
-    SearchMessagesQuery, SendMessageRequest, SteerConversationRequest, UpdateConversationRequest, WebSocketMessage,
+    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ProjectBindingExpectation,
+    ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest, SteerConversationRequest,
+    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
@@ -45,10 +52,11 @@ use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, Mess
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, broadcast};
 
 use crate::ConversationError;
-use crate::service::ConversationService;
+use crate::service::{ConversationAgentTurnRequest, ConversationService};
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
@@ -1177,6 +1185,92 @@ fn project_runtime_workspace(
     }
 }
 
+const TEST_PROJECT_CAPABILITY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const TEST_PROJECT_REALM_ID: &str = "018f0c00-0000-7000-8000-000000000003";
+const TEST_PROJECT_ROOT_ID: &str = "018f0c00-0000-7000-8000-000000000004";
+const TEST_PROJECT_ROOT_REF: &str = "root:018f0c00-0000-7000-8000-000000000004";
+static PROJECT_TICKET_NONCE: AtomicUsize = AtomicUsize::new(1);
+
+fn install_project_attestation_verifier(service: &ConversationService) -> Arc<ProjectRuntimeAttestationVerifier> {
+    let verifier = Arc::new(ProjectRuntimeAttestationVerifier::new(
+        &LocalCapabilityVerifier::new(TEST_PROJECT_CAPABILITY).unwrap(),
+        128,
+    ));
+    service.with_project_runtime_attestation_verifier(Some(Arc::clone(&verifier)));
+    verifier
+}
+
+fn project_runtime_claims(
+    conversation_id: &str,
+    purpose: ProjectRuntimeAttestationPurpose,
+    runtime_workspace: &ProjectRuntimeWorkspaceRequest,
+) -> ProjectRuntimeAttestationClaims {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let nonce = PROJECT_TICKET_NONCE.fetch_add(1, Ordering::SeqCst) as u64;
+    let mut jti = [0_u8; 16];
+    jti[..8].copy_from_slice(&nonce.to_be_bytes());
+    jti[8..].copy_from_slice(&(now as u64).to_be_bytes());
+    ProjectRuntimeAttestationClaims {
+        v: 1,
+        iss: "aionui-main".into(),
+        aud: "aioncore-project-runtime".into(),
+        sub: conversation_id.into(),
+        purpose,
+        backend_generation: LocalCapabilityVerifier::new(TEST_PROJECT_CAPABILITY)
+            .unwrap()
+            .backend_generation(),
+        seat_id: "seat-owner".into(),
+        realm_id: TEST_PROJECT_REALM_ID.into(),
+        root_id: TEST_PROJECT_ROOT_ID.into(),
+        project_id: runtime_workspace.project_id.clone(),
+        workspace_root_ref: runtime_workspace.workspace_root_ref.clone(),
+        canonical_path_sha256: format!("{:x}", Sha256::digest(runtime_workspace.path.as_bytes())),
+        root_catalog_revision: 7,
+        root_ownership_revision: 5,
+        project_catalog_revision: 11,
+        root_record_sha256: "a".repeat(64),
+        project_record_sha256: "b".repeat(64),
+        iat: now,
+        nbf: now.saturating_sub(1),
+        exp: now.saturating_add(10),
+        jti: URL_SAFE_NO_PAD.encode(jti),
+    }
+}
+
+fn project_runtime_ticket(
+    conversation_id: &str,
+    purpose: ProjectRuntimeAttestationPurpose,
+    runtime_workspace: &ProjectRuntimeWorkspaceRequest,
+) -> String {
+    sign_project_runtime_attestation(
+        TEST_PROJECT_CAPABILITY,
+        &project_runtime_claims(conversation_id, purpose, runtime_workspace),
+    )
+    .unwrap()
+}
+
+fn verified_project_runtime(
+    verifier: &ProjectRuntimeAttestationVerifier,
+    conversation_id: &str,
+    purpose: ProjectRuntimeAttestationPurpose,
+    runtime_workspace: &ProjectRuntimeWorkspaceRequest,
+) -> VerifiedProjectRuntimeAttestation {
+    let ticket = project_runtime_ticket(conversation_id, purpose, runtime_workspace);
+    verifier
+        .verify_and_consume(
+            Some(&ticket),
+            conversation_id,
+            purpose,
+            &runtime_workspace.project_id,
+            &runtime_workspace.workspace_root_ref,
+            runtime_workspace,
+        )
+        .unwrap()
+}
+
 fn ensure_test_workspace_path() -> String {
     let workspace = std::env::temp_dir().join("aionui-conversation-service-test-project");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -1392,6 +1486,30 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
     let project_id = "018f0c00-0000-7000-8000-000000000001";
     let workspace_root_ref = "root:primary-projects";
 
+    let missing_expectation = svc
+        .update(
+            "user_1",
+            &conv.id,
+            UpdateConversationRequest {
+                name: None,
+                pinned: None,
+                model: None,
+                extra: Some(json!({
+                    "project_id": project_id,
+                    "workspace_root_ref": workspace_root_ref
+                })),
+                expected_project_binding: None,
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        missing_expectation,
+        ConversationError::BadRequest { reason } if reason == "PROJECT_BINDING_EXPECTATION_REQUIRED"
+    ));
+    assert_eq!(task_mgr.kill_count(), 0);
+
     let updated = svc
         .update(
             "user_1",
@@ -1404,6 +1522,10 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
                     "project_id": project_id,
                     "workspace_root_ref": workspace_root_ref
                 })),
+                expected_project_binding: Some(ProjectBindingExpectation {
+                    project_id: None,
+                    workspace_root_ref: None,
+                }),
             },
             &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
         )
@@ -1415,6 +1537,30 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
     assert!(updated.extra.get("workspace").is_none());
     assert_eq!(task_mgr.kill_count(), 1);
 
+    let stale_expectation = svc
+        .update(
+            "user_1",
+            &conv.id,
+            UpdateConversationRequest {
+                name: None,
+                pinned: None,
+                model: None,
+                extra: Some(json!({
+                    "project_id": "018f0c00-0000-7000-8000-000000000002",
+                    "workspace_root_ref": "root:secondary-projects"
+                })),
+                expected_project_binding: Some(ProjectBindingExpectation {
+                    project_id: None,
+                    workspace_root_ref: None,
+                }),
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_expectation, ConversationError::ProjectBindingConflict));
+    assert_eq!(task_mgr.kill_count(), 1);
+
     let err = svc
         .update(
             "user_1",
@@ -1424,6 +1570,10 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
                 pinned: None,
                 model: None,
                 extra: Some(json!({ "project_id": "018f0c00-0000-7000-8000-000000000002" })),
+                expected_project_binding: Some(ProjectBindingExpectation {
+                    project_id: Some(project_id.to_owned()),
+                    workspace_root_ref: Some(workspace_root_ref.to_owned()),
+                }),
             },
             &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
         )
@@ -3156,24 +3306,34 @@ async fn send_message_returns_accepted() {
 
 #[tokio::test]
 async fn project_send_validates_binding_before_persisting_message() {
-    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    install_project_attestation_verifier(&svc);
     let project_id = "018f0c00-0000-7000-8000-000000000001";
-    let workspace_root_ref = "root:primary-projects";
+    let workspace_root_ref = TEST_PROJECT_ROOT_REF;
     let conv = svc
         .create("user_1", make_project_create_req(project_id, workspace_root_ref))
         .await
         .unwrap();
+    let agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(agent)]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
     let runtime_dir = tempfile::TempDir::new().unwrap();
+    broadcaster.take_events();
 
     let missing_err = svc
-        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
         .await
         .unwrap_err();
     assert!(
         matches!(missing_err, ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_BINDING_REQUIRED")
     );
     assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.build_count(), 0);
+    assert!(broadcaster.take_events().is_empty());
 
     let mut mismatch_req = make_send_req();
     mismatch_req.runtime_workspace = Some(project_runtime_workspace(
@@ -3181,14 +3341,23 @@ async fn project_send_validates_binding_before_persisting_message() {
         workspace_root_ref,
         runtime_dir.path(),
     ));
+    let mismatch_ticket = project_runtime_ticket(
+        &conv.id,
+        ProjectRuntimeAttestationPurpose::Send,
+        mismatch_req.runtime_workspace.as_ref().unwrap(),
+    );
     let mismatch_err = svc
-        .send_message("user_1", &conv.id, mismatch_req, &task_mgr)
+        .send_message_with_project_attestation("user_1", &conv.id, mismatch_req, Some(&mismatch_ticket), &task_mgr_dyn)
         .await
         .unwrap_err();
-    assert!(
-        matches!(mismatch_err, ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_BINDING_MISMATCH")
-    );
+    assert!(matches!(
+        mismatch_err,
+        ConversationError::ProjectRuntimeAttestationMismatch
+    ));
     assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.build_count(), 0);
+    assert!(broadcaster.take_events().is_empty());
 
     let mut valid_req = make_send_req();
     valid_req.runtime_workspace = Some(project_runtime_workspace(
@@ -3196,22 +3365,59 @@ async fn project_send_validates_binding_before_persisting_message() {
         workspace_root_ref,
         runtime_dir.path(),
     ));
-    svc.send_message("user_1", &conv.id, valid_req, &task_mgr)
+    let missing_ticket_err = svc
+        .send_message("user_1", &conv.id, valid_req.clone(), &task_mgr_dyn)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(
+        missing_ticket_err,
+        ConversationError::ProjectRuntimeAttestationRequired
+    ));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.build_count(), 0);
+    assert!(broadcaster.take_events().is_empty());
+
+    let valid_ticket = project_runtime_ticket(
+        &conv.id,
+        ProjectRuntimeAttestationPurpose::Send,
+        valid_req.runtime_workspace.as_ref().unwrap(),
+    );
+    svc.send_message_with_project_attestation(
+        "user_1",
+        &conv.id,
+        valid_req.clone(),
+        Some(&valid_ticket),
+        &task_mgr_dyn,
+    )
+    .await
+    .unwrap();
     wait_for_turn_released(&svc, &conv.id).await;
 
     assert_eq!(repo_messages_asc(&repo, &conv.id, 10).await.len(), 1);
+    assert_eq!(task_mgr.build_count(), 1);
     let stored = repo.get(&conv.id).await.unwrap().unwrap();
     assert!(!stored.extra.contains(runtime_dir.path().to_string_lossy().as_ref()));
     assert!(!stored.extra.contains("\"workspace\""));
+
+    broadcaster.take_events();
+    let replay = svc
+        .send_message_with_project_attestation("user_1", &conv.id, valid_req, Some(&valid_ticket), &task_mgr_dyn)
+        .await
+        .unwrap_err();
+    assert!(matches!(replay, ConversationError::ProjectRuntimeAttestationReplayed));
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.build_count(), 1);
+    assert_eq!(repo_messages_asc(&repo, &conv.id, 10).await.len(), 1);
+    assert!(broadcaster.take_events().is_empty());
 }
 
 #[tokio::test]
 async fn project_runtime_builder_uses_transient_canonical_path_only() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let verifier = install_project_attestation_verifier(&svc);
     let project_id = "018f0c00-0000-7000-8000-000000000001";
-    let workspace_root_ref = "root:primary-projects";
+    let workspace_root_ref = TEST_PROJECT_ROOT_REF;
     let conv = svc
         .create("user_1", make_project_create_req(project_id, workspace_root_ref))
         .await
@@ -3219,9 +3425,15 @@ async fn project_runtime_builder_uses_transient_canonical_path_only() {
     let row = repo.get(&conv.id).await.unwrap().unwrap();
     let runtime_dir = tempfile::TempDir::new().unwrap();
     let runtime_workspace = project_runtime_workspace(project_id, workspace_root_ref, runtime_dir.path());
+    let verified = verified_project_runtime(
+        &verifier,
+        &conv.id,
+        ProjectRuntimeAttestationPurpose::Send,
+        &runtime_workspace,
+    );
 
     let options = svc
-        .build_task_options_with_project_workspace(&row, &runtime_workspace)
+        .build_task_options_with_project_workspace(&row, &runtime_workspace, &verified)
         .await
         .unwrap();
     assert_eq!(options.context.workspace.path, runtime_workspace.path);
@@ -3233,10 +3445,208 @@ async fn project_runtime_builder_uses_transient_canonical_path_only() {
         ..runtime_workspace
     };
     let err = svc
-        .build_task_options_with_project_workspace(&row, &relative)
+        .build_task_options_with_project_workspace(&row, &relative, &verified)
         .await
         .unwrap_err();
-    assert!(matches!(err, ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_PATH_NOT_ABSOLUTE"));
+    assert!(matches!(err, ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_BINDING_MISMATCH"));
+}
+
+#[tokio::test]
+async fn project_runtime_is_unavailable_without_local_capability_verifier() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let conv = svc
+        .create("user_1", make_project_create_req(project_id, TEST_PROJECT_ROOT_REF))
+        .await
+        .unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    let mut request = make_send_req();
+    request.runtime_workspace = Some(project_runtime_workspace(
+        project_id,
+        TEST_PROJECT_ROOT_REF,
+        runtime_dir.path(),
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(Vec::new()));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    broadcaster.take_events();
+
+    let error = svc
+        .send_message_with_project_attestation(
+            "user_1",
+            &conv.id,
+            request,
+            Some("header.payload.signature"),
+            &task_mgr_dyn,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::ProjectRuntimeAttestationUnavailable));
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.build_count(), 0);
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(broadcaster.take_events().is_empty());
+}
+
+#[tokio::test]
+async fn project_bound_run_agent_turn_rejects_before_any_runtime_or_persistence_side_effect() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc
+        .create(
+            "user_1",
+            make_project_create_req("018f0c00-0000-7000-8000-000000000001", TEST_PROJECT_ROOT_REF),
+        )
+        .await
+        .unwrap();
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_count_for_turn = Arc::clone(&callback_count);
+    broadcaster.take_events();
+
+    let error = svc
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "internal project turn".into(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            on_started: Some(Arc::new(move |_| {
+                let callback_count = Arc::clone(&callback_count_for_turn);
+                Box::pin(async move {
+                    callback_count.fetch_add(1, Ordering::SeqCst);
+                })
+            })),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_BINDING_REQUIRED"
+    ));
+    assert_eq!(callback_count.load(Ordering::SeqCst), 0);
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.active_count(), 0);
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(broadcaster.take_events().is_empty());
+}
+
+#[tokio::test]
+async fn project_warmup_redacts_runtime_path_from_returned_failure() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    install_project_attestation_verifier(&svc);
+    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let conv = svc
+        .create("user_1", make_project_create_req(project_id, TEST_PROJECT_ROOT_REF))
+        .await
+        .unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    let runtime_workspace = project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, runtime_dir.path());
+    let secret_path = runtime_workspace.path.clone();
+    let ticket = project_runtime_ticket(&conv.id, ProjectRuntimeAttestationPurpose::Warmup, &runtime_workspace);
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(FailingBuildTaskManager::new(format!(
+        "runtime failed while opening {secret_path}"
+    )));
+
+    let error = svc
+        .warmup_with_project_attestation("user_1", &conv.id, &runtime_workspace, Some(&ticket), &task_mgr)
+        .await
+        .unwrap_err();
+    let rendered = error.to_string();
+    assert!(!rendered.contains(&secret_path));
+    assert!(rendered.contains("[project workspace redacted]"));
+}
+
+#[tokio::test]
+async fn project_send_redacts_runtime_path_from_persisted_and_streamed_failures() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    install_project_attestation_verifier(&svc);
+    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let conv = svc
+        .create("user_1", make_project_create_req(project_id, TEST_PROJECT_ROOT_REF))
+        .await
+        .unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    let runtime_workspace = project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, runtime_dir.path());
+    let secret_path = runtime_workspace.path.clone();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(FailingBuildTaskManager::new(format!(
+        "runtime failed while opening {secret_path}"
+    )));
+    let mut request = make_send_req();
+    request.runtime_workspace = Some(runtime_workspace);
+    let ticket = project_runtime_ticket(
+        &conv.id,
+        ProjectRuntimeAttestationPurpose::Send,
+        request.runtime_workspace.as_ref().unwrap(),
+    );
+    broadcaster.take_events();
+
+    svc.send_message_with_project_attestation("user_1", &conv.id, request, Some(&ticket), &task_mgr)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let persisted = serde_json::to_string(&repo_messages_asc(&repo, &conv.id, 20).await).unwrap();
+    assert!(!persisted.contains(&secret_path));
+    assert!(persisted.contains("[project workspace redacted]"));
+    assert!(!persisted.contains("workspacePath"));
+    assert!(!persisted.contains("workspace_path"));
+
+    let streamed = serde_json::to_string(&broadcaster.take_events()).unwrap();
+    assert!(!streamed.contains(&secret_path));
+    assert!(streamed.contains("[project workspace redacted]"));
+    assert!(!streamed.contains("workspacePath"));
+    assert!(!streamed.contains("workspace_path"));
+}
+
+#[tokio::test]
+async fn project_stream_error_is_redacted_before_websocket_and_database_boundaries() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    install_project_attestation_verifier(&svc);
+    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let conv = svc
+        .create("user_1", make_project_create_req(project_id, TEST_PROJECT_ROOT_REF))
+        .await
+        .unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    let runtime_workspace = project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, runtime_dir.path());
+    let secret_path = runtime_workspace.path.clone();
+    let agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: format!("runtime failed in {secret_path}"),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: Some(format!("could not read {secret_path}")),
+            workspace_path: Some(secret_path.clone()),
+            retryable: Some(false),
+            feedback_recommended: Some(false),
+            resolution: None,
+        })]],
+    ));
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(agent)]));
+    let mut request = make_send_req();
+    request.runtime_workspace = Some(runtime_workspace);
+    let ticket = project_runtime_ticket(
+        &conv.id,
+        ProjectRuntimeAttestationPurpose::Send,
+        request.runtime_workspace.as_ref().unwrap(),
+    );
+    broadcaster.take_events();
+
+    svc.send_message_with_project_attestation("user_1", &conv.id, request, Some(&ticket), &task_mgr)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let persisted = serde_json::to_string(&repo_messages_asc(&repo, &conv.id, 20).await).unwrap();
+    let streamed = serde_json::to_string(&broadcaster.take_events()).unwrap();
+    for output in [&persisted, &streamed] {
+        assert!(!output.contains(&secret_path));
+        assert!(output.contains("[project workspace redacted]"));
+        assert!(!output.contains("workspacePath"));
+        assert!(!output.contains("workspace_path"));
+    }
 }
 
 #[tokio::test]
@@ -3690,6 +4100,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
                 name: None,
                 extra: None,
                 pinned: None,
+                expected_project_binding: None,
             },
             &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
         )
@@ -3751,6 +4162,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
                 name: None,
                 extra: None,
                 pinned: None,
+                expected_project_binding: None,
             },
             &(task_mgr as Arc<dyn IWorkerTaskManager>),
         )
@@ -5540,9 +5952,10 @@ async fn warmup_creates_agent_task() {
 #[tokio::test]
 async fn project_warmup_requires_transient_binding_and_never_persists_path() {
     let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    install_project_attestation_verifier(&svc);
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
     let project_id = "018f0c00-0000-7000-8000-000000000001";
-    let workspace_root_ref = "root:primary-projects";
+    let workspace_root_ref = TEST_PROJECT_ROOT_REF;
     let conv = svc
         .create("user_1", make_project_create_req(project_id, workspace_root_ref))
         .await
@@ -5553,7 +5966,16 @@ async fn project_warmup_requires_transient_binding_and_never_persists_path() {
 
     let runtime_dir = tempfile::TempDir::new().unwrap();
     let runtime_workspace = project_runtime_workspace(project_id, workspace_root_ref, runtime_dir.path());
-    svc.warmup_with_project_workspace("user_1", &conv.id, &runtime_workspace, &task_mgr)
+    let missing_ticket = svc
+        .warmup_with_project_workspace("user_1", &conv.id, &runtime_workspace, &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        missing_ticket,
+        ConversationError::ProjectRuntimeAttestationRequired
+    ));
+    let ticket = project_runtime_ticket(&conv.id, ProjectRuntimeAttestationPurpose::Warmup, &runtime_workspace);
+    svc.warmup_with_project_attestation("user_1", &conv.id, &runtime_workspace, Some(&ticket), &task_mgr)
         .await
         .unwrap();
 

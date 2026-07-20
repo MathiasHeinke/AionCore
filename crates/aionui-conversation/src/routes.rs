@@ -3,7 +3,7 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
@@ -14,7 +14,7 @@ use aionui_api_types::{
     MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SteerConversationRequest,
     SteerConversationResponse, UpdateConversationArtifactRequest, UpdateConversationRequest, WarmupConversationRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, extract_project_runtime_attestation_from_headers};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
@@ -32,6 +32,48 @@ impl From<ConversationError> for ApiError {
             ConversationError::Archived { reason, .. } => ApiError::ConversationArchived(reason),
             ConversationError::BadRequest { reason } => ApiError::BadRequest(reason),
             ConversationError::Busy { reason } => ApiError::Conflict(reason),
+            ConversationError::ProjectBindingConflict => ApiError::coded(
+                StatusCode::CONFLICT,
+                "PROJECT_BINDING_CONFLICT",
+                "Project binding changed concurrently",
+                None,
+            ),
+            ConversationError::ProjectRuntimeAttestationRequired => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "PROJECT_RUNTIME_ATTESTATION_REQUIRED",
+                "Project runtime attestation is required",
+                None,
+            ),
+            ConversationError::ProjectRuntimeAttestationInvalid => ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "PROJECT_RUNTIME_ATTESTATION_INVALID",
+                "Project runtime attestation is invalid",
+                None,
+            ),
+            ConversationError::ProjectRuntimeAttestationMismatch => ApiError::coded(
+                StatusCode::CONFLICT,
+                "PROJECT_RUNTIME_ATTESTATION_MISMATCH",
+                "Project runtime attestation does not match the request",
+                None,
+            ),
+            ConversationError::ProjectRuntimeAttestationReplayed => ApiError::coded(
+                StatusCode::CONFLICT,
+                "PROJECT_RUNTIME_ATTESTATION_REPLAYED",
+                "Project runtime attestation was already consumed",
+                None,
+            ),
+            ConversationError::ProjectRuntimeAttestationCacheFull => ApiError::coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PROJECT_RUNTIME_ATTESTATION_CACHE_FULL",
+                "Project runtime attestation capacity is unavailable",
+                None,
+            ),
+            ConversationError::ProjectRuntimeAttestationUnavailable => ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "PROJECT_RUNTIME_ATTESTATION_UNAVAILABLE",
+                "Project runtime attestation is unavailable in this runtime",
+                None,
+            ),
             ConversationError::Forbidden { reason } => ApiError::Forbidden(reason),
             ConversationError::NotFoundReason { reason } => ApiError::NotFound(reason),
             ConversationError::Unauthorized { reason } => ApiError::Unauthorized(reason),
@@ -244,12 +286,15 @@ async fn send_msg(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let project_attestation = extract_project_runtime_attestation_from_headers(&headers)
+        .map_err(|_| ApiError::from(ConversationError::ProjectRuntimeAttestationInvalid))?;
     let response = state
         .service
-        .send_message(&user.id, &id, req, &state.task_manager)
+        .send_message_with_project_attestation(&user.id, &id, req, project_attestation.as_deref(), &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
@@ -324,8 +369,11 @@ async fn warmup(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let project_attestation = extract_project_runtime_attestation_from_headers(&headers)
+        .map_err(|_| ApiError::from(ConversationError::ProjectRuntimeAttestationInvalid))?;
     let runtime_workspace = match body {
         None | Some(Json(serde_json::Value::Null)) => None,
         Some(Json(value)) => {
@@ -337,10 +385,19 @@ async fn warmup(
     if let Some(runtime_workspace) = runtime_workspace {
         state
             .service
-            .warmup_with_project_workspace(&user.id, &id, &runtime_workspace, &state.task_manager)
+            .warmup_with_project_attestation(
+                &user.id,
+                &id,
+                &runtime_workspace,
+                project_attestation.as_deref(),
+                &state.task_manager,
+            )
             .await
             .map_err(ApiError::from)?;
     } else {
+        if project_attestation.is_some() {
+            return Err(ApiError::from(ConversationError::ProjectRuntimeAttestationMismatch));
+        }
         state
             .service
             .warmup(&user.id, &id, &state.task_manager)
@@ -496,5 +553,50 @@ mod error_mapping_tests {
         let details = app.error_details().expect("details should be present");
         assert_eq!(details["backend"], "openclaw");
         assert_eq!(details["port"], 18789);
+    }
+
+    #[test]
+    fn project_runtime_and_binding_failures_keep_stable_http_codes() {
+        for (error, status, code) in [
+            (
+                ConversationError::ProjectBindingConflict,
+                StatusCode::CONFLICT,
+                "PROJECT_BINDING_CONFLICT",
+            ),
+            (
+                ConversationError::ProjectRuntimeAttestationRequired,
+                StatusCode::BAD_REQUEST,
+                "PROJECT_RUNTIME_ATTESTATION_REQUIRED",
+            ),
+            (
+                ConversationError::ProjectRuntimeAttestationInvalid,
+                StatusCode::FORBIDDEN,
+                "PROJECT_RUNTIME_ATTESTATION_INVALID",
+            ),
+            (
+                ConversationError::ProjectRuntimeAttestationMismatch,
+                StatusCode::CONFLICT,
+                "PROJECT_RUNTIME_ATTESTATION_MISMATCH",
+            ),
+            (
+                ConversationError::ProjectRuntimeAttestationReplayed,
+                StatusCode::CONFLICT,
+                "PROJECT_RUNTIME_ATTESTATION_REPLAYED",
+            ),
+            (
+                ConversationError::ProjectRuntimeAttestationCacheFull,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PROJECT_RUNTIME_ATTESTATION_CACHE_FULL",
+            ),
+            (
+                ConversationError::ProjectRuntimeAttestationUnavailable,
+                StatusCode::FORBIDDEN,
+                "PROJECT_RUNTIME_ATTESTATION_UNAVAILABLE",
+            ),
+        ] {
+            let app = ApiError::from(error);
+            assert_eq!(app.status_code(), status);
+            assert_eq!(app.error_code(), code);
+        }
     }
 }

@@ -1,7 +1,7 @@
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessageRowUpdate, SqliteConversationRepository, init_database_memory, models::ConversationRow,
-    models::MessageRow,
+    ConversationFilters, ConversationProjectBindingExpectation, ConversationRowUpdate, IConversationRepository,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, MessageRowUpdate, SqliteConversationRepository,
+    init_database_memory, models::ConversationRow, models::MessageRow,
 };
 
 const USER_ID: &str = "system_default_user";
@@ -101,6 +101,145 @@ async fn create_get_update_delete_lifecycle() {
     // Delete
     repo.delete(&conv.id).await.unwrap();
     assert!(repo.get(&conv.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn project_binding_cas_binds_unbound_row_and_preserves_unrelated_extra() {
+    let (repo, _db) = setup().await;
+    let mut conv = make_conversation("project-cas-bind");
+    conv.extra = serde_json::json!({ "marker": "keep-me" }).to_string();
+    repo.create(&conv).await.unwrap();
+
+    repo.update_project_binding_cas(
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(
+                serde_json::json!({
+                    "marker": "keep-me",
+                    "project_id": "018f0c00-0000-7000-8000-000000000001",
+                    "workspace_root_ref": "root:primary-projects"
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        },
+        &ConversationProjectBindingExpectation::unbound(),
+    )
+    .await
+    .unwrap();
+
+    let stored: serde_json::Value = serde_json::from_str(&repo.get(&conv.id).await.unwrap().unwrap().extra).unwrap();
+    assert_eq!(stored["marker"], "keep-me");
+    assert_eq!(stored["project_id"], "018f0c00-0000-7000-8000-000000000001");
+    assert_eq!(stored["workspace_root_ref"], "root:primary-projects");
+}
+
+#[tokio::test]
+async fn concurrent_project_binding_cas_has_exactly_one_committer() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let (repo, _db) = setup().await;
+    let mut conv = make_conversation("project-cas-race");
+    conv.extra = serde_json::json!({ "marker": "original" }).to_string();
+    repo.create(&conv).await.unwrap();
+    let repo = Arc::new(repo);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut joins = Vec::new();
+    for suffix in ["001", "002"] {
+        let repo = Arc::clone(&repo);
+        let barrier = Arc::clone(&barrier);
+        let conversation_id = conv.id.clone();
+        let project_id = format!("018f0c00-0000-7000-8000-000000000{suffix}");
+        joins.push(tokio::spawn(async move {
+            barrier.wait().await;
+            repo.update_project_binding_cas(
+                &conversation_id,
+                &ConversationRowUpdate {
+                    extra: Some(
+                        serde_json::json!({
+                            "marker": suffix,
+                            "project_id": project_id,
+                            "workspace_root_ref": "root:primary-projects"
+                        })
+                        .to_string(),
+                    ),
+                    ..Default::default()
+                },
+                &ConversationProjectBindingExpectation::unbound(),
+            )
+            .await
+        }));
+    }
+    barrier.wait().await;
+    let mut results = Vec::new();
+    for join in joins {
+        results.push(join.await);
+    }
+    let success_count = results.iter().filter(|result| matches!(result, Ok(Ok(())))).count();
+    let conflict_count = results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result,
+                Ok(Err(aionui_db::DbError::Conflict(reason))) if reason == "PROJECT_BINDING_CONFLICT"
+            )
+        })
+        .count();
+    assert_eq!(success_count, 1);
+    assert_eq!(conflict_count, 1);
+}
+
+#[tokio::test]
+async fn stale_project_unbind_cannot_overwrite_newer_manual_rebind() {
+    let (repo, _db) = setup().await;
+    let project_a = "018f0c00-0000-7000-8000-000000000001";
+    let project_b = "018f0c00-0000-7000-8000-000000000002";
+    let mut conv = make_conversation("project-cas-stale-rollback");
+    conv.extra = serde_json::json!({
+        "marker": "before",
+        "project_id": project_a,
+        "workspace_root_ref": "root:primary-projects"
+    })
+    .to_string();
+    repo.create(&conv).await.unwrap();
+
+    repo.update_project_binding_cas(
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(
+                serde_json::json!({
+                    "marker": "manual-winner",
+                    "project_id": project_b,
+                    "workspace_root_ref": "root:secondary-projects"
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        },
+        &ConversationProjectBindingExpectation::bound(project_a, "root:primary-projects"),
+    )
+    .await
+    .unwrap();
+
+    let stale_rollback = repo
+        .update_project_binding_cas(
+            &conv.id,
+            &ConversationRowUpdate {
+                extra: Some(serde_json::json!({ "marker": "stale-rollback" }).to_string()),
+                ..Default::default()
+            },
+            &ConversationProjectBindingExpectation::bound(project_a, "root:primary-projects"),
+        )
+        .await;
+    assert!(
+        matches!(stale_rollback, Err(aionui_db::DbError::Conflict(reason)) if reason == "PROJECT_BINDING_CONFLICT")
+    );
+
+    let stored: serde_json::Value = serde_json::from_str(&repo.get(&conv.id).await.unwrap().unwrap().extra).unwrap();
+    assert_eq!(stored["marker"], "manual-winner");
+    assert_eq!(stored["project_id"], project_b);
+    assert_eq!(stored["workspace_root_ref"], "root:secondary-projects");
 }
 
 #[tokio::test]

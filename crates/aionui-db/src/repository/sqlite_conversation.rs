@@ -8,8 +8,9 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    ConversationFilters, ConversationProjectBindingExpectation, ConversationRowUpdate, IConversationRepository,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    PROJECT_BINDING_CONFLICT,
 };
 
 /// SQLite-backed implementation of [`IConversationRepository`].
@@ -245,6 +246,87 @@ impl IConversationRepository for SqliteConversationRepository {
         }
 
         Ok(())
+    }
+
+    async fn update_project_binding_cas(
+        &self,
+        id: &str,
+        updates: &ConversationRowUpdate,
+        expected: &ConversationProjectBindingExpectation,
+    ) -> Result<(), DbError> {
+        let mut set_parts: Vec<String> = Vec::new();
+        let mut binds: Vec<BindValue> = Vec::new();
+
+        if let Some(ref name) = updates.name {
+            set_parts.push("name = ?".to_string());
+            binds.push(BindValue::Str(name.clone()));
+        }
+        if let Some(pinned) = updates.pinned {
+            set_parts.push("pinned = ?".to_string());
+            binds.push(BindValue::Bool(pinned));
+        }
+        if let Some(ref pinned_at) = updates.pinned_at {
+            set_parts.push("pinned_at = ?".to_string());
+            binds.push(BindValue::OptI64(*pinned_at));
+        }
+        if let Some(ref model) = updates.model {
+            set_parts.push("model = ?".to_string());
+            binds.push(BindValue::OptStr(model.clone()));
+        }
+        if let Some(ref extra) = updates.extra {
+            set_parts.push("extra = ?".to_string());
+            binds.push(BindValue::Str(extra.clone()));
+        }
+        if let Some(ref status) = updates.status {
+            set_parts.push("status = ?".to_string());
+            binds.push(BindValue::Str(status.clone()));
+        }
+        if let Some(updated_at) = updates.updated_at {
+            set_parts.push("updated_at = ?".to_string());
+            binds.push(BindValue::I64(updated_at));
+        }
+        if set_parts.is_empty() {
+            return Ok(());
+        }
+
+        let binding_predicate = match (&expected.project_id, &expected.workspace_root_ref) {
+            (None, None) => {
+                "json_type(extra, '$.project_id') IS NULL AND json_type(extra, '$.workspace_root_ref') IS NULL"
+            }
+            (Some(_), Some(_)) => {
+                "json_type(extra, '$.project_id') = 'text' \
+                 AND json_extract(extra, '$.project_id') = ? \
+                 AND json_type(extra, '$.workspace_root_ref') = 'text' \
+                 AND json_extract(extra, '$.workspace_root_ref') = ?"
+            }
+            _ => return Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned())),
+        };
+        let sql = format!(
+            "UPDATE conversations SET {} WHERE id = ? AND {binding_predicate}",
+            set_parts.join(", ")
+        );
+        let mut query = sqlx::query(&sql);
+        for bind in &binds {
+            query = bind_value(query, bind);
+        }
+        query = query.bind(id);
+        if let (Some(project_id), Some(workspace_root_ref)) = (&expected.project_id, &expected.workspace_root_ref) {
+            query = query.bind(project_id).bind(workspace_root_ref);
+        }
+
+        let result = query.execute(&self.pool).await?;
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
+        let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?)")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        if exists == 0 {
+            Err(DbError::NotFound(format!("Conversation '{id}' not found")))
+        } else {
+            Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned()))
+        }
     }
 
     async fn delete(&self, id: &str) -> Result<(), DbError> {
