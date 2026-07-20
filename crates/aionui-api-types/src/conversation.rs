@@ -86,6 +86,13 @@ pub struct CloneConversationRequest {
 /// Body for `POST /api/conversations/:id/messages`.
 ///
 /// `msg_id` is server-generated — clients must not provide one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectRuntimeWorkspaceRequest {
+    pub project_id: String,
+    pub workspace_root_ref: String,
+    pub path: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SendMessageRequest {
     pub content: String,
@@ -95,6 +102,18 @@ pub struct SendMessageRequest {
     pub inject_skills: Vec<String>,
     #[serde(default)]
     pub hidden: bool,
+    /// Transient, request-only workspace resolution for project-bound
+    /// conversations. `path` is never part of the persisted conversation
+    /// identity; the main process resolves it from the active seat/root.
+    #[serde(default)]
+    pub runtime_workspace: Option<ProjectRuntimeWorkspaceRequest>,
+}
+
+/// Optional body for `POST /api/conversations/:id/warmup`.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct WarmupConversationRequest {
+    #[serde(default)]
+    pub runtime_workspace: Option<ProjectRuntimeWorkspaceRequest>,
 }
 
 /// Response for `POST /api/conversations/:id/messages`.
@@ -804,13 +823,26 @@ mod tests {
             "content": "Review this code",
             "files": ["/tmp/a.rs"],
             "inject_skills": ["security-review"],
-            "hidden": true
+            "hidden": true,
+            "runtime_workspace": {
+                "project_id": "018f0c00-0000-7000-8000-000000000001",
+                "workspace_root_ref": "root:primary-projects",
+                "path": "/tmp/portable-project"
+            }
         });
         let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Review this code");
         assert_eq!(req.files, vec!["/tmp/a.rs"]);
         assert_eq!(req.inject_skills, vec!["security-review"]);
         assert!(req.hidden);
+        assert_eq!(
+            req.runtime_workspace,
+            Some(ProjectRuntimeWorkspaceRequest {
+                project_id: "018f0c00-0000-7000-8000-000000000001".into(),
+                workspace_root_ref: "root:primary-projects".into(),
+                path: "/tmp/portable-project".into(),
+            })
+        );
     }
 
     #[test]
@@ -821,6 +853,7 @@ mod tests {
         assert!(req.files.is_empty());
         assert!(req.inject_skills.is_empty());
         assert!(!req.hidden);
+        assert!(req.runtime_workspace.is_none());
     }
 
     #[test]
@@ -835,6 +868,22 @@ mod tests {
         let raw = json!({ "content": "Hi", "msg_id": "client-supplied" });
         let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Hi");
+    }
+
+    #[test]
+    fn deserialize_warmup_project_runtime_workspace() {
+        let raw = json!({
+            "runtime_workspace": {
+                "project_id": "018f0c00-0000-7000-8000-000000000001",
+                "workspace_root_ref": "root:primary-projects",
+                "path": "/tmp/portable-project"
+            }
+        });
+        let req: WarmupConversationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            req.runtime_workspace.unwrap().workspace_root_ref,
+            "root:primary-projects"
+        );
     }
 
     // ── Paginated type aliases ──────────────────────────────────────

@@ -12,7 +12,7 @@ use aionui_api_types::{
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
     MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SteerConversationRequest,
-    SteerConversationResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    SteerConversationResponse, UpdateConversationArtifactRequest, UpdateConversationRequest, WarmupConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -324,12 +324,29 @@ async fn warmup(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state
-        .service
-        .warmup(&user.id, &id, &state.task_manager)
-        .await
-        .map_err(ApiError::from)?;
+    let runtime_workspace = match body {
+        None | Some(Json(serde_json::Value::Null)) => None,
+        Some(Json(value)) => {
+            serde_json::from_value::<WarmupConversationRequest>(value)
+                .map_err(|error| ApiError::BadRequest(format!("Invalid warmup request: {error}")))?
+                .runtime_workspace
+        }
+    };
+    if let Some(runtime_workspace) = runtime_workspace {
+        state
+            .service
+            .warmup_with_project_workspace(&user.id, &id, &runtime_workspace, &state.task_manager)
+            .await
+            .map_err(ApiError::from)?;
+    } else {
+        state
+            .service
+            .warmup(&user.id, &id, &state.task_manager)
+            .await
+            .map_err(ApiError::from)?;
+    }
     Ok(Json(ApiResponse::success()))
 }
 

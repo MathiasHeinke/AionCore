@@ -21,8 +21,8 @@ use aionui_api_types::{
     SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
-    SendMessageRequest, SteerConversationRequest, UpdateConversationRequest, WebSocketMessage,
+    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ProjectRuntimeWorkspaceRequest,
+    SearchMessagesQuery, SendMessageRequest, SteerConversationRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
@@ -1154,6 +1154,29 @@ fn make_create_req_with_backend(backend: &str) -> CreateConversationRequest {
     .unwrap()
 }
 
+fn make_project_create_req(project_id: &str, workspace_root_ref: &str) -> CreateConversationRequest {
+    serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "project_id": project_id,
+            "workspace_root_ref": workspace_root_ref
+        }
+    }))
+    .unwrap()
+}
+
+fn project_runtime_workspace(
+    project_id: &str,
+    workspace_root_ref: &str,
+    path: &Path,
+) -> ProjectRuntimeWorkspaceRequest {
+    ProjectRuntimeWorkspaceRequest {
+        project_id: project_id.to_owned(),
+        workspace_root_ref: workspace_root_ref.to_owned(),
+        path: std::fs::canonicalize(path).unwrap().to_string_lossy().into_owned(),
+    }
+}
+
 fn ensure_test_workspace_path() -> String {
     let workspace = std::env::temp_dir().join("aionui-conversation-service-test-project");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -1301,6 +1324,118 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
+}
+
+#[tokio::test]
+async fn create_project_conversation_persists_only_portable_binding() {
+    let (svc, broadcaster, repo, _task_mgr) = make_service();
+    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let workspace_root_ref = "root:primary-projects";
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "Portable Project",
+        "extra": {
+            "project_id": project_id,
+            "workspace_root_ref": workspace_root_ref
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.create("user_1", req).await.unwrap();
+
+    assert_eq!(resp.extra["project_id"], project_id);
+    assert_eq!(resp.extra["workspace_root_ref"], workspace_root_ref);
+    assert!(resp.extra.get("workspace").is_none());
+
+    let stored = repo.get(&resp.id).await.unwrap().unwrap();
+    assert!(stored.extra.contains(project_id));
+    assert!(stored.extra.contains(workspace_root_ref));
+    assert!(!stored.extra.contains(std::env::temp_dir().to_string_lossy().as_ref()));
+
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 1);
+    let encoded = serde_json::to_string(&events[0]).unwrap();
+    assert!(!encoded.contains("workspace"));
+    assert!(!encoded.contains(std::env::temp_dir().to_string_lossy().as_ref()));
+}
+
+#[tokio::test]
+async fn create_project_conversation_rejects_incomplete_or_path_bearing_binding() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
+
+    for extra in [
+        json!({ "project_id": "018f0c00-0000-7000-8000-000000000001" }),
+        json!({ "workspace_root_ref": "root:primary-projects" }),
+        json!({
+            "project_id": "018f0c00-0000-7000-8000-000000000001",
+            "workspace_root_ref": "root:primary-projects",
+            "workspace": workspace
+        }),
+    ] {
+        let req: CreateConversationRequest = serde_json::from_value(json!({
+            "type": "acp",
+            "extra": extra
+        }))
+        .unwrap();
+
+        let err = svc.create("user_1", req).await.unwrap_err();
+        assert!(matches!(err, ConversationError::BadRequest { .. }));
+    }
+}
+
+#[tokio::test]
+async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runtime() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let workspace_root_ref = "root:primary-projects";
+
+    let updated = svc
+        .update(
+            "user_1",
+            &conv.id,
+            UpdateConversationRequest {
+                name: None,
+                pinned: None,
+                model: None,
+                extra: Some(json!({
+                    "project_id": project_id,
+                    "workspace_root_ref": workspace_root_ref
+                })),
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.extra["project_id"], project_id);
+    assert_eq!(updated.extra["workspace_root_ref"], workspace_root_ref);
+    assert!(updated.extra.get("workspace").is_none());
+    assert_eq!(task_mgr.kill_count(), 1);
+
+    let err = svc
+        .update(
+            "user_1",
+            &conv.id,
+            UpdateConversationRequest {
+                name: None,
+                pinned: None,
+                model: None,
+                extra: Some(json!({ "project_id": "018f0c00-0000-7000-8000-000000000002" })),
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ConversationError::BadRequest { reason } if reason == "PROJECT_BINDING_UPDATE_REQUIRES_PAIR")
+    );
+
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    assert!(stored.extra.contains(project_id));
+    assert!(!stored.extra.contains("000000000002"));
 }
 
 #[tokio::test]
@@ -3020,6 +3155,91 @@ async fn send_message_returns_accepted() {
 }
 
 #[tokio::test]
+async fn project_send_validates_binding_before_persisting_message() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let workspace_root_ref = "root:primary-projects";
+    let conv = svc
+        .create("user_1", make_project_create_req(project_id, workspace_root_ref))
+        .await
+        .unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+
+    let missing_err = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(missing_err, ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_BINDING_REQUIRED")
+    );
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+
+    let mut mismatch_req = make_send_req();
+    mismatch_req.runtime_workspace = Some(project_runtime_workspace(
+        "018f0c00-0000-7000-8000-000000000002",
+        workspace_root_ref,
+        runtime_dir.path(),
+    ));
+    let mismatch_err = svc
+        .send_message("user_1", &conv.id, mismatch_req, &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(mismatch_err, ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_BINDING_MISMATCH")
+    );
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+
+    let mut valid_req = make_send_req();
+    valid_req.runtime_workspace = Some(project_runtime_workspace(
+        project_id,
+        workspace_root_ref,
+        runtime_dir.path(),
+    ));
+    svc.send_message("user_1", &conv.id, valid_req, &task_mgr)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(repo_messages_asc(&repo, &conv.id, 10).await.len(), 1);
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    assert!(!stored.extra.contains(runtime_dir.path().to_string_lossy().as_ref()));
+    assert!(!stored.extra.contains("\"workspace\""));
+}
+
+#[tokio::test]
+async fn project_runtime_builder_uses_transient_canonical_path_only() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let workspace_root_ref = "root:primary-projects";
+    let conv = svc
+        .create("user_1", make_project_create_req(project_id, workspace_root_ref))
+        .await
+        .unwrap();
+    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    let runtime_workspace = project_runtime_workspace(project_id, workspace_root_ref, runtime_dir.path());
+
+    let options = svc
+        .build_task_options_with_project_workspace(&row, &runtime_workspace)
+        .await
+        .unwrap();
+    assert_eq!(options.context.workspace.path, runtime_workspace.path);
+    assert!(options.context.workspace.stored_path.is_empty());
+    assert!(options.context.workspace.is_custom);
+
+    let relative = ProjectRuntimeWorkspaceRequest {
+        path: "relative/project".into(),
+        ..runtime_workspace
+    };
+    let err = svc
+        .build_task_options_with_project_workspace(&row, &relative)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_PATH_NOT_ABSOLUTE"));
+}
+
+#[tokio::test]
 async fn send_message_returns_msg_id_and_turn_id_and_summary_tracks_turn() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let slow_task_mgr = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(500)));
@@ -3835,6 +4055,7 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
                 hidden: false,
                 files: vec![],
                 inject_skills: vec![],
+                runtime_workspace: None,
             },
             &task_mgr,
         )
@@ -5314,6 +5535,31 @@ async fn warmup_creates_agent_task() {
 
     // Agent should now exist
     assert!(task_mgr.get_task(&conv.id).is_some());
+}
+
+#[tokio::test]
+async fn project_warmup_requires_transient_binding_and_never_persists_path() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let workspace_root_ref = "root:primary-projects";
+    let conv = svc
+        .create("user_1", make_project_create_req(project_id, workspace_root_ref))
+        .await
+        .unwrap();
+
+    let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+    assert!(matches!(err, ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_BINDING_REQUIRED"));
+
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    let runtime_workspace = project_runtime_workspace(project_id, workspace_root_ref, runtime_dir.path());
+    svc.warmup_with_project_workspace("user_1", &conv.id, &runtime_workspace, &task_mgr)
+        .await
+        .unwrap();
+
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    assert!(!stored.extra.contains(runtime_workspace.path.as_str()));
+    assert!(!stored.extra.contains("\"workspace\""));
 }
 
 #[tokio::test]

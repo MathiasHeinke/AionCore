@@ -75,6 +75,7 @@ impl ChannelMessageService {
             files: vec![],
             inject_skills: vec![],
             hidden: false,
+            runtime_workspace: None,
         };
 
         let user_id = &self.owner_user_id;

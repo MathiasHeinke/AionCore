@@ -151,7 +151,6 @@ impl SkillResolver for ExtensionSkillResolver {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(
-                    workspace = %workspace.display(),
                     error = %e,
                     "link_workspace_skills failed"
                 );

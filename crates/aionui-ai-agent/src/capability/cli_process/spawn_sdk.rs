@@ -141,7 +141,11 @@ impl CliAgentProcess {
             config.args.len(),
             config.env.len(),
             explicit_env_key_names,
-            config.cwd.as_deref().unwrap_or("<inherit>")
+            if config.cwd.is_some() {
+                "<configured>"
+            } else {
+                "<inherit>"
+            }
         )
     }
 }
@@ -317,7 +321,8 @@ printf '%s\n' \
         assert!(preview.contains("args=1"));
         assert!(preview.contains("explicit_env_keys=2"));
         assert!(preview.contains("explicit_env_key_names=[\"SECRET_TOKEN\", \"PATH\"]"));
-        assert!(preview.contains("cwd=/workspace"));
+        assert!(preview.contains("cwd=<configured>"));
+        assert!(!preview.contains("/workspace"));
         assert!(!preview.contains("secret-arg-value"));
         assert!(!preview.contains("secret-env-value"));
         assert!(!preview.contains("/secret/path"));

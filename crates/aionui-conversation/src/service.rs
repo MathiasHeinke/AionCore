@@ -18,9 +18,9 @@ use aionui_api_types::{
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
-    SteerConversationRequest, SteerConversationResponse, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage,
+    ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
+    SessionMcpTransport, SteerConversationRequest, SteerConversationResponse, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -48,6 +48,12 @@ use crate::convert::{
     snapshot_to_assistant_identity, string_to_enum,
 };
 use crate::error::ConversationError;
+use crate::project_workspace::{
+    PROJECT_BINDING_INTERNAL_MUTATION_FORBIDDEN, PROJECT_BINDING_PATH_FORBIDDEN, PROJECT_RUNTIME_BINDING_MISMATCH,
+    PROJECT_RUNTIME_BINDING_REQUIRED, PROJECT_RUNTIME_BINDING_UNEXPECTED, map_project_runtime_build_error,
+    merge_and_validate_project_update, normalize_project_create_extra, parse_project_binding,
+    parse_project_binding_from_row, project_bad_request, validate_project_runtime_path,
+};
 use crate::session_context::SessionContextBuilder;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
@@ -662,6 +668,7 @@ impl ConversationService {
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
         let mut extra = req.extra;
+        let project_binding = normalize_project_create_extra(&mut extra)?;
 
         let assistant_id = req
             .assistant
@@ -752,7 +759,7 @@ impl ConversationService {
                 .map(str::to_owned)
         });
 
-        let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
+        let auto_provisioned_workspace = if user_supplied_workspace.is_none() && project_binding.is_none() {
             // Per-conversation temp workspaces live under
             // `{data_dir}/conversations/{label}-temp-{id}/`. The label lets
             // operators eyeball the agent type; the conversation id keeps
@@ -908,7 +915,6 @@ impl ConversationService {
                     .await;
                 debug!(
                     conversation_id = %id,
-                    workspace = %ws_path.display(),
                     links = n,
                     "wired skill symlinks into workspace"
                 );
@@ -1778,17 +1784,19 @@ impl ConversationService {
 
         // Merge extra if provided. For aionrs, strip `extra.model` post-merge
         // so the row keeps a single canonical model source (top-level column).
+        let mut project_binding_changed = false;
         let merged_extra = if let Some(new_extra) = &req.extra {
-            let mut existing_extra: serde_json::Value =
-                serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
-            merge_json(&mut existing_extra, new_extra);
+            let existing_extra: serde_json::Value = serde_json::from_str(&existing.extra)
+                .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+            let (mut existing_extra, binding_changed) = merge_and_validate_project_update(&existing_extra, new_extra)?;
+            project_binding_changed = binding_changed;
             if existing_type == AgentType::Aionrs
                 && let Some(obj) = existing_extra.as_object_mut()
                 && obj.remove("model").is_some()
             {
                 warn!("aionrs update: stripped legacy `extra.model` from merged extra");
             }
-            if new_extra.get("workspace").is_some() {
+            if new_extra.get("workspace").is_some() && parse_project_binding(&existing_extra)?.is_none() {
                 normalize_workspace_extra(&mut existing_extra)?;
             }
             Some(
@@ -1849,13 +1857,13 @@ impl ConversationService {
             .await?;
         }
 
-        if model_changed {
+        if model_changed || project_binding_changed {
             info!(
-                model_changed = true,
-                "Conversation updated, killing agent task due to model change"
+                model_changed,
+                project_binding_changed, "Conversation updated, killing agent task due to runtime identity change"
             );
             if let Err(e) = task_manager.kill(id, None) {
-                warn!(error = %ErrorChain(&e), "Failed to kill agent after model change");
+                warn!(error = %ErrorChain(&e), "Failed to kill agent after runtime identity change");
             }
         }
 
@@ -1881,6 +1889,12 @@ impl ConversationService {
     /// on a spurious model comparison.
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
     pub async fn update_extra(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), ConversationError> {
+        if patch
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("project_id") || obj.contains_key("workspace_root_ref"))
+        {
+            return Err(project_bad_request(PROJECT_BINDING_INTERNAL_MUTATION_FORBIDDEN));
+        }
         let existing =
             self.conversation_repo
                 .get(conversation_id)
@@ -1889,9 +1903,14 @@ impl ConversationService {
                     id: conversation_id.to_owned(),
                 })?;
 
-        let mut merged: serde_json::Value =
-            serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let mut merged: serde_json::Value = serde_json::from_str(&existing.extra)
+            .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+        let project_binding = parse_project_binding(&merged)?;
+        if project_binding.is_some() && patch.get("workspace").is_some() {
+            return Err(project_bad_request(PROJECT_BINDING_PATH_FORBIDDEN));
+        }
         merge_json(&mut merged, &patch);
+        parse_project_binding(&merged)?;
         if patch.get("workspace").is_some() {
             normalize_workspace_extra(&mut merged)?;
         }
@@ -2474,6 +2493,18 @@ impl ConversationService {
 
         reject_deprecated_runtime_row(&row)?;
 
+        // Project conversations must validate the portable identity and the
+        // request-only path before claiming a turn or persisting a message.
+        let project_build_opts = match (parse_project_binding_from_row(&row)?, req.runtime_workspace.as_ref()) {
+            (Some(_), Some(runtime_workspace)) => Some(
+                self.build_task_options_with_project_workspace(&row, runtime_workspace)
+                    .await?,
+            ),
+            (Some(_), None) => return Err(project_bad_request(PROJECT_RUNTIME_BINDING_REQUIRED)),
+            (None, Some(_)) => return Err(project_bad_request(PROJECT_RUNTIME_BINDING_UNEXPECTED)),
+            (None, None) => None,
+        };
+
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
 
@@ -2524,7 +2555,11 @@ impl ConversationService {
         ));
 
         // Build task options from conversation row
-        let build_opts = match self.build_task_options(&row).await {
+        let build_opts_result = match project_build_opts {
+            Some(options) => Ok(options),
+            None => self.build_task_options(&row).await,
+        };
+        let build_opts = match build_opts_result {
             Ok(opts) => opts,
             Err(err) => {
                 error!(
@@ -2646,6 +2681,7 @@ impl ConversationService {
                     files: request.files,
                     inject_skills: request.inject_skills,
                     hidden: false,
+                    runtime_workspace: None,
                 },
                 build_options: build_opts,
                 stored_workspace,
@@ -3024,6 +3060,42 @@ impl ConversationService {
         reject_deprecated_runtime_row(&row)?;
 
         let build_opts = self.build_task_options(&row).await?;
+        self.warmup_with_options(conversation_id, task_manager, row, build_opts)
+            .await
+    }
+
+    /// Warm a project-bound conversation using the active-seat resolution
+    /// supplied by AionUi main. The path is consumed only for this runtime.
+    pub async fn warmup_with_project_workspace(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        runtime_workspace: &ProjectRuntimeWorkspaceRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(conversation_id)
+            .await?
+            .filter(|r| r.user_id == user_id)
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let build_opts = self
+            .build_task_options_with_project_workspace(&row, runtime_workspace)
+            .await?;
+        self.warmup_with_options(conversation_id, task_manager, row, build_opts)
+            .await
+    }
+
+    async fn warmup_with_options(
+        &self,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        row: ConversationRow,
+        build_opts: BuildTaskOptions,
+    ) -> Result<(), ConversationError> {
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
@@ -3098,6 +3170,9 @@ impl ConversationService {
         row: &aionui_db::models::ConversationRow,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
+        if parse_project_binding_from_row(row)?.is_some() {
+            return Err(project_bad_request(PROJECT_RUNTIME_BINDING_REQUIRED));
+        }
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
             .build_options(row)
             .await
@@ -3109,9 +3184,36 @@ impl ConversationService {
         workspace_override: Option<&str>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
+        if parse_project_binding_from_row(row)?.is_some() {
+            return Err(project_bad_request(PROJECT_RUNTIME_BINDING_REQUIRED));
+        }
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
             .build_options_with_workspace_override(row, workspace_override)
             .await
+    }
+
+    /// Build an agent runtime for a project-bound conversation. The caller
+    /// supplies the active-seat resolution, while AionCore verifies that its
+    /// opaque tuple exactly matches the persisted portable identity.
+    pub async fn build_task_options_with_project_workspace(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+        runtime_workspace: &ProjectRuntimeWorkspaceRequest,
+    ) -> Result<BuildTaskOptions, ConversationError> {
+        reject_deprecated_runtime_row(row)?;
+        let Some(binding) = parse_project_binding_from_row(row)? else {
+            return Err(project_bad_request(PROJECT_RUNTIME_BINDING_UNEXPECTED));
+        };
+        if binding.project_id != runtime_workspace.project_id
+            || binding.workspace_root_ref != runtime_workspace.workspace_root_ref
+        {
+            return Err(project_bad_request(PROJECT_RUNTIME_BINDING_MISMATCH));
+        }
+        let runtime_path = validate_project_runtime_path(runtime_workspace)?;
+        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+            .build_options_with_workspace_override(row, Some(&runtime_path))
+            .await
+            .map_err(map_project_runtime_build_error)
     }
 
     /// Ensure native skill links exist in the runtime workspace. Auto
@@ -3165,7 +3267,6 @@ impl ConversationService {
             .await;
         debug!(
             conversation_id = %row.id,
-            workspace = %workspace.display(),
             links = n,
             "ensured skill symlinks in auto workspace"
         );
@@ -3200,6 +3301,10 @@ impl ConversationService {
             .await?
             .ok_or_else(|| ConversationError::internal("Conversation vanished during workspace sync"))?;
 
+        if parse_project_binding_from_row(&row)?.is_some() {
+            return Ok(());
+        }
+
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
         extra["workspace"] = serde_json::Value::String(resolved_workspace.to_owned());
 
@@ -3215,7 +3320,6 @@ impl ConversationService {
 
         debug!(
             conversation_id,
-            workspace = resolved_workspace,
             "Persisted auto-resolved workspace to conversation.extra"
         );
         Ok(())

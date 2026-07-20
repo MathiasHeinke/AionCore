@@ -633,6 +633,7 @@ impl JobExecutor {
             files: vec![],
             inject_skills: skill_names.clone(),
             hidden: true,
+            runtime_workspace: None,
         };
 
         match self

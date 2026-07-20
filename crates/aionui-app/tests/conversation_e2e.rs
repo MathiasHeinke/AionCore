@@ -2,6 +2,7 @@
 
 mod common;
 
+use aionui_app::{AppConfig, AppServices, create_router};
 use aionui_db::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantPreferenceRepository,
     IConversationRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
@@ -58,6 +59,89 @@ async fn t1_1_create_conversation_success() {
     assert!(data["created_at"].as_i64().is_some());
     assert!(data["modified_at"].as_i64().is_some());
     assert!(data["extra"]["workspace"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn t1_1b_project_binding_survives_rest_roundtrip_and_database_restart_without_path() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let config = AppConfig {
+        data_dir: temp.path().join("data"),
+        work_dir: temp.path().join("work"),
+        ..Default::default()
+    };
+    let database_path = config.database_path();
+    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let workspace_root_ref = "root:primary-projects";
+
+    let database = aionui_db::init_database(&database_path).await.unwrap();
+    let services = AppServices::from_config(database, &config).await.unwrap();
+    let mut app = create_router(&services).await.unwrap();
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let create = json_with_token(
+        "POST",
+        "/api/conversations",
+        create_body_with_extra(
+            "Restart-safe Project",
+            json!({
+                "project_id": project_id,
+                "workspace_root_ref": workspace_root_ref
+            }),
+        ),
+        &token,
+        &csrf,
+    );
+    let create_response = app.clone().oneshot(create).await.unwrap();
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let create_json = body_json(create_response).await;
+    let conversation_id = create_json["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(create_json["data"]["extra"]["project_id"], project_id);
+    assert_eq!(create_json["data"]["extra"]["workspace_root_ref"], workspace_root_ref);
+    assert!(create_json["data"]["extra"].get("workspace").is_none());
+
+    let raw_extra: String = sqlx::query_scalar("SELECT extra FROM conversations WHERE id = ?")
+        .bind(&conversation_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert!(!raw_extra.contains(temp.path().to_string_lossy().as_ref()));
+    assert!(!raw_extra.contains("\"workspace\""));
+
+    let read = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/conversations/{conversation_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let read_json = body_json(read).await;
+    assert_eq!(read_json["data"]["extra"]["project_id"], project_id);
+
+    drop(app);
+    services.database.close().await;
+    drop(services);
+
+    let reopened_database = aionui_db::init_database(&database_path).await.unwrap();
+    let reopened_services = AppServices::from_config(reopened_database, &config).await.unwrap();
+    let mut reopened_app = create_router(&reopened_services).await.unwrap();
+    let (reopened_token, _reopened_csrf) =
+        setup_and_login(&mut reopened_app, &reopened_services, "admin", "StrongP@ss1").await;
+    let restarted_read = reopened_app
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conversation_id}"),
+            &reopened_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(restarted_read.status(), StatusCode::OK);
+    let restarted_json = body_json(restarted_read).await;
+    assert_eq!(restarted_json["data"]["extra"]["project_id"], project_id);
+    assert_eq!(
+        restarted_json["data"]["extra"]["workspace_root_ref"],
+        workspace_root_ref
+    );
+    assert!(restarted_json["data"]["extra"].get("workspace").is_none());
+
+    reopened_services.database.close().await;
 }
 
 #[tokio::test]

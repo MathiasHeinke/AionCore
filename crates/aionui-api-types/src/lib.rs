@@ -79,8 +79,9 @@ pub use conversation::{
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SteerConversationRequest,
-    SteerConversationResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    MessageSearchResponse, ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, SteerConversationRequest, SteerConversationResponse, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WarmupConversationRequest,
 };
 pub use cron::{
     CreateCronJobRequest, CronAgentConfigReadDto, CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto,
