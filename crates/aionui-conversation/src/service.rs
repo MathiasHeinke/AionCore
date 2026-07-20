@@ -3,11 +3,15 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
+use aionui_ai_agent::project_runtime_fence::{
+    ProjectRuntimeBuildGate, ProjectRuntimeEpochRegistry, ProjectRuntimeRevalidator, ProjectRuntimeUse,
+};
+use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind, ProjectEnvironmentHint};
 use aionui_ai_agent::types::{BuildTaskOptions, ProjectRuntimeContext};
 use aionui_ai_agent::{AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
 use aionui_auth::{
-    ProjectRuntimeAttestationPurpose, ProjectRuntimeAttestationVerifier, VerifiedProjectRuntimeAttestation,
+    ProjectRuntimeAttestationPurpose, ProjectRuntimeAttestationVerifier, ProjectRuntimeVerificationExpectation,
+    VerifiedProjectRuntimeAttestation,
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
@@ -31,8 +35,8 @@ use aionui_common::{
 };
 use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
-    AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    AgentBindingResolution, ConversationExtraPatch, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams,
+    IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
     MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
     resolve_agent_binding_from_rows,
@@ -53,10 +57,10 @@ use crate::convert::{
 use crate::error::ConversationError;
 use crate::project_workspace::{
     PROJECT_BINDING_INTERNAL_MUTATION_FORBIDDEN, PROJECT_BINDING_PATH_FORBIDDEN, PROJECT_RUNTIME_BINDING_MISMATCH,
-    PROJECT_RUNTIME_BINDING_REQUIRED, PROJECT_RUNTIME_BINDING_UNEXPECTED, map_project_runtime_build_error,
-    merge_and_validate_project_update, normalize_project_create_extra, parse_project_binding,
-    parse_project_binding_from_row, project_bad_request, project_binding_expectation_for_update,
-    redact_project_runtime_agent_error, validate_project_runtime_path,
+    PROJECT_RUNTIME_BINDING_REQUIRED, PROJECT_RUNTIME_BINDING_UNEXPECTED, is_idempotent_project_binding_retry,
+    map_project_runtime_build_error, merge_and_validate_project_update, normalize_project_create_extra,
+    parse_project_binding, parse_project_binding_from_row, project_bad_request, project_binding_expectation_for_update,
+    project_binding_revision, redact_project_runtime_agent_error, validate_project_runtime_path,
 };
 use crate::session_context::SessionContextBuilder;
 use crate::skill_resolver::SkillResolver;
@@ -70,6 +74,36 @@ const ACP_STEER_AGENT_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const ACP_STEER_AGENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_STEER_CONTENT_BYTES: usize = 32 * 1024;
 const MAX_STEER_CORRELATION_ID_BYTES: usize = 128;
+const PROJECT_BINDING_RUNTIME_IDENTITY_KEYS: &[&str] = &[
+    "agent_id",
+    "agent_name",
+    "agent_source",
+    "assistant_snapshot",
+    "backend",
+    "cli_path",
+    "current_mode_id",
+    "current_model_id",
+    "custom_agent_id",
+    "guide_mcp_config",
+    "max_tokens",
+    "max_tool_call_failure_turns",
+    "max_tool_call_malformed_turns",
+    "max_turns",
+    "mcp_server_ids",
+    "mcp_servers",
+    "mcp_statuses",
+    "mode",
+    "model",
+    "preset_assistant_id",
+    "preset_context",
+    "preset_rules",
+    "session_mcp_servers",
+    "session_mode",
+    "skills",
+    "system_prompt",
+    "team_mcp_stdio_config",
+    "thought_level",
+];
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
@@ -92,6 +126,44 @@ const ACP_VENDOR_LABELS: &[&str] = &[
     "hermes",
     "snow",
 ];
+
+fn runtime_identity_extra_key(extra: Option<&serde_json::Value>) -> Option<&'static str> {
+    let object = extra.and_then(serde_json::Value::as_object)?;
+    PROJECT_BINDING_RUNTIME_IDENTITY_KEYS
+        .iter()
+        .copied()
+        .find(|key| object.contains_key(*key))
+}
+
+fn runtime_identity_extra_changed(before: &serde_json::Value, after: &serde_json::Value) -> bool {
+    PROJECT_BINDING_RUNTIME_IDENTITY_KEYS
+        .iter()
+        .any(|key| before.get(*key) != after.get(*key))
+}
+
+fn top_level_extra_patch(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Result<ConversationExtraPatch, ConversationError> {
+    let before = before
+        .as_object()
+        .ok_or_else(|| ConversationError::internal("conversation extra must be a JSON object"))?;
+    let after = after
+        .as_object()
+        .ok_or_else(|| ConversationError::internal("conversation extra must be a JSON object"))?;
+    let mut patch = ConversationExtraPatch::default();
+    for key in before.keys() {
+        if !after.contains_key(key) {
+            patch.remove.push(key.clone());
+        }
+    }
+    for (key, value) in after {
+        if before.get(key) != Some(value) {
+            patch.set.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(patch)
+}
 
 fn steer_failure_is_definitive(error: &AgentError) -> bool {
     matches!(
@@ -360,6 +432,7 @@ pub struct ConversationService {
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     project_runtime_attestation_verifier: Arc<RwLock<Option<Arc<ProjectRuntimeAttestationVerifier>>>>,
+    project_runtime_epochs: Arc<ProjectRuntimeEpochRegistry>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -428,6 +501,7 @@ impl ConversationService {
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             project_runtime_attestation_verifier: Arc::new(RwLock::new(None)),
+            project_runtime_epochs: Arc::new(ProjectRuntimeEpochRegistry::default()),
 
             conversation_repo,
             agent_metadata_repo,
@@ -541,6 +615,10 @@ impl ConversationService {
 
     pub fn runtime_state(&self) -> Arc<ConversationRuntimeStateService> {
         self.runtime_state.clone()
+    }
+
+    pub(crate) fn project_runtime_epochs(&self) -> &Arc<ProjectRuntimeEpochRegistry> {
+        &self.project_runtime_epochs
     }
 
     fn assistant_definition_repo(&self) -> Option<Arc<dyn IAssistantDefinitionRepository>> {
@@ -1743,14 +1821,31 @@ impl ConversationService {
         req: UpdateConversationRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConversationResponse, ConversationError> {
-        let existing = self
+        let project_touched = req.extra.as_ref().is_some_and(|extra| {
+            extra
+                .as_object()
+                .is_some_and(|object| object.contains_key("project_id") || object.contains_key("workspace_root_ref"))
+        });
+        let initial_existing = self
             .conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        let existing_type: AgentType = string_to_enum(&initial_existing.r#type)?;
 
-        let existing_type: AgentType = string_to_enum(&existing.r#type)?;
+        let incoming_runtime_identity_key = runtime_identity_extra_key(req.extra.as_ref());
+        let combined_runtime_identity_key = project_touched.then_some(incoming_runtime_identity_key).flatten();
+        if project_touched && (req.model.is_some() || combined_runtime_identity_key.is_some()) {
+            warn!(
+                conversation_id = %id,
+                runtime_identity_key = combined_runtime_identity_key.unwrap_or("top_level_model"),
+                "Rejected combined project-binding and runtime-identity mutation"
+            );
+            return Err(ConversationError::BadRequest {
+                reason: "project binding and runtime identity must be updated in separate requests".into(),
+            });
+        }
 
         // Snapshot invariant: once written at create time, `extra.skills`
         // must not be re-shaped by PATCH. The frontend must clone the
@@ -1788,42 +1883,89 @@ impl ConversationService {
             return Err(ConversationError::BadRequest {
                 reason: format!(
                     "top-level `model` is only accepted for aionrs conversations; pass model via `extra` for {}",
-                    existing.r#type
+                    initial_existing.r#type
                 ),
             });
         }
 
+        let runtime_identity_touched = req.model.is_some() || incoming_runtime_identity_key.is_some();
+
+        // Project pair and model/runtime identity mutations never wait behind
+        // an active build/turn. A single write permit fences the refreshed DB
+        // snapshot, CAS, epoch publish, task invalidation and returned receipt.
+        let _runtime_identity_mutation = if project_touched || runtime_identity_touched {
+            Some(self.runtime_state.try_claim_runtime_identity_mutation(id)?)
+        } else {
+            None
+        };
+        let project_mutation = if project_touched || runtime_identity_touched {
+            Some(self.project_runtime_epochs.try_begin_mutation(id)?)
+        } else {
+            None
+        };
+        let existing = if project_mutation.is_some() {
+            self.conversation_repo
+                .get(id)
+                .await?
+                .filter(|r| r.user_id == user_id)
+                .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?
+        } else {
+            initial_existing
+        };
+
         let now = now_ms();
 
-        let project_touched = req.extra.as_ref().is_some_and(|extra| {
-            extra
-                .as_object()
-                .is_some_and(|object| object.contains_key("project_id") || object.contains_key("workspace_root_ref"))
-        });
-        let project_binding_expectation =
-            project_binding_expectation_for_update(project_touched, req.expected_project_binding.as_ref())?;
+        let project_binding_expectation = project_binding_expectation_for_update(
+            project_touched,
+            req.expected_project_binding.as_ref(),
+            req.project_binding_operation_id.as_deref(),
+        )?;
+
+        if project_touched {
+            let existing_extra: serde_json::Value = serde_json::from_str(&existing.extra)
+                .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+            if is_idempotent_project_binding_retry(
+                &existing_extra,
+                req.extra.as_ref().expect("project touch came from extra"),
+                req.expected_project_binding
+                    .as_ref()
+                    .expect("validated project expectation"),
+                req.project_binding_operation_id
+                    .as_deref()
+                    .expect("validated project operation"),
+            )? {
+                if let Some(mutation) = project_mutation.as_ref() {
+                    mutation.commit_runtime_identity(project_binding_revision(&existing_extra)?, false)?;
+                }
+                let response = row_to_response(existing, &self.workspace_root)?;
+                return Ok(response);
+            }
+        }
 
         // Merge extra if provided. For aionrs, strip `extra.model` post-merge
         // so the row keeps a single canonical model source (top-level column).
         let mut project_binding_changed = false;
-        let merged_extra = if let Some(new_extra) = &req.extra {
+        let mut runtime_extra_changed = false;
+        let extra_patch = if let Some(new_extra) = &req.extra {
             let existing_extra: serde_json::Value = serde_json::from_str(&existing.extra)
                 .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
-            let (mut existing_extra, binding_changed) = merge_and_validate_project_update(&existing_extra, new_extra)?;
+            let (mut merged_extra, binding_changed) = merge_and_validate_project_update(
+                &existing_extra,
+                new_extra,
+                req.project_binding_operation_id.as_deref(),
+            )?;
             project_binding_changed = binding_changed;
             if existing_type == AgentType::Aionrs
-                && let Some(obj) = existing_extra.as_object_mut()
+                && let Some(obj) = merged_extra.as_object_mut()
                 && obj.remove("model").is_some()
             {
                 warn!("aionrs update: stripped legacy `extra.model` from merged extra");
             }
-            if new_extra.get("workspace").is_some() && parse_project_binding(&existing_extra)?.is_none() {
-                normalize_workspace_extra(&mut existing_extra)?;
+            runtime_extra_changed = runtime_identity_extra_changed(&existing_extra, &merged_extra);
+            if new_extra.get("workspace").is_some() && parse_project_binding(&merged_extra)?.is_none() {
+                normalize_workspace_extra(&mut merged_extra)?;
             }
-            Some(
-                serde_json::to_string(&existing_extra)
-                    .map_err(|e| ConversationError::internal(format!("Failed to serialize merged extra: {e}")))?,
-            )
+            Some(top_level_extra_patch(&existing_extra, &merged_extra)?)
         } else {
             None
         };
@@ -1851,17 +1993,47 @@ impl ConversationService {
             pinned: req.pinned,
             pinned_at,
             model: model_json,
-            extra: merged_extra,
+            extra: None,
             status: None,
             updated_at: Some(now),
         };
 
-        if let Some(expectation) = project_binding_expectation.as_ref() {
+        let updated = if let Some(extra_patch) = extra_patch.as_ref() {
             self.conversation_repo
-                .update_project_binding_cas(id, &updates, expectation)
-                .await?;
+                .update_with_extra_patch_cas(id, &updates, extra_patch, project_binding_expectation.as_ref())
+                .await?
         } else {
             self.conversation_repo.update(id, &updates).await?;
+            self.conversation_repo
+                .get(id)
+                .await?
+                .ok_or_else(|| ConversationError::internal("Conversation vanished after update"))?
+        };
+        let runtime_identity_changed = model_changed || project_binding_changed || runtime_extra_changed;
+        let runtime_identity_commit = if let Some(mutation) = project_mutation.as_ref() {
+            let updated_extra: serde_json::Value = serde_json::from_str(&updated.extra)
+                .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+            Some(mutation.commit_runtime_identity(project_binding_revision(&updated_extra)?, runtime_identity_changed))
+        } else {
+            None
+        };
+
+        // Invalidate the old task immediately after publishing the new
+        // runtime identity. Secondary assistant-preference writes can fail;
+        // they must never leave the old slot live under a newer DB identity.
+        if runtime_identity_changed {
+            info!(
+                model_changed,
+                project_binding_changed,
+                runtime_extra_changed,
+                "Conversation updated, killing agent task due to runtime identity change"
+            );
+            if let Err(e) = task_manager.kill(id, None) {
+                warn!(error = %ErrorChain(&e), "Failed to kill agent after runtime identity change");
+            }
+        }
+        if let Some(commit) = runtime_identity_commit {
+            commit?;
         }
 
         if let Some(model) = req.model.as_ref() {
@@ -1884,23 +2056,6 @@ impl ConversationService {
             .await?;
         }
 
-        if model_changed || project_binding_changed {
-            info!(
-                model_changed,
-                project_binding_changed, "Conversation updated, killing agent task due to runtime identity change"
-            );
-            if let Err(e) = task_manager.kill(id, None) {
-                warn!(error = %ErrorChain(&e), "Failed to kill agent after runtime identity change");
-            }
-        }
-
-        // Re-fetch to return the updated version
-        let updated = self
-            .conversation_repo
-            .get(id)
-            .await?
-            .ok_or_else(|| ConversationError::internal("Conversation vanished after update"))?;
-
         let response = row_to_response(updated, &self.workspace_root)?;
 
         info!("Conversation updated");
@@ -1910,18 +2065,43 @@ impl ConversationService {
     }
 
     /// Merge a JSON patch into `conversation.extra` without touching model,
-    /// name, pinned flag, or task lifecycle. Intended for internal callers
-    /// (e.g. `TeamSessionService::ensure_session` writing
-    /// `team_mcp_stdio_config`) where a full `update()` would kill the agent
-    /// on a spurious model comparison.
+    /// name, or the pinned flag. Runtime-identity keys are fenced against
+    /// active turns/builds and invalidate the old task after durable commit;
+    /// opaque metadata remains a lightweight write.
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
     pub async fn update_extra(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), ConversationError> {
-        if patch
-            .as_object()
-            .is_some_and(|obj| obj.contains_key("project_id") || obj.contains_key("workspace_root_ref"))
-        {
+        self.update_extra_with_acp_runtime_mode(conversation_id, patch, None)
+            .await
+    }
+
+    async fn update_extra_with_acp_runtime_mode(
+        &self,
+        conversation_id: &str,
+        patch: serde_json::Value,
+        acp_runtime_mode: Option<&str>,
+    ) -> Result<(), ConversationError> {
+        if patch.as_object().is_some_and(|obj| {
+            obj.contains_key("project_id")
+                || obj.contains_key("workspace_root_ref")
+                || obj.contains_key("project_binding_revision")
+                || obj.contains_key("project_binding_receipt_id")
+        }) {
             return Err(project_bad_request(PROJECT_BINDING_INTERNAL_MUTATION_FORBIDDEN));
         }
+        let runtime_identity_touched = runtime_identity_extra_key(Some(&patch)).is_some() || acp_runtime_mode.is_some();
+        let _runtime_identity_mutation = if runtime_identity_touched {
+            Some(
+                self.runtime_state
+                    .try_claim_runtime_identity_mutation(conversation_id)?,
+            )
+        } else {
+            None
+        };
+        let project_mutation = if runtime_identity_touched {
+            Some(self.project_runtime_epochs.try_begin_mutation(conversation_id)?)
+        } else {
+            None
+        };
         let existing =
             self.conversation_repo
                 .get(conversation_id)
@@ -1930,41 +2110,67 @@ impl ConversationService {
                     id: conversation_id.to_owned(),
                 })?;
 
-        let mut merged: serde_json::Value = serde_json::from_str(&existing.extra)
+        let existing_extra: serde_json::Value = serde_json::from_str(&existing.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
-        let project_binding = parse_project_binding(&merged)?;
+        let project_binding_revision = project_binding_revision(&existing_extra)?;
+        let project_binding = parse_project_binding(&existing_extra)?;
         if project_binding.is_some() && patch.get("workspace").is_some() {
             return Err(project_bad_request(PROJECT_BINDING_PATH_FORBIDDEN));
         }
+        let mut merged = existing_extra.clone();
         merge_json(&mut merged, &patch);
         parse_project_binding(&merged)?;
         if patch.get("workspace").is_some() {
             normalize_workspace_extra(&mut merged)?;
         }
+        let extra_patch = top_level_extra_patch(&existing_extra, &merged)?;
 
         let updates = ConversationRowUpdate {
-            extra: Some(
-                serde_json::to_string(&merged)
-                    .map_err(|e| ConversationError::internal(format!("Failed to serialize merged extra: {e}")))?,
-            ),
+            extra: None,
             updated_at: Some(now_ms()),
             ..Default::default()
         };
-        self.conversation_repo.update(conversation_id, &updates).await?;
+        self.conversation_repo
+            .update_with_extra_patch_cas(conversation_id, &updates, &extra_patch, None)
+            .await?;
+        let runtime_identity_changed = runtime_identity_extra_changed(&existing_extra, &merged);
+        let acp_runtime_state_result = if let Some(mode) = acp_runtime_mode {
+            let params = SaveRuntimeStateParams {
+                current_mode_id: Some(Some(mode)),
+                ..Default::default()
+            };
+            match self.acp_session_repo.save_runtime_state(conversation_id, &params).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(ConversationError::internal("ACP_RUNTIME_MODE_PERSISTENCE_FAILED")),
+                Err(error) => Err(ConversationError::internal(format!(
+                    "ACP_RUNTIME_MODE_PERSISTENCE_FAILED: {error}"
+                ))),
+            }
+        } else {
+            Ok(())
+        };
+        let durable_runtime_identity_changed = runtime_identity_changed || acp_runtime_mode.is_some();
+        let runtime_identity_commit = project_mutation.as_ref().map(|mutation| {
+            mutation.commit_runtime_identity(project_binding_revision, durable_runtime_identity_changed)
+        });
+        if durable_runtime_identity_changed {
+            self.task_manager.kill_and_wait(conversation_id, None).await;
+        }
+        if let Some(commit) = runtime_identity_commit {
+            commit?;
+        }
+        acp_runtime_state_result?;
         debug!("Conversation extra merged");
         Ok(())
     }
 
     pub async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), ConversationError> {
-        let params = SaveRuntimeStateParams {
-            current_mode_id: Some(Some(mode)),
-            ..Default::default()
-        };
-        self.acp_session_repo
-            .save_runtime_state(conversation_id, &params)
-            .await
-            .map_err(|e| ConversationError::internal(format!("Failed to persist runtime mode: {e}")))?;
-        Ok(())
+        self.update_extra_with_acp_runtime_mode(
+            conversation_id,
+            serde_json::json!({ "session_mode": mode }),
+            Some(mode),
+        )
+        .await
     }
 
     /// Delete a conversation (messages cascade via FK).
@@ -1979,6 +2185,7 @@ impl ConversationService {
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        let _project_runtime_deletion = self.project_runtime_epochs.try_begin_mutation(id)?;
 
         let source: Option<ConversationSource> = existing
             .source
@@ -2000,6 +2207,7 @@ impl ConversationService {
             self.runtime_state.clear_deleting(id);
             return Err(err.into());
         }
+        self.project_runtime_epochs.forget(id);
         if !had_active_turn {
             self.runtime_state.clear_deleting(id);
         }
@@ -2531,6 +2739,7 @@ impl ConversationService {
         }
 
         reject_deprecated_runtime_row(&row)?;
+        let turn_id = Self::mint_turn_id();
 
         // Project conversations must validate the portable identity and the
         // request-only path before claiming a turn or persisting a message.
@@ -2544,8 +2753,15 @@ impl ConversationService {
                     runtime_workspace,
                 )?;
                 Some(
-                    self.build_task_options_with_project_workspace(&row, runtime_workspace, &verified)
-                        .await?,
+                    self.build_task_options_with_project_workspace_for_use(
+                        &row,
+                        runtime_workspace,
+                        &verified,
+                        ProjectRuntimeUse::Turn {
+                            turn_id: turn_id.clone(),
+                        },
+                    )
+                    .await?,
                 )
             }
             (Some(_), None) => return Err(project_bad_request(PROJECT_RUNTIME_BINDING_REQUIRED)),
@@ -2556,7 +2772,6 @@ impl ConversationService {
             (None, None) => None,
         };
 
-        let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
 
         // Store user message. `msg_id` is server-generated so the WebSocket
@@ -3286,30 +3501,109 @@ impl ConversationService {
         runtime_workspace: &ProjectRuntimeWorkspaceRequest,
         verified: &VerifiedProjectRuntimeAttestation,
     ) -> Result<BuildTaskOptions, ConversationError> {
+        self.build_task_options_with_project_workspace_for_use(
+            row,
+            runtime_workspace,
+            verified,
+            ProjectRuntimeUse::Warmup,
+        )
+        .await
+    }
+
+    async fn build_task_options_with_project_workspace_for_use(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+        runtime_workspace: &ProjectRuntimeWorkspaceRequest,
+        verified: &VerifiedProjectRuntimeAttestation,
+        runtime_use: ProjectRuntimeUse,
+    ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let Some(binding) = parse_project_binding_from_row(row)? else {
             return Err(project_bad_request(PROJECT_RUNTIME_BINDING_UNEXPECTED));
         };
         if binding.project_id != runtime_workspace.project_id
             || binding.workspace_root_ref != runtime_workspace.workspace_root_ref
+            || binding.project_binding_revision != runtime_workspace.project_binding_revision
+            || binding.project_binding_receipt_id != runtime_workspace.project_binding_receipt_id
             || !verified.matches_runtime_workspace(runtime_workspace)
         {
             return Err(project_bad_request(PROJECT_RUNTIME_BINDING_MISMATCH));
         }
         let runtime_path = validate_project_runtime_path(runtime_workspace)?;
-        let options =
+        let conversation_id = row.id.clone();
+        let expected_project_id = binding.project_id.clone();
+        let expected_workspace_root_ref = binding.workspace_root_ref.clone();
+        let expected_revision = binding.project_binding_revision;
+        let expected_receipt = binding.project_binding_receipt_id.clone();
+        let repo = Arc::clone(&self.conversation_repo);
+        let revalidate: ProjectRuntimeRevalidator = Arc::new(move || {
+            let repo = Arc::clone(&repo);
+            let conversation_id = conversation_id.clone();
+            let expected_project_id = expected_project_id.clone();
+            let expected_workspace_root_ref = expected_workspace_root_ref.clone();
+            let expected_receipt = expected_receipt.clone();
+            Box::pin(async move {
+                let row = repo
+                    .get(&conversation_id)
+                    .await
+                    .map_err(|_| AgentError::internal("PROJECT_RUNTIME_REVALIDATION_UNAVAILABLE"))?
+                    .ok_or_else(|| AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"))?;
+                let current = parse_project_binding_from_row(&row)
+                    .map_err(|_| AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"))?
+                    .ok_or_else(|| AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"))?;
+                if current.project_id != expected_project_id
+                    || current.workspace_root_ref != expected_workspace_root_ref
+                    || current.project_binding_revision != expected_revision
+                    || current.project_binding_receipt_id != expected_receipt
+                {
+                    return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"));
+                }
+                Ok(())
+            })
+        });
+        let gate = ProjectRuntimeBuildGate::new(
+            Arc::clone(&self.project_runtime_epochs),
+            &row.id,
+            binding.project_binding_revision,
+            revalidate,
+        );
+        let process_runtime_generation = gate.process_runtime_generation();
+        let execution_permit = gate.acquire_and_revalidate(runtime_use).await?;
+
+        // Re-read under the execution permit so model/runtime fields cannot
+        // be stale even when a non-binding identity mutation won just before
+        // permit acquisition.
+        let current_row = self
+            .conversation_repo
+            .get(&row.id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: row.id.clone() })?;
+        let current_binding = parse_project_binding_from_row(&current_row)?
+            .ok_or_else(|| project_bad_request(PROJECT_RUNTIME_BINDING_UNEXPECTED))?;
+        if current_binding != binding {
+            return Err(ConversationError::Busy {
+                reason: "PROJECT_RUNTIME_CONTEXT_INVALIDATED".into(),
+            });
+        }
+        let mut options =
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-                .build_options_with_workspace_override(row, Some(&runtime_path))
+                .build_options_with_workspace_override(&current_row, Some(&runtime_path))
                 .await
                 .map_err(map_project_runtime_build_error)?;
-        Ok(options.with_project_runtime_context(ProjectRuntimeContext {
-            runtime_fingerprint: verified.runtime_fingerprint().to_owned(),
-            environment_hint_fingerprint: verified.environment_hint_fingerprint().to_owned(),
-            backend_generation: verified.backend_generation().to_owned(),
-            root_catalog_revision: verified.root_catalog_revision(),
-            root_ownership_revision: verified.root_ownership_revision(),
-            project_catalog_revision: verified.project_catalog_revision(),
-        }))
+        options.context.workspace.project_environment_hint =
+            Some(ProjectEnvironmentHint::try_new(verified.environment_hint().to_owned())?);
+        Ok(options
+            .with_project_runtime_context(ProjectRuntimeContext {
+                runtime_fingerprint: verified.runtime_fingerprint().to_owned(),
+                environment_hint_fingerprint: verified.environment_hint_fingerprint().to_owned(),
+                project_binding_revision: binding.project_binding_revision,
+                process_runtime_generation,
+                backend_generation: verified.backend_generation().to_owned(),
+                root_catalog_revision: verified.root_catalog_revision(),
+                root_ownership_revision: verified.root_ownership_revision(),
+                project_catalog_revision: verified.project_catalog_revision(),
+            })
+            .with_project_runtime_execution(execution_permit))
     }
 
     fn verify_project_runtime_attestation(
@@ -3328,15 +3622,17 @@ impl ConversationService {
         let Some(verifier) = verifier else {
             return Err(ConversationError::ProjectRuntimeAttestationUnavailable);
         };
+        let expectation = ProjectRuntimeVerificationExpectation::new(
+            conversation_id,
+            purpose,
+            &persisted_binding.project_id,
+            &persisted_binding.workspace_root_ref,
+            persisted_binding.project_binding_revision,
+            persisted_binding.project_binding_receipt_id.as_deref(),
+            runtime_workspace,
+        );
         verifier
-            .verify_and_consume(
-                compact_jws,
-                conversation_id,
-                purpose,
-                &persisted_binding.project_id,
-                &persisted_binding.workspace_root_ref,
-                runtime_workspace,
-            )
+            .verify_and_consume(compact_jws, &expectation)
             .map_err(Into::into)
     }
 
@@ -3385,10 +3681,15 @@ impl ConversationService {
         }
 
         let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
-        let n = self
-            .skill_resolver
-            .link_workspace_skills(&workspace, &rel_dirs_refs, &resolved)
-            .await;
+        let n = if build_opts.project_runtime_context.is_some() {
+            self.skill_resolver
+                .link_project_workspace_skills(&workspace, &rel_dirs_refs, &resolved)
+                .await
+        } else {
+            self.skill_resolver
+                .link_workspace_skills(&workspace, &rel_dirs_refs, &resolved)
+                .await
+        };
         debug!(
             conversation_id = %row.id,
             links = n,
@@ -3476,39 +3777,13 @@ impl ConversationService {
         Arc::clone(&self.skill_resolver)
     }
 
-    /// Backfill `extra.skills` if the row predates the snapshot model.
-    /// Persists the mutation asynchronously; failures are logged and
-    /// swallowed so a read path never 500s because of a backfill write
-    /// failure.
-    async fn backfill_extra_inplace(&self, conversation_id: &str, extra: &mut serde_json::Value) {
+    /// Materialize legacy aliases/snapshots in the response only. Read paths
+    /// must never persist a stale whole-object `extra` snapshot: doing so can
+    /// overwrite a concurrent project binding or runtime-identity mutation.
+    async fn backfill_extra_inplace(&self, _conversation_id: &str, extra: &mut serde_json::Value) {
         let auto_inject = self.skill_resolver.auto_inject_names().await;
-        let mut mutated = backfill_skills_if_missing(extra, &auto_inject);
-        mutated |= backfill_cron_job_id_alias(extra);
-        if !mutated {
-            return;
-        }
-        let serialized = match serde_json::to_string(extra) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    conversation_id,
-                    error = %ErrorChain(&e),
-                    "backfill serialize failed; returning in-memory value"
-                );
-                return;
-            }
-        };
-        let update = ConversationRowUpdate {
-            extra: Some(serialized),
-            ..Default::default()
-        };
-        if let Err(e) = self.conversation_repo.update(conversation_id, &update).await {
-            warn!(
-                conversation_id,
-                error = %ErrorChain(&e),
-                "backfill persist failed; returning in-memory value"
-            );
-        }
+        backfill_skills_if_missing(extra, &auto_inject);
+        backfill_cron_job_id_alias(extra);
     }
 }
 

@@ -98,6 +98,7 @@ fn make_aionrs_options(
             path: workspace.to_owned(),
             stored_path: workspace.to_owned(),
             is_custom: !workspace.is_empty(),
+            project_environment_hint: None,
         },
         model,
         skills: vec![],

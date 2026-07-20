@@ -14,7 +14,7 @@ use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
-use crate::project_workspace::redact_project_runtime_error;
+use crate::project_workspace::{redact_project_runtime_event, redact_project_runtime_json_value};
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
@@ -314,14 +314,11 @@ impl StreamRelay {
 
             match recv_result {
                 Ok(event) => {
-                    let event = match event {
-                        AgentStreamEvent::Error(data) if self.project_runtime_workspace_path.is_some() => {
-                            AgentStreamEvent::Error(redact_project_runtime_error(
-                                &data,
-                                self.project_runtime_workspace_path.as_deref(),
-                            ))
-                        }
-                        other => other,
+                    // Project privacy is enforced at ingress, before any
+                    // branch can buffer, persist, log, or broadcast data.
+                    let event = match self.project_runtime_workspace_path.as_deref() {
+                        Some(path) => redact_project_runtime_event(event, path),
+                        None => event,
                     };
                     let deleting = self.is_deleting();
                     if deleting && !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
@@ -703,6 +700,11 @@ impl StreamRelay {
                 return;
             }
         };
+        // Defense in depth for future event branches that bypass the normal
+        // ingress loop but still use the shared broadcaster.
+        if let Some(path) = self.project_runtime_workspace_path.as_ref() {
+            redact_project_runtime_json_value(&mut event_data, std::slice::from_ref(path));
+        }
         // Nested ACP SDK payloads serialise as camelCase on their own;
         // force every object key down the tree to snake_case so the
         // wire contract stays uniform.

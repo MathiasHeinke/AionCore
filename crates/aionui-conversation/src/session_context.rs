@@ -113,6 +113,7 @@ impl<'a> SessionContextBuilder<'a> {
                 path: normalized,
                 stored_path: existing_stored_path,
                 is_custom: true,
+                project_environment_hint: None,
             });
         }
 
@@ -128,6 +129,7 @@ impl<'a> SessionContextBuilder<'a> {
                 path: expected_auto_workspace.to_string_lossy().into_owned(),
                 stored_path: String::new(),
                 is_custom: false,
+                project_environment_hint: None,
             });
         };
 
@@ -145,6 +147,7 @@ impl<'a> SessionContextBuilder<'a> {
             is_custom: Path::new(&normalized) != expected_auto_workspace.as_path(),
             stored_path: stored_path.to_owned(),
             path: normalized,
+            project_environment_hint: None,
         })
     }
 

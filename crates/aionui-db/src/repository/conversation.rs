@@ -1,4 +1,4 @@
-use aionui_common::{PaginatedResult, TimestampMs};
+use aionui_common::{PaginatedResult, TimestampMs, constants::MAX_SAFE_PROJECT_BINDING_REVISION};
 use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
@@ -29,22 +29,32 @@ pub trait IConversationRepository: Send + Sync {
 
     /// Atomically updates a conversation only while its portable project
     /// binding equals `expected`. SQLite overrides this with a single
-    /// conditional UPDATE; the default keeps custom test repositories source
-    /// compatible while still failing closed on a mismatched observation.
+    /// conditional UPDATE and returns the exact row written by that statement.
+    /// Other adapters fail closed until they provide a genuinely atomic CAS.
     async fn update_project_binding_cas(
         &self,
         id: &str,
         updates: &ConversationRowUpdate,
         expected: &ConversationProjectBindingExpectation,
-    ) -> Result<(), DbError> {
-        let row = self
-            .get(id)
-            .await?
-            .ok_or_else(|| DbError::NotFound(format!("Conversation '{id}' not found")))?;
-        if !expected.matches_extra(&row.extra) {
-            return Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned()));
-        }
-        self.update(id, updates).await
+    ) -> Result<ConversationRow, DbError> {
+        let _ = (id, updates, expected);
+        Err(DbError::Conflict("PROJECT_BINDING_CAS_UNSUPPORTED".to_owned()))
+    }
+
+    /// Atomically applies only the requested top-level `extra` keys while
+    /// preserving every concurrent sibling mutation. If `expected_binding`
+    /// is present, the same compare-and-swap also guards the portable project
+    /// binding. Adapters must override this with a genuine CAS/retry loop;
+    /// the default fails closed.
+    async fn update_with_extra_patch_cas(
+        &self,
+        id: &str,
+        updates: &ConversationRowUpdate,
+        extra_patch: &ConversationExtraPatch,
+        expected_binding: Option<&ConversationProjectBindingExpectation>,
+    ) -> Result<ConversationRow, DbError> {
+        let _ = (id, updates, extra_patch, expected_binding);
+        Err(DbError::Conflict("CONVERSATION_EXTRA_PATCH_CAS_UNSUPPORTED".to_owned()))
     }
 
     /// Deletes a conversation (messages cascade via FK).
@@ -284,35 +294,96 @@ pub struct ConversationRowUpdate {
     pub updated_at: Option<TimestampMs>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConversationExtraPatch {
+    pub set: serde_json::Map<String, serde_json::Value>,
+    pub remove: Vec<String>,
+}
+
+impl ConversationExtraPatch {
+    pub fn touches_project_binding(&self) -> bool {
+        const KEYS: [&str; 4] = [
+            "project_id",
+            "workspace_root_ref",
+            "project_binding_revision",
+            "project_binding_receipt_id",
+        ];
+        KEYS.iter()
+            .any(|key| self.set.contains_key(*key) || self.remove.iter().any(|removed| removed == key))
+    }
+}
+
 pub const PROJECT_BINDING_CONFLICT: &str = "PROJECT_BINDING_CONFLICT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationProjectBindingExpectation {
     pub project_id: Option<String>,
     pub workspace_root_ref: Option<String>,
+    pub project_binding_revision: u64,
+    pub project_binding_receipt_id: Option<String>,
 }
 
 impl ConversationProjectBindingExpectation {
     pub fn unbound() -> Self {
+        Self::unbound_at(0)
+    }
+
+    pub fn unbound_at(project_binding_revision: u64) -> Self {
         Self {
             project_id: None,
             workspace_root_ref: None,
+            project_binding_revision,
+            project_binding_receipt_id: None,
         }
     }
 
-    pub fn bound(project_id: impl Into<String>, workspace_root_ref: impl Into<String>) -> Self {
+    pub fn unbound_with_receipt(project_binding_revision: u64, project_binding_receipt_id: Option<String>) -> Self {
+        Self {
+            project_id: None,
+            workspace_root_ref: None,
+            project_binding_revision,
+            project_binding_receipt_id,
+        }
+    }
+
+    pub fn bound(
+        project_id: impl Into<String>,
+        workspace_root_ref: impl Into<String>,
+        project_binding_revision: u64,
+        project_binding_receipt_id: Option<String>,
+    ) -> Self {
         Self {
             project_id: Some(project_id.into()),
             workspace_root_ref: Some(workspace_root_ref.into()),
+            project_binding_revision,
+            project_binding_receipt_id,
         }
     }
 
-    fn matches_extra(&self, extra: &str) -> bool {
+    pub fn matches_extra(&self, extra: &str) -> bool {
         let Ok(extra) = serde_json::from_str::<serde_json::Value>(extra) else {
             return false;
         };
         let project_id = extra.get("project_id").and_then(serde_json::Value::as_str);
         let workspace_root_ref = extra.get("workspace_root_ref").and_then(serde_json::Value::as_str);
+        let project_binding_revision = match extra.get("project_binding_revision") {
+            Some(value) => value.as_u64(),
+            None => Some(0),
+        };
+        if project_binding_revision != Some(self.project_binding_revision) {
+            return false;
+        }
+        if self.project_binding_revision > MAX_SAFE_PROJECT_BINDING_REVISION {
+            return false;
+        }
+        let project_binding_receipt_id = match extra.get("project_binding_receipt_id") {
+            Some(serde_json::Value::String(value)) => Some(value.as_str()),
+            Some(serde_json::Value::Null) | None => None,
+            Some(_) => return false,
+        };
+        if project_binding_receipt_id != self.project_binding_receipt_id.as_deref() {
+            return false;
+        }
         match (&self.project_id, &self.workspace_root_ref) {
             (None, None) => project_id.is_none() && workspace_root_ref.is_none(),
             (Some(expected_project), Some(expected_root)) => {

@@ -18,6 +18,9 @@ pub const COOKIE_MAX_AGE_DAYS: u32 = 30;
 pub const CSRF_COOKIE_NAME: &str = "aionui-csrf-token";
 pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
 
+/// Largest integer that remains exact across Rust JSON and JavaScript.
+pub const MAX_SAFE_PROJECT_BINDING_REVISION: u64 = 9_007_199_254_740_991;
+
 // --- Server ---
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";

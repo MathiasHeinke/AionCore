@@ -384,12 +384,6 @@ impl TeamAgentProvisioner {
 
     pub(crate) async fn update_session_mode_seed(&self, agent: &TeamAgent, mode: &str) -> Result<(), TeamError> {
         self.conversation_port
-            .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "session_mode": mode }))
-            .await
-            .map_err(|e| {
-                TeamError::InvalidRequest(format!("failed to persist session_mode for {}: {e}", agent.slot_id))
-            })?;
-        self.conversation_port
             .save_acp_runtime_mode(&agent.conversation_id, mode)
             .await
             .map_err(|e| {

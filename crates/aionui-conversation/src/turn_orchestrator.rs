@@ -324,6 +324,11 @@ impl ConversationTurnOrchestrator {
     }
 
     pub(crate) async fn run_user_turn(self, input: TurnStartInput) -> ConversationTurnResult {
+        // Keep the single revalidated project execution permit alive through
+        // stream consumption, persistence and turn completion. Mutation uses
+        // a non-blocking write permit and therefore stays BUSY until this
+        // exact turn hold is released.
+        let _project_runtime_execution = input.build_options.project_runtime_execution.clone();
         let mut turn_claim = input.turn_claim;
         let conv_id = input.conversation.id.clone();
         let turn_id = input.turn_id.clone();

@@ -8,9 +8,9 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationProjectBindingExpectation, ConversationRowUpdate, IConversationRepository,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
-    PROJECT_BINDING_CONFLICT,
+    ConversationExtraPatch, ConversationFilters, ConversationProjectBindingExpectation, ConversationRowUpdate,
+    IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult,
+    MessageRowUpdate, MessageSearchRow, PROJECT_BINDING_CONFLICT,
 };
 
 /// SQLite-backed implementation of [`IConversationRepository`].
@@ -215,7 +215,38 @@ impl IConversationRepository for SqliteConversationRepository {
             binds.push(BindValue::OptStr(model.clone()));
         }
         if let Some(ref extra) = updates.extra {
-            set_parts.push("extra = ?".to_string());
+            // Generic whole-extra writes are deliberately not allowed to
+            // mutate the project binding receipt.  Binding changes use the
+            // dedicated CAS path below. The scalar CTE binds the candidate
+            // once, strips all reserved fields, then restores each currently
+            // persisted JSON value without coercing its type. This preserves
+            // malformed/future values and explicit null byte-semantically;
+            // absence remains absence. The whole transform is one UPDATE, so
+            // it cannot overwrite a concurrent binding CAS.
+            set_parts.push(
+                "extra = (\
+                    WITH candidate(value) AS (\
+                        SELECT json_remove(?, '$.project_id', '$.workspace_root_ref', '$.project_binding_revision', '$.project_binding_receipt_id')\
+                    ), project_id(value) AS (\
+                        SELECT CASE WHEN json_type(conversations.extra, '$.project_id') IS NULL \
+                            THEN value ELSE json_set(value, '$.project_id', conversations.extra -> '$.project_id') END \
+                        FROM candidate\
+                    ), workspace_root_ref(value) AS (\
+                        SELECT CASE WHEN json_type(conversations.extra, '$.workspace_root_ref') IS NULL \
+                            THEN value ELSE json_set(value, '$.workspace_root_ref', conversations.extra -> '$.workspace_root_ref') END \
+                        FROM project_id\
+                    ), binding_revision(value) AS (\
+                        SELECT CASE WHEN json_type(conversations.extra, '$.project_binding_revision') IS NULL \
+                            THEN value ELSE json_set(value, '$.project_binding_revision', conversations.extra -> '$.project_binding_revision') END \
+                        FROM workspace_root_ref\
+                    ), binding_receipt(value) AS (\
+                        SELECT CASE WHEN json_type(conversations.extra, '$.project_binding_receipt_id') IS NULL \
+                            THEN value ELSE json_set(value, '$.project_binding_receipt_id', conversations.extra -> '$.project_binding_receipt_id') END \
+                        FROM binding_revision\
+                    ) SELECT value FROM binding_receipt\
+                )"
+                .to_string(),
+            );
             binds.push(BindValue::Str(extra.clone()));
         }
         if let Some(ref status) = updates.status {
@@ -248,85 +279,129 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn update_with_extra_patch_cas(
+        &self,
+        id: &str,
+        updates: &ConversationRowUpdate,
+        extra_patch: &ConversationExtraPatch,
+        expected_binding: Option<&ConversationProjectBindingExpectation>,
+    ) -> Result<ConversationRow, DbError> {
+        const MAX_RETRIES: usize = 32;
+        if updates.extra.is_some() {
+            return Err(DbError::Conflict("CONVERSATION_EXTRA_PATCH_AMBIGUOUS".to_owned()));
+        }
+        if extra_patch.touches_project_binding() && expected_binding.is_none() {
+            return Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned()));
+        }
+        if expected_binding.is_some_and(|expected| {
+            expected.project_binding_revision > aionui_common::constants::MAX_SAFE_PROJECT_BINDING_REVISION
+        }) {
+            return Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned()));
+        }
+
+        for _ in 0..MAX_RETRIES {
+            let Some(observed) = self.get(id).await? else {
+                return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
+            };
+            if expected_binding.is_some_and(|expected| !expected.matches_extra(&observed.extra)) {
+                return Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned()));
+            }
+            if extra_patch.set.contains_key("workspace") {
+                let observed_extra: serde_json::Value = serde_json::from_str(&observed.extra)
+                    .map_err(|error| DbError::Init(format!("conversation extra is not valid JSON: {error}")))?;
+                if observed_extra.get("project_id").is_some() && observed_extra.get("workspace_root_ref").is_some() {
+                    return Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned()));
+                }
+            }
+            let candidate_extra = apply_extra_patch(&observed.extra, extra_patch)?;
+            let mut set_parts = vec!["extra = ?".to_owned()];
+            let mut binds = vec![BindValue::Str(candidate_extra)];
+            if let Some(ref name) = updates.name {
+                set_parts.push("name = ?".to_owned());
+                binds.push(BindValue::Str(name.clone()));
+            }
+            if let Some(pinned) = updates.pinned {
+                set_parts.push("pinned = ?".to_owned());
+                binds.push(BindValue::Bool(pinned));
+            }
+            if let Some(ref pinned_at) = updates.pinned_at {
+                set_parts.push("pinned_at = ?".to_owned());
+                binds.push(BindValue::OptI64(*pinned_at));
+            }
+            if let Some(ref model) = updates.model {
+                set_parts.push("model = ?".to_owned());
+                binds.push(BindValue::OptStr(model.clone()));
+            }
+            if let Some(ref status) = updates.status {
+                set_parts.push("status = ?".to_owned());
+                binds.push(BindValue::Str(status.clone()));
+            }
+            if let Some(updated_at) = updates.updated_at {
+                set_parts.push("updated_at = ?".to_owned());
+                binds.push(BindValue::I64(updated_at));
+            }
+
+            let sql = format!(
+                "UPDATE conversations SET {} WHERE id = ? AND extra = ? RETURNING *",
+                set_parts.join(", ")
+            );
+            let mut query = sqlx::query_as::<_, ConversationRow>(&sql);
+            for bind in &binds {
+                query = bind_value_as(query, bind);
+            }
+            query = query.bind(id).bind(&observed.extra);
+            if let Some(updated) = query.fetch_optional(&self.pool).await? {
+                return Ok(updated);
+            }
+        }
+
+        Err(DbError::Conflict("CONVERSATION_EXTRA_PATCH_CONFLICT".to_owned()))
+    }
+
     async fn update_project_binding_cas(
         &self,
         id: &str,
         updates: &ConversationRowUpdate,
         expected: &ConversationProjectBindingExpectation,
-    ) -> Result<(), DbError> {
-        let mut set_parts: Vec<String> = Vec::new();
-        let mut binds: Vec<BindValue> = Vec::new();
-
-        if let Some(ref name) = updates.name {
-            set_parts.push("name = ?".to_string());
-            binds.push(BindValue::Str(name.clone()));
-        }
-        if let Some(pinned) = updates.pinned {
-            set_parts.push("pinned = ?".to_string());
-            binds.push(BindValue::Bool(pinned));
-        }
-        if let Some(ref pinned_at) = updates.pinned_at {
-            set_parts.push("pinned_at = ?".to_string());
-            binds.push(BindValue::OptI64(*pinned_at));
-        }
-        if let Some(ref model) = updates.model {
-            set_parts.push("model = ?".to_string());
-            binds.push(BindValue::OptStr(model.clone()));
-        }
-        if let Some(ref extra) = updates.extra {
-            set_parts.push("extra = ?".to_string());
-            binds.push(BindValue::Str(extra.clone()));
-        }
-        if let Some(ref status) = updates.status {
-            set_parts.push("status = ?".to_string());
-            binds.push(BindValue::Str(status.clone()));
-        }
-        if let Some(updated_at) = updates.updated_at {
-            set_parts.push("updated_at = ?".to_string());
-            binds.push(BindValue::I64(updated_at));
-        }
-        if set_parts.is_empty() {
-            return Ok(());
+    ) -> Result<ConversationRow, DbError> {
+        let candidate = updates
+            .extra
+            .as_deref()
+            .ok_or_else(|| DbError::Conflict("PROJECT_BINDING_CAS_EMPTY".to_owned()))?;
+        let candidate: serde_json::Value = serde_json::from_str(candidate)
+            .map_err(|error| DbError::Init(format!("project binding candidate is not valid JSON: {error}")))?;
+        let object = candidate
+            .as_object()
+            .ok_or_else(|| DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned()))?;
+        let project_id = object.get("project_id").and_then(serde_json::Value::as_str);
+        let workspace_root_ref = object.get("workspace_root_ref").and_then(serde_json::Value::as_str);
+        if project_id.is_some() != workspace_root_ref.is_some()
+            || (project_id.is_some() && object.contains_key("workspace"))
+        {
+            return Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned()));
         }
 
-        let binding_predicate = match (&expected.project_id, &expected.workspace_root_ref) {
-            (None, None) => {
-                "json_type(extra, '$.project_id') IS NULL AND json_type(extra, '$.workspace_root_ref') IS NULL"
+        let mut patch = ConversationExtraPatch::default();
+        for key in [
+            "project_id",
+            "workspace_root_ref",
+            "project_binding_revision",
+            "project_binding_receipt_id",
+        ] {
+            if let Some(value) = object.get(key) {
+                patch.set.insert(key.to_owned(), value.clone());
+            } else {
+                patch.remove.push(key.to_owned());
             }
-            (Some(_), Some(_)) => {
-                "json_type(extra, '$.project_id') = 'text' \
-                 AND json_extract(extra, '$.project_id') = ? \
-                 AND json_type(extra, '$.workspace_root_ref') = 'text' \
-                 AND json_extract(extra, '$.workspace_root_ref') = ?"
-            }
-            _ => return Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned())),
-        };
-        let sql = format!(
-            "UPDATE conversations SET {} WHERE id = ? AND {binding_predicate}",
-            set_parts.join(", ")
-        );
-        let mut query = sqlx::query(&sql);
-        for bind in &binds {
-            query = bind_value(query, bind);
         }
-        query = query.bind(id);
-        if let (Some(project_id), Some(workspace_root_ref)) = (&expected.project_id, &expected.workspace_root_ref) {
-            query = query.bind(project_id).bind(workspace_root_ref);
+        if !object.contains_key("workspace") {
+            patch.remove.push("workspace".to_owned());
         }
 
-        let result = query.execute(&self.pool).await?;
-        if result.rows_affected() == 1 {
-            return Ok(());
-        }
-        let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?)")
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await?;
-        if exists == 0 {
-            Err(DbError::NotFound(format!("Conversation '{id}' not found")))
-        } else {
-            Err(DbError::Conflict(PROJECT_BINDING_CONFLICT.to_owned()))
-        }
+        let mut safe_updates = updates.clone();
+        safe_updates.extra = None;
+        self.update_with_extra_patch_cas(id, &safe_updates, &patch, Some(expected))
+            .await
     }
 
     async fn delete(&self, id: &str) -> Result<(), DbError> {
@@ -1023,6 +1098,22 @@ impl IConversationRepository for SqliteConversationRepository {
 }
 
 // ── Dynamic bind helpers ────────────────────────────────────────────
+
+fn apply_extra_patch(raw: &str, patch: &ConversationExtraPatch) -> Result<String, DbError> {
+    let mut value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| DbError::Init(format!("conversation extra is not valid JSON: {error}")))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| DbError::Init("conversation extra must be a JSON object".to_owned()))?;
+    for key in &patch.remove {
+        object.remove(key);
+    }
+    for (key, value) in &patch.set {
+        object.insert(key.clone(), value.clone());
+    }
+    serde_json::to_string(&value)
+        .map_err(|error| DbError::Init(format!("conversation extra patch serialization failed: {error}")))
+}
 
 /// Tagged union to carry heterogeneous bind values for dynamic SQL.
 #[derive(Debug, Clone)]

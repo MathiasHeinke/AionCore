@@ -93,6 +93,16 @@ pub(super) async fn build(
         });
     }
 
+    // Keep authenticated-but-untrusted project metadata as the final prompt
+    // block, after all executable system rules and guide context.
+    if let Some(environment_hint) = ctx.project_environment_hint.as_ref() {
+        let metadata = environment_hint.metadata_block();
+        overrides.system_prompt = Some(match overrides.system_prompt.take() {
+            Some(existing) => format!("{existing}\n\n{metadata}"),
+            None => metadata,
+        });
+    }
+
     if !extra_mcp_servers.is_empty() {
         info!(
             conversation_id = %ctx.conversation_id,

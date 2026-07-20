@@ -19,10 +19,10 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 const LOCAL_CAPABILITY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const PROJECT_ID: &str = "018f0c00-0000-7000-8000-000000000001";
-const REALM_ID: &str = "018f0c00-0000-7000-8000-000000000003";
-const ROOT_ID: &str = "018f0c00-0000-7000-8000-000000000004";
-const ROOT_REF: &str = "root:018f0c00-0000-7000-8000-000000000004";
+const PROJECT_ID: &str = "018f0c00-0000-4000-8000-000000000001";
+const REALM_ID: &str = "018f0c00-0000-4000-8000-000000000003";
+const ROOT_ID: &str = "018f0c00-0000-4000-8000-000000000004";
+const ROOT_REF: &str = "root:018f0c00-0000-4000-8000-000000000004";
 
 struct NoopProjectAgent {
     conversation_id: String,
@@ -135,7 +135,7 @@ async fn response_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-async fn create_project_conversation(app: &axum::Router) -> String {
+async fn create_project_conversation(app: &axum::Router) -> (String, u64, Option<String>) {
     let response = app
         .clone()
         .oneshot(local_json_request(
@@ -154,13 +154,26 @@ async fn create_project_conversation(app: &axum::Router) -> String {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    response_json(response).await["data"]["id"].as_str().unwrap().to_owned()
+    let body = response_json(response).await;
+    (
+        body["data"]["id"].as_str().unwrap().to_owned(),
+        body["data"]["extra"]["project_binding_revision"].as_u64().unwrap(),
+        body["data"]["extra"]["project_binding_receipt_id"]
+            .as_str()
+            .map(str::to_owned),
+    )
 }
 
-fn runtime_workspace(directory: &tempfile::TempDir) -> ProjectRuntimeWorkspaceRequest {
+fn runtime_workspace(
+    directory: &tempfile::TempDir,
+    project_binding_revision: u64,
+    project_binding_receipt_id: Option<String>,
+) -> ProjectRuntimeWorkspaceRequest {
     ProjectRuntimeWorkspaceRequest {
         project_id: PROJECT_ID.to_owned(),
         workspace_root_ref: ROOT_REF.to_owned(),
+        project_binding_revision,
+        project_binding_receipt_id,
         path: std::fs::canonicalize(directory.path())
             .unwrap()
             .to_string_lossy()
@@ -193,12 +206,15 @@ fn ticket(
             root_id: ROOT_ID.into(),
             project_id: PROJECT_ID.into(),
             workspace_root_ref: ROOT_REF.into(),
+            project_binding_revision: runtime_workspace.project_binding_revision,
+            project_binding_receipt_id: runtime_workspace.project_binding_receipt_id.clone(),
             canonical_path_sha256: format!("{:x}", Sha256::digest(runtime_workspace.path.as_bytes())),
             root_catalog_revision: 7,
             root_ownership_revision: 11,
             project_catalog_revision: 13,
             root_record_sha256: "a".repeat(64),
             project_record_sha256: "b".repeat(64),
+            environment_hint: r#"{"metadata_class":"untrusted_data_not_instructions","project_title":"Attested Project","knowledge_boot_policy":"system_index_first"}"#.into(),
             iat: now,
             nbf: now.saturating_sub(1),
             exp: now.saturating_add(9),
@@ -229,8 +245,8 @@ async fn assert_route_error(response: axum::response::Response, status: StatusCo
 async fn signed_send_and_warmup_succeed_without_persisting_ticket_or_project_path() {
     let (app, services, _app_data) = build_local_app().await;
     let runtime_directory = tempfile::tempdir().unwrap();
-    let runtime_workspace = runtime_workspace(&runtime_directory);
-    let conversation_id = create_project_conversation(&app).await;
+    let (conversation_id, binding_revision, binding_receipt) = create_project_conversation(&app).await;
+    let runtime_workspace = runtime_workspace(&runtime_directory, binding_revision, binding_receipt);
     let mut ws_events = services.event_bus.subscribe();
 
     let send_ticket = ticket(
@@ -306,8 +322,8 @@ async fn signed_send_and_warmup_succeed_without_persisting_ticket_or_project_pat
 async fn send_route_rejects_duplicate_oversized_spoofed_and_body_only_attestations_without_side_effects() {
     let (app, services, _app_data) = build_local_app().await;
     let runtime_directory = tempfile::tempdir().unwrap();
-    let runtime_workspace = runtime_workspace(&runtime_directory);
-    let conversation_id = create_project_conversation(&app).await;
+    let (conversation_id, binding_revision, binding_receipt) = create_project_conversation(&app).await;
+    let runtime_workspace = runtime_workspace(&runtime_directory, binding_revision, binding_receipt);
     let endpoint = format!("/api/conversations/{conversation_id}/messages");
 
     let duplicate_ticket = ticket(
@@ -395,8 +411,8 @@ async fn send_route_rejects_duplicate_oversized_spoofed_and_body_only_attestatio
 async fn warmup_route_rejects_body_only_and_send_purpose_tickets() {
     let (app, services, _app_data) = build_local_app().await;
     let runtime_directory = tempfile::tempdir().unwrap();
-    let runtime_workspace = runtime_workspace(&runtime_directory);
-    let conversation_id = create_project_conversation(&app).await;
+    let (conversation_id, binding_revision, binding_receipt) = create_project_conversation(&app).await;
+    let runtime_workspace = runtime_workspace(&runtime_directory, binding_revision, binding_receipt);
     let endpoint = format!("/api/conversations/{conversation_id}/warmup");
 
     let response = app

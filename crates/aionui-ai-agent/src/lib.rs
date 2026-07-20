@@ -10,6 +10,7 @@ pub mod factory;
 pub(crate) mod idle_scanner;
 pub mod manager;
 pub(crate) mod persistence;
+pub mod project_runtime_fence;
 pub mod protocol;
 pub mod registry;
 pub mod routes;
@@ -44,6 +45,6 @@ pub use services::AgentService;
 pub use services::RemoteAgentService;
 pub use session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,
-    WorkspaceContext,
+    ProjectEnvironmentHint, WorkspaceContext,
 };
 pub use task_manager::{IWorkerTaskManager, WorkerTaskManagerImpl};

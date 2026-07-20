@@ -29,6 +29,14 @@ pub(super) async fn build(
     let belongs_to_team = build_context.team.is_some();
     let mut config = build_context.config;
 
+    if let Some(environment_hint) = ctx.project_environment_hint.as_ref() {
+        let metadata = environment_hint.metadata_block();
+        config.preset_context = Some(match config.preset_context.take() {
+            Some(existing) => format!("{existing}\n\n{metadata}"),
+            None => metadata,
+        });
+    }
+
     // Resolve the catalog row — prefer explicit agent_id, fall
     // back to a vendor-label match for legacy payloads.
     let meta = if let Some(ref agent_id) = config.agent_id {

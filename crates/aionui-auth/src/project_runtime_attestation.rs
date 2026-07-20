@@ -1,7 +1,8 @@
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aionui_api_types::ProjectRuntimeWorkspaceRequest;
+use aionui_api_types::{MAX_SAFE_PROJECT_BINDING_REVISION, ProjectRuntimeWorkspaceRequest};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use dashmap::DashMap;
@@ -20,6 +21,33 @@ const CLOCK_SKEW_SECONDS: i64 = 2;
 const EXPECTED_ISSUER: &str = "aionui-main";
 const EXPECTED_AUDIENCE: &str = "aioncore-project-runtime";
 const EXPECTED_TYPE: &str = "AIONUI-PROJECT-RUNTIME";
+const HEADER_KEYS: &[&str] = &["alg", "typ", "v"];
+const CLAIM_KEYS: &[&str] = &[
+    "v",
+    "iss",
+    "aud",
+    "sub",
+    "purpose",
+    "backend_generation",
+    "seat_id",
+    "realm_id",
+    "root_id",
+    "project_id",
+    "workspace_root_ref",
+    "project_binding_revision",
+    "project_binding_receipt_id",
+    "environment_hint",
+    "canonical_path_sha256",
+    "root_catalog_revision",
+    "root_ownership_revision",
+    "project_catalog_revision",
+    "root_record_sha256",
+    "project_record_sha256",
+    "iat",
+    "nbf",
+    "exp",
+    "jti",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -42,12 +70,15 @@ pub struct ProjectRuntimeAttestationClaims {
     pub root_id: String,
     pub project_id: String,
     pub workspace_root_ref: String,
+    pub project_binding_revision: u64,
+    pub project_binding_receipt_id: Option<String>,
     pub canonical_path_sha256: String,
     pub root_catalog_revision: u64,
     pub root_ownership_revision: u64,
     pub project_catalog_revision: u64,
     pub root_record_sha256: String,
     pub project_record_sha256: String,
+    pub environment_hint: String,
     pub iat: i64,
     pub nbf: i64,
     pub exp: i64,
@@ -62,11 +93,22 @@ struct ProjectRuntimeJwsHeader {
     v: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VerifiedProjectRuntimeAttestation {
     claims: ProjectRuntimeAttestationClaims,
     runtime_fingerprint: String,
     environment_hint_fingerprint: String,
+}
+
+impl std::fmt::Debug for VerifiedProjectRuntimeAttestation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedProjectRuntimeAttestation")
+            .field("runtime_fingerprint", &self.runtime_fingerprint)
+            .field("environment_hint", &"[REDACTED]")
+            .field("environment_hint_fingerprint", &self.environment_hint_fingerprint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl VerifiedProjectRuntimeAttestation {
@@ -99,9 +141,23 @@ impl VerifiedProjectRuntimeAttestation {
         &self.environment_hint_fingerprint
     }
 
+    pub fn environment_hint(&self) -> &str {
+        &self.claims.environment_hint
+    }
+
+    pub fn project_binding_revision(&self) -> u64 {
+        self.claims.project_binding_revision
+    }
+
+    pub fn project_binding_receipt_id(&self) -> Option<&str> {
+        self.claims.project_binding_receipt_id.as_deref()
+    }
+
     pub fn matches_runtime_workspace(&self, runtime_workspace: &ProjectRuntimeWorkspaceRequest) -> bool {
         self.claims.project_id == runtime_workspace.project_id
             && self.claims.workspace_root_ref == runtime_workspace.workspace_root_ref
+            && self.claims.project_binding_revision == runtime_workspace.project_binding_revision
+            && self.claims.project_binding_receipt_id == runtime_workspace.project_binding_receipt_id
             && canonical_path_hash(runtime_workspace)
                 .is_ok_and(|path_hash| path_hash == self.claims.canonical_path_sha256)
     }
@@ -154,12 +210,36 @@ pub struct ProjectRuntimeAttestationVerifier {
     nonce_capacity: usize,
 }
 
-struct ProjectRuntimeVerificationExpectation<'a> {
+pub struct ProjectRuntimeVerificationExpectation<'a> {
     conversation_id: &'a str,
     purpose: ProjectRuntimeAttestationPurpose,
     project_id: &'a str,
     workspace_root_ref: &'a str,
+    project_binding_revision: u64,
+    project_binding_receipt_id: Option<&'a str>,
     runtime_workspace: &'a ProjectRuntimeWorkspaceRequest,
+}
+
+impl<'a> ProjectRuntimeVerificationExpectation<'a> {
+    pub fn new(
+        conversation_id: &'a str,
+        purpose: ProjectRuntimeAttestationPurpose,
+        project_id: &'a str,
+        workspace_root_ref: &'a str,
+        project_binding_revision: u64,
+        project_binding_receipt_id: Option<&'a str>,
+        runtime_workspace: &'a ProjectRuntimeWorkspaceRequest,
+    ) -> Self {
+        Self {
+            conversation_id,
+            purpose,
+            project_id,
+            workspace_root_ref,
+            project_binding_revision,
+            project_binding_receipt_id,
+            runtime_workspace,
+        }
+    }
 }
 
 impl std::fmt::Debug for ProjectRuntimeAttestationVerifier {
@@ -192,24 +272,13 @@ impl ProjectRuntimeAttestationVerifier {
     pub fn verify_and_consume(
         &self,
         compact_jws: Option<&str>,
-        expected_conversation_id: &str,
-        expected_purpose: ProjectRuntimeAttestationPurpose,
-        expected_project_id: &str,
-        expected_workspace_root_ref: &str,
-        runtime_workspace: &ProjectRuntimeWorkspaceRequest,
+        expectation: &ProjectRuntimeVerificationExpectation<'_>,
     ) -> Result<VerifiedProjectRuntimeAttestation, ProjectRuntimeAttestationError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| ProjectRuntimeAttestationError::Invalid)?
             .as_secs() as i64;
-        let expectation = ProjectRuntimeVerificationExpectation {
-            conversation_id: expected_conversation_id,
-            purpose: expected_purpose,
-            project_id: expected_project_id,
-            workspace_root_ref: expected_workspace_root_ref,
-            runtime_workspace,
-        };
-        self.verify_and_consume_at(compact_jws, &expectation, now)
+        self.verify_and_consume_at(compact_jws, expectation, now)
     }
 
     fn verify_and_consume_at(
@@ -238,6 +307,7 @@ impl ProjectRuntimeAttestationVerifier {
         }
 
         let header_bytes = decode_segment(header_segment)?;
+        require_exact_object_keys(&header_bytes, HEADER_KEYS)?;
         let header: ProjectRuntimeJwsHeader =
             serde_json::from_slice(&header_bytes).map_err(|_| ProjectRuntimeAttestationError::Invalid)?;
         if header.alg != "HS256" || header.typ != EXPECTED_TYPE || header.v != 1 {
@@ -254,13 +324,14 @@ impl ProjectRuntimeAttestationVerifier {
         }
 
         let claims_bytes = decode_segment(payload_segment)?;
+        require_exact_object_keys(&claims_bytes, CLAIM_KEYS)?;
         let claims: ProjectRuntimeAttestationClaims =
             serde_json::from_slice(&claims_bytes).map_err(|_| ProjectRuntimeAttestationError::Invalid)?;
         self.validate_claims(&claims, expectation, now_seconds)?;
         self.consume_nonce(&claims.jti, claims.exp, now_seconds)?;
 
         let runtime_fingerprint = runtime_fingerprint(&claims);
-        let environment_hint_fingerprint = claims.project_record_sha256.clone();
+        let environment_hint_fingerprint = encode_lower_hex(&Sha256::digest(claims.environment_hint.as_bytes()).into());
         Ok(VerifiedProjectRuntimeAttestation {
             claims,
             runtime_fingerprint,
@@ -285,26 +356,47 @@ impl ProjectRuntimeAttestationVerifier {
         }
         if claims.project_id != expectation.runtime_workspace.project_id
             || claims.workspace_root_ref != expectation.runtime_workspace.workspace_root_ref
+            || claims.project_binding_revision != expectation.runtime_workspace.project_binding_revision
+            || claims.project_binding_receipt_id != expectation.runtime_workspace.project_binding_receipt_id
             || claims.project_id != expectation.project_id
             || claims.workspace_root_ref != expectation.workspace_root_ref
+            || claims.project_binding_revision != expectation.project_binding_revision
+            || claims.project_binding_receipt_id.as_deref() != expectation.project_binding_receipt_id
             || claims.workspace_root_ref != format!("root:{}", claims.root_id)
         {
             return Err(ProjectRuntimeAttestationError::Mismatch);
         }
-        if !valid_identity(&claims.seat_id)
+        if !valid_seat_id(&claims.seat_id)
             || !canonical_uuid(&claims.realm_id)
             || !canonical_uuid(&claims.root_id)
             || !canonical_uuid(&claims.project_id)
-            || !valid_identity(&claims.sub)
+            || !valid_conversation_id(&claims.sub)
             || !valid_jti(&claims.jti)
             || !is_lower_hex_64(&claims.canonical_path_sha256)
             || !is_lower_hex_64(&claims.root_record_sha256)
             || !is_lower_hex_64(&claims.project_record_sha256)
+            || claims.project_binding_revision > MAX_SAFE_PROJECT_BINDING_REVISION
+            || claims.root_catalog_revision > MAX_SAFE_PROJECT_BINDING_REVISION
+            || claims.root_ownership_revision > MAX_SAFE_PROJECT_BINDING_REVISION
+            || claims.project_catalog_revision > MAX_SAFE_PROJECT_BINDING_REVISION
+            || claims
+                .project_binding_receipt_id
+                .as_deref()
+                .is_some_and(|value| !canonical_receipt_uuid(value))
+            || !valid_environment_hint(&claims.environment_hint)
         {
             return Err(ProjectRuntimeAttestationError::Invalid);
         }
-        if claims.exp <= claims.iat
-            || claims.nbf > claims.exp
+        let max_safe_timestamp = MAX_SAFE_PROJECT_BINDING_REVISION as i64;
+        if claims.iat < 0
+            || claims.nbf < 0
+            || claims.exp < 0
+            || claims.iat > max_safe_timestamp
+            || claims.nbf > max_safe_timestamp
+            || claims.exp > max_safe_timestamp
+            || claims.exp <= claims.iat
+            || claims.nbf > claims.iat
+            || claims.iat.saturating_sub(claims.nbf) > CLOCK_SKEW_SECONDS
             || claims.exp.saturating_sub(claims.iat) > MAX_TTL_SECONDS
             || claims.iat > now_seconds.saturating_add(CLOCK_SKEW_SECONDS)
             || claims.nbf > now_seconds.saturating_add(CLOCK_SKEW_SECONDS)
@@ -393,16 +485,60 @@ fn decode_segment(segment: &str) -> Result<Vec<u8>, ProjectRuntimeAttestationErr
         .map_err(|_| ProjectRuntimeAttestationError::Invalid)
 }
 
-fn valid_identity(value: &str) -> bool {
+fn require_exact_object_keys(bytes: &[u8], expected: &[&str]) -> Result<(), ProjectRuntimeAttestationError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| ProjectRuntimeAttestationError::Invalid)?;
+    let object = value.as_object().ok_or(ProjectRuntimeAttestationError::Invalid)?;
+    if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
+        return Err(ProjectRuntimeAttestationError::Invalid);
+    }
+    Ok(())
+}
+
+fn valid_conversation_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
+        && value.as_bytes()[0].is_ascii_alphanumeric()
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
 }
 
+fn valid_seat_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 fn canonical_uuid(value: &str) -> bool {
-    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| {
+        !parsed.is_nil()
+            && (1..=5).contains(&parsed.get_version_num())
+            && parsed.get_variant() == uuid::Variant::RFC4122
+            && parsed.hyphenated().to_string() == value
+    })
+}
+
+fn canonical_receipt_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| {
+        !parsed.is_nil()
+            && parsed.get_version_num() == 4
+            && parsed.get_variant() == uuid::Variant::RFC4122
+            && parsed.hyphenated().to_string() == value
+    })
+}
+
+fn valid_environment_hint(value: &str) -> bool {
+    static FORBIDDEN_UNICODE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]").expect("valid Unicode policy"));
+    !value.is_empty()
+        && value.len() <= 600
+        && value.trim() == value
+        && !FORBIDDEN_UNICODE.is_match(value)
+        && !value.contains(['/', '\\'])
 }
 
 fn valid_jti(value: &str) -> bool {
@@ -444,9 +580,9 @@ mod tests {
     use super::*;
 
     const CAPABILITY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const PROJECT_ID: &str = "018f0c00-0000-7000-8000-000000000001";
-    const ROOT_ID: &str = "018f0c00-0000-7000-8000-000000000004";
-    const ROOT_REF: &str = "root:018f0c00-0000-7000-8000-000000000004";
+    const PROJECT_ID: &str = "018f0c00-0000-4000-8000-000000000001";
+    const ROOT_ID: &str = "018f0c00-0000-4000-8000-000000000004";
+    const ROOT_REF: &str = "root:018f0c00-0000-4000-8000-000000000004";
 
     fn fixture() -> (
         tempfile::TempDir,
@@ -461,6 +597,8 @@ mod tests {
         let request = ProjectRuntimeWorkspaceRequest {
             project_id: PROJECT_ID.into(),
             workspace_root_ref: ROOT_REF.into(),
+            project_binding_revision: 1,
+            project_binding_receipt_id: Some("00000000-0000-4000-8000-000000000006".into()),
             path: path.clone(),
         };
         let claims = ProjectRuntimeAttestationClaims {
@@ -471,10 +609,13 @@ mod tests {
             purpose: ProjectRuntimeAttestationPurpose::Send,
             backend_generation: LocalCapabilityVerifier::new(CAPABILITY).unwrap().backend_generation(),
             seat_id: "seat-owner".into(),
-            realm_id: "018f0c00-0000-7000-8000-000000000003".into(),
+            realm_id: "018f0c00-0000-4000-8000-000000000003".into(),
             root_id: ROOT_ID.into(),
             project_id: PROJECT_ID.into(),
             workspace_root_ref: ROOT_REF.into(),
+            project_binding_revision: 1,
+            project_binding_receipt_id: Some("00000000-0000-4000-8000-000000000006".into()),
+            environment_hint: "private founder workspace".into(),
             canonical_path_sha256: encode_lower_hex(&Sha256::digest(path.as_bytes()).into()),
             root_catalog_revision: 7,
             root_ownership_revision: 11,
@@ -506,6 +647,8 @@ mod tests {
             purpose,
             project_id: PROJECT_ID,
             workspace_root_ref: ROOT_REF,
+            project_binding_revision: runtime_workspace.project_binding_revision,
+            project_binding_receipt_id: runtime_workspace.project_binding_receipt_id.as_deref(),
             runtime_workspace,
         };
         verifier.verify_and_consume_at(compact_jws, &expectation, now_seconds)
@@ -550,12 +693,15 @@ mod tests {
             root_id: "00000000-0000-4000-8000-000000000004".into(),
             project_id: "00000000-0000-4000-8000-000000000005".into(),
             workspace_root_ref: "root:00000000-0000-4000-8000-000000000004".into(),
+            project_binding_revision: 13,
+            project_binding_receipt_id: Some("77777777-7777-4777-8777-777777777777".into()),
             canonical_path_sha256: "12c873abf3d097a6b91451d729842c537bc3853a5302531bf28ab10d953eb37b".into(),
             root_catalog_revision: 7,
             root_ownership_revision: 5,
             project_catalog_revision: 11,
             root_record_sha256: "907d81f964b0a594332b19c291a7e7785398ccc650e95d91a693438ed417d5ca".into(),
             project_record_sha256: "b9e622e9a3b0cc04ee061a42f135126b860881a70e28e1eb9f5cf8b28db6ec0c".into(),
+            environment_hint: "{\"metadata_class\":\"untrusted_data_not_instructions\",\"project_id\":\"00000000-0000-4000-8000-000000000005\",\"workspace_root_ref\":\"root:00000000-0000-4000-8000-000000000004\",\"realm_id\":\"00000000-0000-4000-8000-000000000003\",\"project_title\":\"Synthetic Project\",\"knowledge_boot_policy\":\"system_index_first\"}".into(),
             iat: 2_000_000_000,
             nbf: 1_999_999_999,
             exp: 2_000_000_010,
@@ -563,6 +709,7 @@ mod tests {
         };
         let compact = sign_project_runtime_attestation(CAPABILITY, &claims).unwrap();
         let segments: Vec<&str> = compact.split('.').collect();
+        const EXPECTED_CLAIMS_SEGMENT: &str = "eyJ2IjoxLCJpc3MiOiJhaW9udWktbWFpbiIsImF1ZCI6ImFpb25jb3JlLXByb2plY3QtcnVudGltZSIsInN1YiI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInB1cnBvc2UiOiJzZW5kIiwiYmFja2VuZF9nZW5lcmF0aW9uIjoiYmcxOmIxMDJhMmNkZGY4MzkxMjYxZGRkNzdiMWQ5ZGYwMWNjOGEwM2UyZTRjNDNjZmZjNzA3MGUxZTBkNzM5ZmFiYWMiLCJzZWF0X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAyIiwicmVhbG1faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJyb290X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA0IiwicHJvamVjdF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNSIsIndvcmtzcGFjZV9yb290X3JlZiI6InJvb3Q6MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA0IiwicHJvamVjdF9iaW5kaW5nX3JldmlzaW9uIjoxMywicHJvamVjdF9iaW5kaW5nX3JlY2VpcHRfaWQiOiI3Nzc3Nzc3Ny03Nzc3LTQ3NzctODc3Ny03Nzc3Nzc3Nzc3NzciLCJjYW5vbmljYWxfcGF0aF9zaGEyNTYiOiIxMmM4NzNhYmYzZDA5N2E2YjkxNDUxZDcyOTg0MmM1MzdiYzM4NTNhNTMwMjUzMWJmMjhhYjEwZDk1M2ViMzdiIiwicm9vdF9jYXRhbG9nX3JldmlzaW9uIjo3LCJyb290X293bmVyc2hpcF9yZXZpc2lvbiI6NSwicHJvamVjdF9jYXRhbG9nX3JldmlzaW9uIjoxMSwicm9vdF9yZWNvcmRfc2hhMjU2IjoiOTA3ZDgxZjk2NGIwYTU5NDMzMmIxOWMyOTFhN2U3Nzg1Mzk4Y2NjNjUwZTk1ZDkxYTY5MzQzOGVkNDE3ZDVjYSIsInByb2plY3RfcmVjb3JkX3NoYTI1NiI6ImI5ZTYyMmU5YTNiMGNjMDRlZTA2MWE0MmYxMzUxMjZiODYwODgxYTcwZTI4ZTFlYjlmNWNmOGIyOGRiNmVjMGMiLCJlbnZpcm9ubWVudF9oaW50Ijoie1wibWV0YWRhdGFfY2xhc3NcIjpcInVudHJ1c3RlZF9kYXRhX25vdF9pbnN0cnVjdGlvbnNcIixcInByb2plY3RfaWRcIjpcIjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNVwiLFwid29ya3NwYWNlX3Jvb3RfcmVmXCI6XCJyb290OjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNFwiLFwicmVhbG1faWRcIjpcIjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwM1wiLFwicHJvamVjdF90aXRsZVwiOlwiU3ludGhldGljIFByb2plY3RcIixcImtub3dsZWRnZV9ib290X3BvbGljeVwiOlwic3lzdGVtX2luZGV4X2ZpcnN0XCJ9IiwiaWF0IjoyMDAwMDAwMDAwLCJuYmYiOjE5OTk5OTk5OTksImV4cCI6MjAwMDAwMDAxMCwianRpIjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EdyJ9";
         assert_eq!(
             segments[0],
             "eyJhbGciOiJIUzI1NiIsInR5cCI6IkFJT05VSS1QUk9KRUNULVJVTlRJTUUiLCJ2IjoxfQ"
@@ -570,9 +717,19 @@ mod tests {
         let decoded_claims = URL_SAFE_NO_PAD.decode(segments[1]).unwrap();
         assert_eq!(
             decoded_claims.as_slice(),
-            br#"{"v":1,"iss":"aionui-main","aud":"aioncore-project-runtime","sub":"00000000-0000-4000-8000-000000000001","purpose":"send","backend_generation":"bg1:b102a2cddf8391261ddd77b1d9df01cc8a03e2e4c43cffc7070e1e0d739fabac","seat_id":"00000000-0000-4000-8000-000000000002","realm_id":"00000000-0000-4000-8000-000000000003","root_id":"00000000-0000-4000-8000-000000000004","project_id":"00000000-0000-4000-8000-000000000005","workspace_root_ref":"root:00000000-0000-4000-8000-000000000004","canonical_path_sha256":"12c873abf3d097a6b91451d729842c537bc3853a5302531bf28ab10d953eb37b","root_catalog_revision":7,"root_ownership_revision":5,"project_catalog_revision":11,"root_record_sha256":"907d81f964b0a594332b19c291a7e7785398ccc650e95d91a693438ed417d5ca","project_record_sha256":"b9e622e9a3b0cc04ee061a42f135126b860881a70e28e1eb9f5cf8b28db6ec0c","iat":2000000000,"nbf":1999999999,"exp":2000000010,"jti":"AAECAwQFBgcICQoLDA0ODw"}"#
+            br#"{"v":1,"iss":"aionui-main","aud":"aioncore-project-runtime","sub":"00000000-0000-4000-8000-000000000001","purpose":"send","backend_generation":"bg1:b102a2cddf8391261ddd77b1d9df01cc8a03e2e4c43cffc7070e1e0d739fabac","seat_id":"00000000-0000-4000-8000-000000000002","realm_id":"00000000-0000-4000-8000-000000000003","root_id":"00000000-0000-4000-8000-000000000004","project_id":"00000000-0000-4000-8000-000000000005","workspace_root_ref":"root:00000000-0000-4000-8000-000000000004","project_binding_revision":13,"project_binding_receipt_id":"77777777-7777-4777-8777-777777777777","canonical_path_sha256":"12c873abf3d097a6b91451d729842c537bc3853a5302531bf28ab10d953eb37b","root_catalog_revision":7,"root_ownership_revision":5,"project_catalog_revision":11,"root_record_sha256":"907d81f964b0a594332b19c291a7e7785398ccc650e95d91a693438ed417d5ca","project_record_sha256":"b9e622e9a3b0cc04ee061a42f135126b860881a70e28e1eb9f5cf8b28db6ec0c","environment_hint":"{\"metadata_class\":\"untrusted_data_not_instructions\",\"project_id\":\"00000000-0000-4000-8000-000000000005\",\"workspace_root_ref\":\"root:00000000-0000-4000-8000-000000000004\",\"realm_id\":\"00000000-0000-4000-8000-000000000003\",\"project_title\":\"Synthetic Project\",\"knowledge_boot_policy\":\"system_index_first\"}","iat":2000000000,"nbf":1999999999,"exp":2000000010,"jti":"AAECAwQFBgcICQoLDA0ODw"}"#
         );
-        assert_eq!(segments[2], "ryJ4QpT-s7yAURwEvIzzKNPPh6J9VEoeDFVqNCCU2uA");
+        assert_eq!(segments[2], "O1H2wfgYZZnonOc-1XsjJUApacOrVNCnwh4JyB22c4c");
+        assert_eq!(segments[1], EXPECTED_CLAIMS_SEGMENT);
+        assert_eq!(
+            compact,
+            format!(
+                "{}.{}.{}",
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkFJT05VSS1QUk9KRUNULVJVTlRJTUUiLCJ2IjoxfQ",
+                EXPECTED_CLAIMS_SEGMENT,
+                "O1H2wfgYZZnonOc-1XsjJUApacOrVNCnwh4JyB22c4c"
+            )
+        );
     }
 
     #[test]
@@ -592,7 +749,10 @@ mod tests {
         .unwrap();
         assert_eq!(verified.claims, claims);
         assert_eq!(verified.runtime_fingerprint.len(), 64);
-        assert_eq!(verified.environment_hint_fingerprint, "b".repeat(64));
+        assert_eq!(
+            verified.environment_hint_fingerprint,
+            "39bd76acfd56fa31600986b85f240e874378e527d4622829cbd5724d99b51abc"
+        );
         assert_eq!(
             verify_at(
                 &verifier,
@@ -704,6 +864,179 @@ mod tests {
                     1_005,
                 ),
                 Err(ProjectRuntimeAttestationError::Invalid)
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_claim_key_is_required_even_when_value_is_null() {
+        let (_directory, mut request, mut claims) = fixture();
+        request.project_binding_receipt_id = None;
+        claims.project_binding_receipt_id = None;
+
+        let explicit_null = sign_claims(&claims);
+        assert!(
+            verify_at(
+                &verifier(8),
+                Some(&explicit_null),
+                "conv-test",
+                ProjectRuntimeAttestationPurpose::Send,
+                &request,
+                1_005,
+            )
+            .is_ok()
+        );
+
+        let mut missing = serde_json::to_value(&claims).unwrap();
+        missing.as_object_mut().unwrap().remove("project_binding_receipt_id");
+        let missing = sign_payload(&serde_json::to_vec(&missing).unwrap());
+        assert_eq!(
+            verify_at(
+                &verifier(8),
+                Some(&missing),
+                "conv-test",
+                ProjectRuntimeAttestationPurpose::Send,
+                &request,
+                1_005,
+            ),
+            Err(ProjectRuntimeAttestationError::Invalid)
+        );
+    }
+
+    #[test]
+    fn receipt_claim_accepts_only_canonical_lowercase_uuid_v4() {
+        for receipt in [
+            "00000000-0000-1000-8000-000000000006",
+            "00000000-0000-5000-8000-000000000006",
+            "00000000-0000-7000-8000-000000000006",
+            "00000000-0000-4000-0000-000000000006",
+            "00000000-0000-4000-f000-000000000006",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        ] {
+            let (_directory, mut request, mut claims) = fixture();
+            request.project_binding_receipt_id = Some(receipt.to_owned());
+            claims.project_binding_receipt_id = Some(receipt.to_owned());
+            assert_eq!(
+                verify_at(
+                    &verifier(8),
+                    Some(&sign_claims(&claims)),
+                    "conv-test",
+                    ProjectRuntimeAttestationPurpose::Send,
+                    &request,
+                    1_005,
+                ),
+                Err(ProjectRuntimeAttestationError::Invalid),
+                "receipt {receipt} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn seat_and_opaque_identity_grammars_are_exact() {
+        let (_directory, request, claims) = fixture();
+        for seat_id in ["seat.with-dot", "seat:with-colon", &"a".repeat(65)] {
+            let mut invalid = claims.clone();
+            invalid.seat_id = seat_id.to_owned();
+            assert_eq!(
+                verify_at(
+                    &verifier(8),
+                    Some(&sign_claims(&invalid)),
+                    "conv-test",
+                    ProjectRuntimeAttestationPurpose::Send,
+                    &request,
+                    1_005,
+                ),
+                Err(ProjectRuntimeAttestationError::Invalid)
+            );
+        }
+
+        for realm_id in [
+            "00000000-0000-0000-0000-000000000000",
+            "018f0c00-0000-7000-8000-000000000003",
+            "018f0c00-0000-4000-0000-000000000003",
+            "018f0c00-0000-4000-f000-000000000003",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        ] {
+            let mut invalid = claims.clone();
+            invalid.realm_id = realm_id.to_owned();
+            assert_eq!(
+                verify_at(
+                    &verifier(8),
+                    Some(&sign_claims(&invalid)),
+                    "conv-test",
+                    ProjectRuntimeAttestationPurpose::Send,
+                    &request,
+                    1_005,
+                ),
+                Err(ProjectRuntimeAttestationError::Invalid)
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_id_grammar_matches_main_runtime_contract() {
+        let (_directory, request, claims) = fixture();
+        for conversation_id in ["-conversation", "_conversation", ".conversation", ":conversation"] {
+            let mut invalid = claims.clone();
+            invalid.sub = conversation_id.to_owned();
+            assert_eq!(
+                verify_at(
+                    &verifier(8),
+                    Some(&sign_claims(&invalid)),
+                    conversation_id,
+                    ProjectRuntimeAttestationPurpose::Send,
+                    &request,
+                    1_005,
+                ),
+                Err(ProjectRuntimeAttestationError::Invalid),
+                "leading punctuation must be rejected for {conversation_id}"
+            );
+        }
+
+        for conversation_id in ["a", "A._:-09", &format!("a{}", "-_.:z9".repeat(42))] {
+            let mut valid = claims.clone();
+            valid.sub = conversation_id.to_owned();
+            assert!(
+                verify_at(
+                    &verifier(8),
+                    Some(&sign_claims(&valid)),
+                    conversation_id,
+                    ProjectRuntimeAttestationPurpose::Send,
+                    &request,
+                    1_005,
+                )
+                .is_ok(),
+                "valid Main-runtime conversation id was rejected: {conversation_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_claims_are_integer_nonnegative_and_json_safe() {
+        let (_directory, request, claims) = fixture();
+        for (field, value) in [
+            ("project_binding_revision", serde_json::json!(-1)),
+            ("root_catalog_revision", serde_json::json!(1.5)),
+            ("root_ownership_revision", serde_json::json!(9_007_199_254_740_992_u64)),
+            ("project_catalog_revision", serde_json::json!(9_007_199_254_740_992_u64)),
+            ("iat", serde_json::json!(-1)),
+            ("nbf", serde_json::json!(9_007_199_254_740_992_i64)),
+            ("exp", serde_json::json!(9_007_199_254_740_992_i64)),
+        ] {
+            let mut invalid = serde_json::to_value(&claims).unwrap();
+            invalid[field] = value;
+            let compact = sign_payload(&serde_json::to_vec(&invalid).unwrap());
+            assert_eq!(
+                verify_at(
+                    &verifier(8),
+                    Some(&compact),
+                    "conv-test",
+                    ProjectRuntimeAttestationPurpose::Send,
+                    &request,
+                    1_005,
+                ),
+                Err(ProjectRuntimeAttestationError::Invalid),
+                "numeric field {field} must be rejected"
             );
         }
     }

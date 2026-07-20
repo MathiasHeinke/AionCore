@@ -15,16 +15,17 @@ use aionui_ai_agent::{
 };
 use aionui_auth::{
     LocalCapabilityVerifier, ProjectRuntimeAttestationClaims, ProjectRuntimeAttestationPurpose,
-    ProjectRuntimeAttestationVerifier, VerifiedProjectRuntimeAttestation, sign_project_runtime_attestation,
+    ProjectRuntimeAttestationVerifier, ProjectRuntimeVerificationExpectation, VerifiedProjectRuntimeAttestation,
+    sign_project_runtime_attestation,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
-    AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
-    ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
-    SetConfigOptionRequest, SetConfigOptionResponse,
+    AcpConfigOptionDto, AgentErrorCode, AgentErrorOwnership, AgentModeResponse, ConfigOptionConfirmation,
+    ConversationArtifactKind, ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry,
+    ModelInfoPayload, SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ProjectBindingExpectation,
@@ -36,17 +37,17 @@ use aionui_common::{
     ProviderWithModel, TimestampMs,
 };
 use aionui_db::models::{
-    AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow,
-    MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+    AcpSessionRow, AgentMetadataRow, AssistantPreferenceRow, ConversationArtifactRow, ConversationAssistantSnapshotRow,
+    ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
-    init_database_memory,
+    ConversationExtraPatch, ConversationFilters, ConversationProjectBindingExpectation, ConversationRowUpdate,
+    CreateAcpSessionParams, DbError, IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository,
+    IAssistantOverlayRepository, IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate,
+    MessageSearchRow, PersistedSessionState, SaveRuntimeStateParams, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
+    UpsertConversationAssistantSnapshotParams, init_database_memory,
 };
 use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
@@ -72,6 +73,36 @@ struct SkillLinkCall {
 struct RecordingSkillResolver {
     names: Vec<String>,
     links: Arc<Mutex<Vec<SkillLinkCall>>>,
+}
+
+struct BlockingAutoInjectSkillResolver {
+    names: Vec<String>,
+    armed: AtomicBool,
+    started: Notify,
+    release: Notify,
+}
+
+impl BlockingAutoInjectSkillResolver {
+    fn new(names: Vec<String>) -> Self {
+        Self {
+            names,
+            armed: AtomicBool::new(false),
+            started: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_until_started(&self) {
+        self.started.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 struct StaticAssistantDispatcher {
@@ -153,6 +184,30 @@ impl SkillResolver for RecordingSkillResolver {
     }
 }
 
+#[async_trait::async_trait]
+impl SkillResolver for BlockingAutoInjectSkillResolver {
+    async fn auto_inject_names(&self) -> Vec<String> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        self.names.clone()
+    }
+
+    async fn resolve_skills(&self, _names: &[String]) -> Vec<ResolvedAgentSkill> {
+        Vec::new()
+    }
+
+    async fn link_workspace_skills(
+        &self,
+        _workspace: &Path,
+        _rel_dirs: &[&str],
+        _skills: &[ResolvedAgentSkill],
+    ) -> usize {
+        0
+    }
+}
+
 // ── Mock EventBroadcaster ──────────────────────────────────────────
 
 struct MockBroadcaster {
@@ -214,6 +269,11 @@ struct MockRepo {
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<ConversationArtifactRow>>,
     assistant_snapshots: Mutex<Vec<ConversationAssistantSnapshotRow>>,
+    fail_next_update: AtomicBool,
+    fail_next_assistant_snapshot_upsert: AtomicBool,
+    delay_next_extra_patch: AtomicBool,
+    extra_patch_started: Mutex<Option<Arc<Notify>>>,
+    extra_patch_release: Mutex<Option<Arc<Notify>>>,
 }
 
 impl MockRepo {
@@ -223,7 +283,58 @@ impl MockRepo {
             messages: Mutex::new(vec![]),
             artifacts: Mutex::new(vec![]),
             assistant_snapshots: Mutex::new(vec![]),
+            fail_next_update: AtomicBool::new(false),
+            fail_next_assistant_snapshot_upsert: AtomicBool::new(false),
+            delay_next_extra_patch: AtomicBool::new(false),
+            extra_patch_started: Mutex::new(None),
+            extra_patch_release: Mutex::new(None),
         }
+    }
+
+    fn fail_next_update(&self) {
+        self.fail_next_update.store(true, Ordering::SeqCst);
+    }
+
+    fn delay_next_extra_patch(&self, started: Arc<Notify>, release: Arc<Notify>) {
+        *self.extra_patch_started.lock().unwrap() = Some(started);
+        *self.extra_patch_release.lock().unwrap() = Some(release);
+        self.delay_next_extra_patch.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_assistant_snapshot_upsert(&self) {
+        self.fail_next_assistant_snapshot_upsert.store(true, Ordering::SeqCst);
+    }
+}
+
+struct FailingAssistantPreferenceRepository {
+    inner: Arc<dyn IAssistantPreferenceRepository>,
+    fail_next_upsert: AtomicBool,
+}
+
+impl FailingAssistantPreferenceRepository {
+    fn new(inner: Arc<dyn IAssistantPreferenceRepository>) -> Self {
+        Self {
+            inner,
+            fail_next_upsert: AtomicBool::new(true),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl IAssistantPreferenceRepository for FailingAssistantPreferenceRepository {
+    async fn get(&self, assistant_definition_id: &str) -> Result<Option<AssistantPreferenceRow>, DbError> {
+        self.inner.get(assistant_definition_id).await
+    }
+
+    async fn upsert(&self, params: &UpsertAssistantPreferenceParams<'_>) -> Result<AssistantPreferenceRow, DbError> {
+        if self.fail_next_upsert.swap(false, Ordering::SeqCst) {
+            return Err(DbError::Init("injected assistant preference failure".to_owned()));
+        }
+        self.inner.upsert(params).await
+    }
+
+    async fn delete(&self, assistant_definition_id: &str) -> Result<bool, DbError> {
+        self.inner.delete(assistant_definition_id).await
     }
 }
 
@@ -261,6 +372,11 @@ impl IConversationRepository for MockRepo {
     }
 
     async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+        if self.fail_next_update.swap(false, Ordering::SeqCst) {
+            return Err(aionui_db::DbError::Init(
+                "injected conversation update failure".to_owned(),
+            ));
+        }
         let mut rows = self.rows.lock().unwrap();
         let row = rows
             .iter_mut()
@@ -289,6 +405,158 @@ impl IConversationRepository for MockRepo {
             row.updated_at = updated_at;
         }
         Ok(())
+    }
+
+    async fn update_with_extra_patch_cas(
+        &self,
+        id: &str,
+        updates: &ConversationRowUpdate,
+        extra_patch: &ConversationExtraPatch,
+        expected_binding: Option<&ConversationProjectBindingExpectation>,
+    ) -> Result<ConversationRow, aionui_db::DbError> {
+        if updates.extra.is_some() {
+            return Err(aionui_db::DbError::Conflict(
+                "CONVERSATION_EXTRA_PATCH_AMBIGUOUS".to_owned(),
+            ));
+        }
+        if extra_patch.touches_project_binding() && expected_binding.is_none() {
+            return Err(aionui_db::DbError::Conflict(
+                aionui_db::PROJECT_BINDING_CONFLICT.to_owned(),
+            ));
+        }
+        if self.fail_next_update.swap(false, Ordering::SeqCst) {
+            return Err(aionui_db::DbError::Init(
+                "injected conversation update failure".to_owned(),
+            ));
+        }
+
+        for attempt in 0..32 {
+            let observed = self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| row.id == id)
+                .cloned()
+                .ok_or_else(|| aionui_db::DbError::NotFound(format!("Conversation {id}")))?;
+            if expected_binding.is_some_and(|expected| !expected.matches_extra(&observed.extra)) {
+                return Err(aionui_db::DbError::Conflict(
+                    aionui_db::PROJECT_BINDING_CONFLICT.to_owned(),
+                ));
+            }
+            let mut candidate: serde_json::Value = serde_json::from_str(&observed.extra)
+                .map_err(|error| aionui_db::DbError::Init(format!("invalid extra JSON: {error}")))?;
+            let object = candidate
+                .as_object_mut()
+                .ok_or_else(|| aionui_db::DbError::Init("extra must be an object".to_owned()))?;
+            if extra_patch.set.contains_key("workspace")
+                && object.get("project_id").is_some()
+                && object.get("workspace_root_ref").is_some()
+            {
+                return Err(aionui_db::DbError::Conflict(
+                    aionui_db::PROJECT_BINDING_CONFLICT.to_owned(),
+                ));
+            }
+            for key in &extra_patch.remove {
+                object.remove(key);
+            }
+            for (key, value) in &extra_patch.set {
+                object.insert(key.clone(), value.clone());
+            }
+            let candidate = serde_json::to_string(&candidate)
+                .map_err(|error| aionui_db::DbError::Init(format!("extra serialization failed: {error}")))?;
+
+            if attempt == 0 && self.delay_next_extra_patch.swap(false, Ordering::SeqCst) {
+                let started = self.extra_patch_started.lock().unwrap().clone();
+                let release = self.extra_patch_release.lock().unwrap().clone();
+                if let Some(started) = started {
+                    started.notify_one();
+                }
+                if let Some(release) = release {
+                    release.notified().await;
+                }
+            }
+
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == id)
+                .ok_or_else(|| aionui_db::DbError::NotFound(format!("Conversation {id}")))?;
+            if row.extra != observed.extra {
+                continue;
+            }
+            if let Some(name) = &updates.name {
+                row.name = name.clone();
+            }
+            if let Some(pinned) = updates.pinned {
+                row.pinned = pinned;
+            }
+            if let Some(pinned_at) = &updates.pinned_at {
+                row.pinned_at = *pinned_at;
+            }
+            if let Some(model) = &updates.model {
+                row.model = model.clone();
+            }
+            if let Some(status) = &updates.status {
+                row.status = Some(status.clone());
+            }
+            if let Some(updated_at) = updates.updated_at {
+                row.updated_at = updated_at;
+            }
+            row.extra = candidate;
+            return Ok(row.clone());
+        }
+        Err(aionui_db::DbError::Conflict(
+            "CONVERSATION_EXTRA_PATCH_CONFLICT".to_owned(),
+        ))
+    }
+
+    async fn update_project_binding_cas(
+        &self,
+        id: &str,
+        updates: &ConversationRowUpdate,
+        expected: &ConversationProjectBindingExpectation,
+    ) -> Result<ConversationRow, aionui_db::DbError> {
+        let candidate = updates
+            .extra
+            .as_deref()
+            .ok_or_else(|| aionui_db::DbError::Conflict("PROJECT_BINDING_CAS_EMPTY".to_owned()))?;
+        let candidate: serde_json::Value = serde_json::from_str(candidate)
+            .map_err(|error| aionui_db::DbError::Init(format!("invalid project binding JSON: {error}")))?;
+        let object = candidate
+            .as_object()
+            .ok_or_else(|| aionui_db::DbError::Conflict(aionui_db::PROJECT_BINDING_CONFLICT.to_owned()))?;
+        let project_id = object.get("project_id").and_then(serde_json::Value::as_str);
+        let workspace_root_ref = object.get("workspace_root_ref").and_then(serde_json::Value::as_str);
+        if project_id.is_some() != workspace_root_ref.is_some()
+            || (project_id.is_some() && object.contains_key("workspace"))
+        {
+            return Err(aionui_db::DbError::Conflict(
+                aionui_db::PROJECT_BINDING_CONFLICT.to_owned(),
+            ));
+        }
+
+        let mut patch = ConversationExtraPatch::default();
+        for key in [
+            "project_id",
+            "workspace_root_ref",
+            "project_binding_revision",
+            "project_binding_receipt_id",
+        ] {
+            if let Some(value) = object.get(key) {
+                patch.set.insert(key.to_owned(), value.clone());
+            } else {
+                patch.remove.push(key.to_owned());
+            }
+        }
+        if !object.contains_key("workspace") {
+            patch.remove.push("workspace".to_owned());
+        }
+
+        let mut safe_updates = updates.clone();
+        safe_updates.extra = None;
+        self.update_with_extra_patch_cas(id, &safe_updates, &patch, Some(expected))
+            .await
     }
 
     async fn delete(&self, id: &str) -> Result<(), aionui_db::DbError> {
@@ -364,6 +632,11 @@ impl IConversationRepository for MockRepo {
         &self,
         params: &UpsertConversationAssistantSnapshotParams<'_>,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, aionui_db::DbError> {
+        if self.fail_next_assistant_snapshot_upsert.swap(false, Ordering::SeqCst) {
+            return Err(aionui_db::DbError::Init(
+                "injected assistant snapshot failure".to_owned(),
+            ));
+        }
         let row = ConversationAssistantSnapshotRow {
             conversation_id: params.conversation_id.to_owned(),
             assistant_definition_id: params.assistant_definition_id.to_owned(),
@@ -874,6 +1147,9 @@ struct StubAcpSessionRepo {
     create_calls: Mutex<Vec<CreateAcpSessionCall>>,
     runtime_state_saves: Mutex<Vec<RuntimeStateSaveCall>>,
     session_id: Mutex<Option<String>>,
+    runtime_state_save_started: Option<Arc<Notify>>,
+    runtime_state_save_release: Option<Arc<Notify>>,
+    fail_next_runtime_state_save: AtomicBool,
 }
 
 impl StubAcpSessionRepo {
@@ -886,7 +1162,20 @@ impl StubAcpSessionRepo {
             create_calls: Mutex::new(Vec::new()),
             runtime_state_saves: Mutex::new(Vec::new()),
             session_id: Mutex::new(Some(session_id.into())),
+            runtime_state_save_started: None,
+            runtime_state_save_release: None,
+            fail_next_runtime_state_save: AtomicBool::new(false),
         }
+    }
+
+    fn with_blocked_runtime_state_save(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.runtime_state_save_started = Some(started);
+        self.runtime_state_save_release = Some(release);
+        self
+    }
+
+    fn fail_next_runtime_state_save(&self) {
+        self.fail_next_runtime_state_save.store(true, Ordering::SeqCst);
     }
 
     fn runtime_state_saves(&self) -> Vec<RuntimeStateSaveCall> {
@@ -956,6 +1245,15 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
         conversation_id: &str,
         params: &SaveRuntimeStateParams<'_>,
     ) -> Result<bool, DbError> {
+        if let Some(started) = self.runtime_state_save_started.as_ref() {
+            started.notify_one();
+        }
+        if let Some(release) = self.runtime_state_save_release.as_ref() {
+            release.notified().await;
+        }
+        if self.fail_next_runtime_state_save.swap(false, Ordering::SeqCst) {
+            return Err(DbError::Init("injected ACP runtime state failure".to_owned()));
+        }
         self.runtime_state_saves.lock().unwrap().push(RuntimeStateSaveCall {
             conversation_id: conversation_id.to_owned(),
             current_mode_id: params.current_mode_id.map(|outer| outer.map(ToOwned::to_owned)),
@@ -1176,19 +1474,22 @@ fn make_project_create_req(project_id: &str, workspace_root_ref: &str) -> Create
 fn project_runtime_workspace(
     project_id: &str,
     workspace_root_ref: &str,
+    binding_extra: &serde_json::Value,
     path: &Path,
 ) -> ProjectRuntimeWorkspaceRequest {
     ProjectRuntimeWorkspaceRequest {
         project_id: project_id.to_owned(),
         workspace_root_ref: workspace_root_ref.to_owned(),
+        project_binding_revision: binding_extra["project_binding_revision"].as_u64().unwrap(),
+        project_binding_receipt_id: binding_extra["project_binding_receipt_id"].as_str().map(str::to_owned),
         path: std::fs::canonicalize(path).unwrap().to_string_lossy().into_owned(),
     }
 }
 
 const TEST_PROJECT_CAPABILITY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const TEST_PROJECT_REALM_ID: &str = "018f0c00-0000-7000-8000-000000000003";
-const TEST_PROJECT_ROOT_ID: &str = "018f0c00-0000-7000-8000-000000000004";
-const TEST_PROJECT_ROOT_REF: &str = "root:018f0c00-0000-7000-8000-000000000004";
+const TEST_PROJECT_REALM_ID: &str = "018f0c00-0000-4000-8000-000000000003";
+const TEST_PROJECT_ROOT_ID: &str = "018f0c00-0000-4000-8000-000000000004";
+const TEST_PROJECT_ROOT_REF: &str = "root:018f0c00-0000-4000-8000-000000000004";
 static PROJECT_TICKET_NONCE: AtomicUsize = AtomicUsize::new(1);
 
 fn install_project_attestation_verifier(service: &ConversationService) -> Arc<ProjectRuntimeAttestationVerifier> {
@@ -1227,6 +1528,9 @@ fn project_runtime_claims(
         root_id: TEST_PROJECT_ROOT_ID.into(),
         project_id: runtime_workspace.project_id.clone(),
         workspace_root_ref: runtime_workspace.workspace_root_ref.clone(),
+        project_binding_revision: runtime_workspace.project_binding_revision,
+        project_binding_receipt_id: runtime_workspace.project_binding_receipt_id.clone(),
+        environment_hint: "test project workspace".into(),
         canonical_path_sha256: format!("{:x}", Sha256::digest(runtime_workspace.path.as_bytes())),
         root_catalog_revision: 7,
         root_ownership_revision: 5,
@@ -1259,16 +1563,16 @@ fn verified_project_runtime(
     runtime_workspace: &ProjectRuntimeWorkspaceRequest,
 ) -> VerifiedProjectRuntimeAttestation {
     let ticket = project_runtime_ticket(conversation_id, purpose, runtime_workspace);
-    verifier
-        .verify_and_consume(
-            Some(&ticket),
-            conversation_id,
-            purpose,
-            &runtime_workspace.project_id,
-            &runtime_workspace.workspace_root_ref,
-            runtime_workspace,
-        )
-        .unwrap()
+    let expectation = ProjectRuntimeVerificationExpectation::new(
+        conversation_id,
+        purpose,
+        &runtime_workspace.project_id,
+        &runtime_workspace.workspace_root_ref,
+        runtime_workspace.project_binding_revision,
+        runtime_workspace.project_binding_receipt_id.as_deref(),
+        runtime_workspace,
+    );
+    verifier.verify_and_consume(Some(&ticket), &expectation).unwrap()
 }
 
 fn ensure_test_workspace_path() -> String {
@@ -1423,8 +1727,8 @@ async fn create_returns_conversation_with_defaults() {
 #[tokio::test]
 async fn create_project_conversation_persists_only_portable_binding() {
     let (svc, broadcaster, repo, _task_mgr) = make_service();
-    let project_id = "018f0c00-0000-7000-8000-000000000001";
-    let workspace_root_ref = "root:primary-projects";
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
+    let workspace_root_ref = TEST_PROJECT_ROOT_REF;
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Portable Project",
@@ -1459,11 +1763,11 @@ async fn create_project_conversation_rejects_incomplete_or_path_bearing_binding(
     let workspace = ensure_test_workspace_path();
 
     for extra in [
-        json!({ "project_id": "018f0c00-0000-7000-8000-000000000001" }),
-        json!({ "workspace_root_ref": "root:primary-projects" }),
+        json!({ "project_id": "018f0c00-0000-4000-8000-000000000001" }),
+        json!({ "workspace_root_ref": TEST_PROJECT_ROOT_REF }),
         json!({
-            "project_id": "018f0c00-0000-7000-8000-000000000001",
-            "workspace_root_ref": "root:primary-projects",
+            "project_id": "018f0c00-0000-4000-8000-000000000001",
+            "workspace_root_ref": TEST_PROJECT_ROOT_REF,
             "workspace": workspace
         }),
     ] {
@@ -1483,8 +1787,9 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let project_id = "018f0c00-0000-7000-8000-000000000001";
-    let workspace_root_ref = "root:primary-projects";
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
+    let workspace_root_ref = TEST_PROJECT_ROOT_REF;
+    let first_operation = "11111111-1111-4111-8111-111111111111";
 
     let missing_expectation = svc
         .update(
@@ -1499,6 +1804,7 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
                     "workspace_root_ref": workspace_root_ref
                 })),
                 expected_project_binding: None,
+                project_binding_operation_id: Some(first_operation.to_owned()),
             },
             &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
         )
@@ -1520,12 +1826,16 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
                 model: None,
                 extra: Some(json!({
                     "project_id": project_id,
-                    "workspace_root_ref": workspace_root_ref
+                    "workspace_root_ref": workspace_root_ref,
+                    "display_label": "Project Alpha"
                 })),
                 expected_project_binding: Some(ProjectBindingExpectation {
                     project_id: None,
                     workspace_root_ref: None,
+                    project_binding_revision: 0,
+                    project_binding_receipt_id: None,
                 }),
+                project_binding_operation_id: Some(first_operation.to_owned()),
             },
             &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
         )
@@ -1534,6 +1844,9 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
 
     assert_eq!(updated.extra["project_id"], project_id);
     assert_eq!(updated.extra["workspace_root_ref"], workspace_root_ref);
+    assert_eq!(updated.extra["project_binding_revision"], 1);
+    assert_eq!(updated.extra["project_binding_receipt_id"], first_operation);
+    assert_eq!(updated.extra["display_label"], "Project Alpha");
     assert!(updated.extra.get("workspace").is_none());
     assert_eq!(task_mgr.kill_count(), 1);
 
@@ -1546,13 +1859,16 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
                 pinned: None,
                 model: None,
                 extra: Some(json!({
-                    "project_id": "018f0c00-0000-7000-8000-000000000002",
-                    "workspace_root_ref": "root:secondary-projects"
+                    "project_id": "018f0c00-0000-4000-8000-000000000002",
+                    "workspace_root_ref": "root:018f0c00-0000-4000-8000-000000000005"
                 })),
                 expected_project_binding: Some(ProjectBindingExpectation {
                     project_id: None,
                     workspace_root_ref: None,
+                    project_binding_revision: 0,
+                    project_binding_receipt_id: None,
                 }),
+                project_binding_operation_id: Some("22222222-2222-4222-8222-222222222222".to_owned()),
             },
             &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
         )
@@ -1569,11 +1885,14 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
                 name: None,
                 pinned: None,
                 model: None,
-                extra: Some(json!({ "project_id": "018f0c00-0000-7000-8000-000000000002" })),
+                extra: Some(json!({ "project_id": "018f0c00-0000-4000-8000-000000000002" })),
                 expected_project_binding: Some(ProjectBindingExpectation {
                     project_id: Some(project_id.to_owned()),
                     workspace_root_ref: Some(workspace_root_ref.to_owned()),
+                    project_binding_revision: 1,
+                    project_binding_receipt_id: Some(first_operation.to_owned()),
                 }),
+                project_binding_operation_id: Some("33333333-3333-4333-8333-333333333333".to_owned()),
             },
             &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
         )
@@ -1586,6 +1905,192 @@ async fn update_project_binding_is_atomic_removes_legacy_path_and_restarts_runti
     let stored = repo.get(&conv.id).await.unwrap().unwrap();
     assert!(stored.extra.contains(project_id));
     assert!(!stored.extra.contains("000000000002"));
+}
+
+#[tokio::test]
+async fn update_project_binding_rejects_combined_extra_runtime_identity_without_side_effects() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
+    let operation_id = "44444444-4444-4444-8444-444444444444";
+
+    for (runtime_key, runtime_value) in [
+        ("backend", json!("claude")),
+        ("session_mode", json!("workspace-write")),
+        ("current_model_id", json!("opus")),
+        ("system_prompt", json!("runtime prompt")),
+        ("max_tokens", json!(4096)),
+        ("preset_assistant_id", json!("assistant-1")),
+    ] {
+        let mut extra = json!({
+            "project_id": project_id,
+            "workspace_root_ref": TEST_PROJECT_ROOT_REF,
+            "display_label": "allowed metadata"
+        });
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert(runtime_key.to_owned(), runtime_value);
+
+        let error = svc
+            .update(
+                "user_1",
+                &conv.id,
+                UpdateConversationRequest {
+                    name: None,
+                    pinned: None,
+                    model: None,
+                    extra: Some(extra),
+                    expected_project_binding: Some(ProjectBindingExpectation {
+                        project_id: None,
+                        workspace_root_ref: None,
+                        project_binding_revision: 0,
+                        project_binding_receipt_id: None,
+                    }),
+                    project_binding_operation_id: Some(operation_id.to_owned()),
+                },
+                &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ConversationError::BadRequest { ref reason }
+                if reason == "project binding and runtime identity must be updated in separate requests"),
+            "unexpected result for runtime key {runtime_key}: {error:?}"
+        );
+        let stored = repo.get(&conv.id).await.unwrap().unwrap();
+        assert!(!stored.extra.contains("project_id"));
+        assert_eq!(task_mgr.kill_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn active_unbound_turn_blocks_project_bind_then_released_turn_allows_retry() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let operation_id = "55555555-5555-4555-8555-555555555555";
+    let turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-active").unwrap();
+
+    let make_request = || UpdateConversationRequest {
+        name: None,
+        pinned: None,
+        model: None,
+        extra: Some(json!({
+            "project_id": "018f0c00-0000-4000-8000-000000000001",
+            "workspace_root_ref": TEST_PROJECT_ROOT_REF
+        })),
+        expected_project_binding: Some(ProjectBindingExpectation {
+            project_id: None,
+            workspace_root_ref: None,
+            project_binding_revision: 0,
+            project_binding_receipt_id: None,
+        }),
+        project_binding_operation_id: Some(operation_id.to_owned()),
+    };
+
+    let error = svc
+        .update(
+            "user_1",
+            &conv.id,
+            make_request(),
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    assert!(!repo.get(&conv.id).await.unwrap().unwrap().extra.contains("project_id"));
+    assert_eq!(task_mgr.kill_count(), 0);
+
+    drop(turn_claim);
+    let updated = svc
+        .update(
+            "user_1",
+            &conv.id,
+            make_request(),
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.extra["project_id"], "018f0c00-0000-4000-8000-000000000001");
+    assert_eq!(updated.extra["project_binding_revision"], 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+}
+
+#[tokio::test]
+async fn active_turn_blocks_standalone_runtime_extra_then_released_turn_invalidates_old_runtime() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-active").unwrap();
+    let make_request = || UpdateConversationRequest {
+        name: None,
+        pinned: None,
+        model: None,
+        extra: Some(json!({ "backend": "claude" })),
+        expected_project_binding: None,
+        project_binding_operation_id: None,
+    };
+
+    let error = svc
+        .update(
+            "user_1",
+            &conv.id,
+            make_request(),
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    assert!(repo.get(&conv.id).await.unwrap().unwrap().extra.contains("workspace"));
+    assert!(!repo.get(&conv.id).await.unwrap().unwrap().extra.contains("backend"));
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 0);
+    assert_eq!(task_mgr.kill_count(), 0);
+
+    drop(turn_claim);
+    let updated = svc
+        .update(
+            "user_1",
+            &conv.id,
+            make_request(),
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.extra["backend"], "claude");
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+}
+
+#[tokio::test]
+async fn opaque_extra_metadata_remains_writable_during_active_turn_without_runtime_invalidation() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-active").unwrap();
+
+    let updated = svc
+        .update(
+            "user_1",
+            &conv.id,
+            UpdateConversationRequest {
+                name: None,
+                pinned: None,
+                model: None,
+                extra: Some(json!({ "display_label": "Project Alpha" })),
+                expected_project_binding: None,
+                project_binding_operation_id: None,
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.extra["display_label"], "Project Alpha");
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 0);
+    assert_eq!(task_mgr.kill_count(), 0);
 }
 
 #[tokio::test]
@@ -2004,6 +2509,404 @@ async fn update_extra_merge() {
 
     assert_eq!(updated.extra["workspace"], new_workspace.to_string_lossy().to_string());
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
+}
+
+#[tokio::test]
+async fn update_extra_runtime_key_rejects_active_turn_then_persists_and_evicts_old_task() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+    let turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-active").unwrap();
+    let patch = json!({
+        "team_mcp_stdio_config": {
+            "team_id": "team-1",
+            "slot_id": "slot-1",
+            "host": "127.0.0.1",
+            "port": 4242
+        }
+    });
+
+    let error = svc.update_extra(&conv.id, patch.clone()).await.unwrap_err();
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    let stored_extra: serde_json::Value = serde_json::from_str(&stored.extra).unwrap();
+    assert!(stored_extra.get("team_mcp_stdio_config").is_none());
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 0);
+    assert_eq!(task_mgr.kill_count(), 0);
+
+    drop(turn_claim);
+    svc.update_extra(&conv.id, patch).await.unwrap();
+
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    let stored_extra: serde_json::Value = serde_json::from_str(&stored.extra).unwrap();
+    assert_eq!(stored_extra["team_mcp_stdio_config"]["port"], 4242);
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert!(task_mgr.get_task(&conv.id).is_none());
+}
+
+#[tokio::test]
+async fn update_extra_runtime_key_persistence_failure_has_no_generation_or_task_side_effect() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+    repo.fail_next_update();
+
+    svc.update_extra(
+        &conv.id,
+        json!({ "team_mcp_stdio_config": { "team_id": "team-1", "port": 4242 } }),
+    )
+    .await
+    .unwrap_err();
+
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    let stored_extra: serde_json::Value = serde_json::from_str(&stored.extra).unwrap();
+    assert!(stored_extra.get("team_mcp_stdio_config").is_none());
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 0);
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert!(task_mgr.get_task(&conv.id).is_some());
+}
+
+#[tokio::test]
+async fn update_extra_opaque_metadata_remains_writable_during_active_turn_without_invalidation() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+    let _turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-active").unwrap();
+
+    svc.update_extra(&conv.id, json!({ "display_label": "Team workspace" }))
+        .await
+        .unwrap();
+
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    let stored_extra: serde_json::Value = serde_json::from_str(&stored.extra).unwrap();
+    assert_eq!(stored_extra["display_label"], "Team workspace");
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 0);
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert!(task_mgr.get_task(&conv.id).is_some());
+}
+
+#[tokio::test]
+async fn delayed_opaque_update_retries_without_losing_runtime_identity_patches() {
+    for (label, runtime_patch) in [
+        ("session-mode", json!({ "session_mode": "plan" })),
+        (
+            "team-mcp",
+            json!({ "team_mcp_stdio_config": { "team_id": "team-1", "port": 4242 } }),
+        ),
+        ("backend", json!({ "backend": "codex" })),
+    ] {
+        let task_mgr = Arc::new(MockTaskManager::new());
+        let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+        let svc = Arc::new(svc);
+        let conv = svc.create("user_1", make_create_req()).await.unwrap();
+        let opaque_started = Arc::new(Notify::new());
+        let opaque_release = Arc::new(Notify::new());
+        repo.delay_next_extra_patch(opaque_started.clone(), opaque_release.clone());
+
+        let opaque_service = svc.clone();
+        let opaque_id = conv.id.clone();
+        let opaque = tokio::spawn(async move {
+            opaque_service
+                .update(
+                    "user_1",
+                    &opaque_id,
+                    UpdateConversationRequest {
+                        name: None,
+                        pinned: None,
+                        model: None,
+                        extra: Some(json!({ "display_label": label })),
+                        expected_project_binding: None,
+                        project_binding_operation_id: None,
+                    },
+                    &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+                )
+                .await
+        });
+        opaque_started.notified().await;
+
+        svc.update_extra(&conv.id, runtime_patch.clone()).await.unwrap();
+        opaque_release.notify_one();
+        opaque.await.unwrap().unwrap();
+
+        let stored = repo.get(&conv.id).await.unwrap().unwrap();
+        let stored_extra: serde_json::Value = serde_json::from_str(&stored.extra).unwrap();
+        assert_eq!(stored_extra["display_label"], label);
+        for (key, value) in runtime_patch.as_object().unwrap() {
+            assert_eq!(&stored_extra[key], value);
+        }
+        assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 1);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_disjoint_opaque_patches_preserve_both_keys() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr);
+    let svc = Arc::new(svc);
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let first_started = Arc::new(Notify::new());
+    let first_release = Arc::new(Notify::new());
+    repo.delay_next_extra_patch(first_started.clone(), first_release.clone());
+
+    let first_service = svc.clone();
+    let first_id = conv.id.clone();
+    let first = tokio::spawn(async move {
+        first_service
+            .update_extra(&first_id, json!({ "display_label": "first" }))
+            .await
+    });
+    first_started.notified().await;
+    svc.update_extra(&conv.id, json!({ "panel_state": "expanded" }))
+        .await
+        .unwrap();
+    first_release.notify_one();
+    first.await.unwrap().unwrap();
+
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    let stored_extra: serde_json::Value = serde_json::from_str(&stored.extra).unwrap();
+    assert_eq!(stored_extra["display_label"], "first");
+    assert_eq!(stored_extra["panel_state"], "expanded");
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 0);
+}
+
+#[tokio::test]
+async fn delayed_opaque_update_retries_after_project_bind_without_losing_binding() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let svc = Arc::new(svc);
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let opaque_started = Arc::new(Notify::new());
+    let opaque_release = Arc::new(Notify::new());
+    repo.delay_next_extra_patch(opaque_started.clone(), opaque_release.clone());
+
+    let opaque_service = svc.clone();
+    let opaque_id = conv.id.clone();
+    let opaque_task_manager = task_mgr.clone();
+    let opaque = tokio::spawn(async move {
+        opaque_service
+            .update(
+                "user_1",
+                &opaque_id,
+                UpdateConversationRequest {
+                    name: None,
+                    pinned: None,
+                    model: None,
+                    extra: Some(json!({ "display_label": "bound project" })),
+                    expected_project_binding: None,
+                    project_binding_operation_id: None,
+                },
+                &(opaque_task_manager as Arc<dyn IWorkerTaskManager>),
+            )
+            .await
+    });
+    opaque_started.notified().await;
+
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
+    let operation_id = "55555555-5555-4555-8555-555555555555";
+    svc.update(
+        "user_1",
+        &conv.id,
+        UpdateConversationRequest {
+            name: None,
+            pinned: None,
+            model: None,
+            extra: Some(json!({
+                "project_id": project_id,
+                "workspace_root_ref": TEST_PROJECT_ROOT_REF
+            })),
+            expected_project_binding: Some(ProjectBindingExpectation {
+                project_id: None,
+                workspace_root_ref: None,
+                project_binding_revision: 0,
+                project_binding_receipt_id: None,
+            }),
+            project_binding_operation_id: Some(operation_id.to_owned()),
+        },
+        &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+    )
+    .await
+    .unwrap();
+    opaque_release.notify_one();
+    opaque.await.unwrap().unwrap();
+
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    let stored_extra: serde_json::Value = serde_json::from_str(&stored.extra).unwrap();
+    assert_eq!(stored_extra["display_label"], "bound project");
+    assert_eq!(stored_extra["project_id"], project_id);
+    assert_eq!(stored_extra["workspace_root_ref"], TEST_PROJECT_ROOT_REF);
+    assert_eq!(stored_extra["project_binding_revision"], 1);
+    assert_eq!(stored_extra["project_binding_receipt_id"], operation_id);
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 1);
+}
+
+#[tokio::test]
+async fn delayed_read_backfill_cannot_overwrite_concurrent_binding_or_runtime_extra() {
+    let resolver = Arc::new(BlockingAutoInjectSkillResolver::new(vec!["founder-voice".to_owned()]));
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let svc = Arc::new(ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster,
+        resolver.clone(),
+        task_mgr.clone(),
+        repo.clone(),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    ));
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let mut stale_extra: serde_json::Value =
+        serde_json::from_str(&repo.get(&conv.id).await.unwrap().unwrap().extra).unwrap();
+    stale_extra.as_object_mut().unwrap().remove("skills");
+    repo.update(
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(serde_json::to_string(&stale_extra).unwrap()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    resolver.arm();
+    let read_service = svc.clone();
+    let read_conversation_id = conv.id.clone();
+    let delayed_read = tokio::spawn(async move { read_service.get("user_1", &read_conversation_id).await });
+    resolver.wait_until_started().await;
+
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
+    let operation_id = "44444444-4444-4444-8444-444444444444";
+    svc.update(
+        "user_1",
+        &conv.id,
+        UpdateConversationRequest {
+            name: None,
+            pinned: None,
+            model: None,
+            extra: Some(json!({
+                "project_id": project_id,
+                "workspace_root_ref": TEST_PROJECT_ROOT_REF
+            })),
+            expected_project_binding: Some(ProjectBindingExpectation {
+                project_id: None,
+                workspace_root_ref: None,
+                project_binding_revision: 0,
+                project_binding_receipt_id: None,
+            }),
+            project_binding_operation_id: Some(operation_id.to_owned()),
+        },
+        &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+    )
+    .await
+    .unwrap();
+    svc.update_extra(
+        &conv.id,
+        json!({ "team_mcp_stdio_config": { "team_id": "team-1", "port": 4242 } }),
+    )
+    .await
+    .unwrap();
+
+    resolver.release();
+    let response = delayed_read.await.unwrap().unwrap();
+    assert_eq!(response.extra["skills"], json!(["founder-voice"]));
+
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    let stored_extra: serde_json::Value = serde_json::from_str(&stored.extra).unwrap();
+    assert_eq!(stored_extra["project_id"], project_id);
+    assert_eq!(stored_extra["workspace_root_ref"], TEST_PROJECT_ROOT_REF);
+    assert_eq!(stored_extra["project_binding_revision"], 1);
+    assert_eq!(stored_extra["project_binding_receipt_id"], operation_id);
+    assert_eq!(stored_extra["team_mcp_stdio_config"]["port"], 4242);
+    assert!(stored_extra.get("skills").is_none());
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 2);
+    assert_eq!(task_mgr.kill_count(), 2);
+}
+
+#[tokio::test]
+async fn save_acp_runtime_mode_holds_identity_fence_across_both_durable_writes() {
+    let save_started = Arc::new(Notify::new());
+    let save_release = Arc::new(Notify::new());
+    let acp_repo = Arc::new(
+        StubAcpSessionRepo::default().with_blocked_runtime_state_save(save_started.clone(), save_release.clone()),
+    );
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let repo = Arc::new(MockRepo::new());
+    let svc = Arc::new(ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr.clone(),
+        repo.clone(),
+        Arc::new(StubAgentMetadataRepo),
+        acp_repo.clone(),
+    ));
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let save_service = svc.clone();
+    let save_conversation_id = conv.id.clone();
+    let save = tokio::spawn(async move { save_service.save_acp_runtime_mode(&save_conversation_id, "plan").await });
+    save_started.notified().await;
+
+    let stored_during_save = repo.get(&conv.id).await.unwrap().unwrap();
+    let stored_extra: serde_json::Value = serde_json::from_str(&stored_during_save.extra).unwrap();
+    assert_eq!(stored_extra["session_mode"], "plan");
+    assert!(
+        svc.runtime_state()
+            .try_claim_turn(&conv.id, "turn-racing-mode-seed")
+            .is_err()
+    );
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 0);
+    assert_eq!(task_mgr.kill_count(), 0);
+
+    save_release.notify_one();
+    save.await.unwrap().unwrap();
+
+    assert_eq!(acp_repo.runtime_state_saves().len(), 1);
+    assert_eq!(
+        acp_repo.runtime_state_saves()[0].current_mode_id,
+        Some(Some("plan".to_owned()))
+    );
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert!(task_mgr.get_task(&conv.id).is_none());
+}
+
+#[tokio::test]
+async fn save_acp_runtime_mode_partial_persistence_failure_is_fail_closed() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::default());
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let repo = Arc::new(MockRepo::new());
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr.clone(),
+        repo.clone(),
+        Arc::new(StubAgentMetadataRepo),
+        acp_repo.clone(),
+    );
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+    acp_repo.fail_next_runtime_state_save();
+
+    let error = svc.save_acp_runtime_mode(&conv.id, "plan").await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConversationError::Internal { reason } if reason.starts_with("ACP_RUNTIME_MODE_PERSISTENCE_FAILED")
+    ));
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    let stored_extra: serde_json::Value = serde_json::from_str(&stored.extra).unwrap();
+    assert_eq!(stored_extra["session_mode"], "plan");
+    assert!(acp_repo.runtime_state_saves().is_empty());
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert!(task_mgr.get_task(&conv.id).is_none());
 }
 
 #[tokio::test]
@@ -3308,7 +4211,7 @@ async fn send_message_returns_accepted() {
 async fn project_send_validates_binding_before_persisting_message() {
     let (svc, broadcaster, repo, _default_task_mgr) = make_service();
     install_project_attestation_verifier(&svc);
-    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
     let workspace_root_ref = TEST_PROJECT_ROOT_REF;
     let conv = svc
         .create("user_1", make_project_create_req(project_id, workspace_root_ref))
@@ -3337,8 +4240,9 @@ async fn project_send_validates_binding_before_persisting_message() {
 
     let mut mismatch_req = make_send_req();
     mismatch_req.runtime_workspace = Some(project_runtime_workspace(
-        "018f0c00-0000-7000-8000-000000000002",
+        "018f0c00-0000-4000-8000-000000000002",
         workspace_root_ref,
+        &conv.extra,
         runtime_dir.path(),
     ));
     let mismatch_ticket = project_runtime_ticket(
@@ -3363,6 +4267,7 @@ async fn project_send_validates_binding_before_persisting_message() {
     valid_req.runtime_workspace = Some(project_runtime_workspace(
         project_id,
         workspace_root_ref,
+        &conv.extra,
         runtime_dir.path(),
     ));
     let missing_ticket_err = svc
@@ -3416,7 +4321,7 @@ async fn project_send_validates_binding_before_persisting_message() {
 async fn project_runtime_builder_uses_transient_canonical_path_only() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let verifier = install_project_attestation_verifier(&svc);
-    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
     let workspace_root_ref = TEST_PROJECT_ROOT_REF;
     let conv = svc
         .create("user_1", make_project_create_req(project_id, workspace_root_ref))
@@ -3424,7 +4329,7 @@ async fn project_runtime_builder_uses_transient_canonical_path_only() {
         .unwrap();
     let row = repo.get(&conv.id).await.unwrap().unwrap();
     let runtime_dir = tempfile::TempDir::new().unwrap();
-    let runtime_workspace = project_runtime_workspace(project_id, workspace_root_ref, runtime_dir.path());
+    let runtime_workspace = project_runtime_workspace(project_id, workspace_root_ref, &conv.extra, runtime_dir.path());
     let verified = verified_project_runtime(
         &verifier,
         &conv.id,
@@ -3454,7 +4359,7 @@ async fn project_runtime_builder_uses_transient_canonical_path_only() {
 #[tokio::test]
 async fn project_runtime_is_unavailable_without_local_capability_verifier() {
     let (svc, broadcaster, repo, _default_task_mgr) = make_service();
-    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
     let conv = svc
         .create("user_1", make_project_create_req(project_id, TEST_PROJECT_ROOT_REF))
         .await
@@ -3464,6 +4369,7 @@ async fn project_runtime_is_unavailable_without_local_capability_verifier() {
     request.runtime_workspace = Some(project_runtime_workspace(
         project_id,
         TEST_PROJECT_ROOT_REF,
+        &conv.extra,
         runtime_dir.path(),
     ));
     let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(Vec::new()));
@@ -3494,7 +4400,7 @@ async fn project_bound_run_agent_turn_rejects_before_any_runtime_or_persistence_
     let conv = svc
         .create(
             "user_1",
-            make_project_create_req("018f0c00-0000-7000-8000-000000000001", TEST_PROJECT_ROOT_REF),
+            make_project_create_req("018f0c00-0000-4000-8000-000000000001", TEST_PROJECT_ROOT_REF),
         )
         .await
         .unwrap();
@@ -3534,13 +4440,14 @@ async fn project_bound_run_agent_turn_rejects_before_any_runtime_or_persistence_
 async fn project_warmup_redacts_runtime_path_from_returned_failure() {
     let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
     install_project_attestation_verifier(&svc);
-    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
     let conv = svc
         .create("user_1", make_project_create_req(project_id, TEST_PROJECT_ROOT_REF))
         .await
         .unwrap();
     let runtime_dir = tempfile::TempDir::new().unwrap();
-    let runtime_workspace = project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, runtime_dir.path());
+    let runtime_workspace =
+        project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, &conv.extra, runtime_dir.path());
     let secret_path = runtime_workspace.path.clone();
     let ticket = project_runtime_ticket(&conv.id, ProjectRuntimeAttestationPurpose::Warmup, &runtime_workspace);
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(FailingBuildTaskManager::new(format!(
@@ -3560,13 +4467,14 @@ async fn project_warmup_redacts_runtime_path_from_returned_failure() {
 async fn project_send_redacts_runtime_path_from_persisted_and_streamed_failures() {
     let (svc, broadcaster, repo, _default_task_mgr) = make_service();
     install_project_attestation_verifier(&svc);
-    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
     let conv = svc
         .create("user_1", make_project_create_req(project_id, TEST_PROJECT_ROOT_REF))
         .await
         .unwrap();
     let runtime_dir = tempfile::TempDir::new().unwrap();
-    let runtime_workspace = project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, runtime_dir.path());
+    let runtime_workspace =
+        project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, &conv.extra, runtime_dir.path());
     let secret_path = runtime_workspace.path.clone();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(FailingBuildTaskManager::new(format!(
         "runtime failed while opening {secret_path}"
@@ -3599,16 +4507,60 @@ async fn project_send_redacts_runtime_path_from_persisted_and_streamed_failures(
 }
 
 #[tokio::test]
+async fn malformed_project_binding_fail_closes_send_failure_message_persistence() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.update(
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(
+                json!({
+                    "project_id": "018f0c00-0000-4000-8000-000000000001",
+                    "workspace_root_ref": TEST_PROJECT_ROOT_REF,
+                    "project_binding_revision": "malformed",
+                    "project_binding_receipt_id": null
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let secret_path = "/private/tmp/eve-project-secret/notes.md";
+    let send_error = AgentSendError::new(
+        format!("runtime failed in {secret_path}"),
+        AgentErrorCode::UnknownUpstreamError,
+        AgentErrorOwnership::UnknownUpstream,
+        Some(format!("could not read {secret_path}")),
+        true,
+        false,
+        None,
+    );
+
+    let persisted = svc
+        .persist_send_failure_tip(&conv.id, &send_error, None)
+        .await
+        .expect("malformed project binding must still persist a pathless failure tip");
+    assert!(!persisted.content.contains(secret_path));
+    assert!(persisted.content.contains("[project workspace redacted]"));
+    assert!(!persisted.content.contains("workspacePath"));
+    assert!(!persisted.content.contains("workspace_path"));
+}
+
+#[tokio::test]
 async fn project_stream_error_is_redacted_before_websocket_and_database_boundaries() {
     let (svc, broadcaster, repo, _default_task_mgr) = make_service();
     install_project_attestation_verifier(&svc);
-    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
     let conv = svc
         .create("user_1", make_project_create_req(project_id, TEST_PROJECT_ROOT_REF))
         .await
         .unwrap();
     let runtime_dir = tempfile::TempDir::new().unwrap();
-    let runtime_workspace = project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, runtime_dir.path());
+    let runtime_workspace =
+        project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, &conv.extra, runtime_dir.path());
     let secret_path = runtime_workspace.path.clone();
     let agent = Arc::new(ScriptedAgent::new(
         &conv.id,
@@ -3767,6 +4719,176 @@ async fn set_config_option_returns_observed_confirmation() {
 }
 
 #[tokio::test]
+async fn active_turn_rejects_runtime_config_option_before_agent_or_generation_delta() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(MockAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-active").unwrap();
+
+    let error = svc
+        .set_config_option(
+            &conv.id,
+            "model",
+            SetConfigOptionRequest {
+                value: "gpt-5.5".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    assert!(agent.set_config_option_calls.lock().unwrap().is_empty());
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 0);
+    assert_eq!(task_mgr.kill_count(), 0);
+
+    drop(turn_claim);
+    let response = svc
+        .set_config_option(
+            &conv.id,
+            "model",
+            SetConfigOptionRequest {
+                value: "gpt-5.5".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.confirmation, ConfigOptionConfirmation::Observed);
+    assert_eq!(
+        agent.set_config_option_calls.lock().unwrap().as_slice(),
+        &[("model".to_owned(), "gpt-5.5".to_owned())]
+    );
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 1);
+    assert_eq!(task_mgr.kill_count(), 0);
+}
+
+#[tokio::test]
+async fn runtime_config_persistence_failure_evicts_mutated_agent_after_generation_publish() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
+        conversation_id: &conv.id,
+        assistant_definition_id: "asstdef-config-failure",
+        assistant_id: "assistant-config-failure",
+        assistant_source: "builtin",
+        assistant_name: "Config Failure",
+        assistant_avatar_type: "emoji",
+        assistant_avatar_value: None,
+        agent_id: "8e1acf31",
+        rules_content: "",
+        default_model_mode: "auto",
+        resolved_model_id: Some("model-old"),
+        default_permission_mode: "auto",
+        resolved_permission_value: None,
+        default_skills_mode: "auto",
+        resolved_skill_ids: "[]",
+        resolved_disabled_builtin_skill_ids: "[]",
+        default_mcps_mode: "auto",
+        resolved_mcp_ids: "[]",
+    })
+    .await
+    .unwrap();
+    let agent = Arc::new(MockAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    repo.fail_next_assistant_snapshot_upsert();
+
+    let error = svc
+        .set_config_option(
+            &conv.id,
+            "model",
+            SetConfigOptionRequest {
+                value: "model-new".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConversationError::Internal { reason } if reason == "RUNTIME_IDENTITY_PERSISTENCE_FAILED"
+    ));
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert!(task_mgr.get_task(&conv.id).is_none());
+    assert_eq!(
+        agent.set_config_option_calls.lock().unwrap().as_slice(),
+        &[("model".to_owned(), "model-new".to_owned())]
+    );
+    let snapshot = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
+    assert_eq!(snapshot.resolved_model_id.as_deref(), Some("model-old"));
+}
+
+#[tokio::test]
+async fn runtime_config_partial_preference_failure_returns_error_after_snapshot_commit_and_evicts_task() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef-config-partial",
+        "assistant-config-partial",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef-config-partial",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            assistant_definition_id: "asstdef-config-partial",
+            last_model_id: Some("model-old"),
+            last_permission_value: Some("mode-old"),
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let conv =
+        create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-config-partial").await;
+    let agent = Arc::new(MockAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+    svc.with_assistant_preference_repo(Arc::new(FailingAssistantPreferenceRepository::new(
+        preference_repo.clone(),
+    )));
+
+    let error = svc
+        .set_config_option(
+            &conv.id,
+            "model",
+            SetConfigOptionRequest {
+                value: "model-new".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConversationError::Internal { reason } if reason == "RUNTIME_IDENTITY_PERSISTENCE_FAILED"
+    ));
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert!(task_mgr.get_task(&conv.id).is_none());
+    let snapshot = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
+    assert_eq!(snapshot.resolved_model_id.as_deref(), Some("model-new"));
+    let preference = preference_repo.get("asstdef-config-partial").await.unwrap().unwrap();
+    assert_eq!(preference.last_model_id.as_deref(), Some("model-old"));
+}
+
+#[tokio::test]
 async fn set_config_option_evicts_task_when_acp_protocol_is_not_connected() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
@@ -3794,6 +4916,7 @@ async fn set_config_option_evicts_task_when_acp_protocol_is_not_connected() {
         task_mgr.kill_records(),
         vec![(conv.id.clone(), Some(AgentKillReason::AgentErrorRecovery))]
     );
+    assert_eq!(svc.project_runtime_epochs().runtime_generation(&conv.id), 1);
 }
 
 #[tokio::test]
@@ -4101,6 +5224,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
                 extra: None,
                 pinned: None,
                 expected_project_binding: None,
+                project_binding_operation_id: None,
             },
             &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
         )
@@ -4163,6 +5287,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
                 extra: None,
                 pinned: None,
                 expected_project_binding: None,
+                project_binding_operation_id: None,
             },
             &(task_mgr as Arc<dyn IWorkerTaskManager>),
         )
@@ -4182,6 +5307,75 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
             .as_deref()
             .is_some_and(|model| model.contains("model-y"))
     );
+}
+
+#[tokio::test]
+async fn update_aionrs_model_kills_old_runtime_before_secondary_snapshot_failure() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let mut create_request = make_create_req();
+    create_request.r#type = Some(AgentType::Aionrs);
+    create_request.model = Some(ProviderWithModel {
+        provider_id: "provider-old".to_owned(),
+        model: "model-old".to_owned(),
+        use_model: Some("model-old".to_owned()),
+    });
+    let conv = svc.create("user_1", create_request).await.unwrap();
+    repo.upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
+        conversation_id: &conv.id,
+        assistant_definition_id: "asstdef-failure-order",
+        assistant_id: "assistant-failure-order",
+        assistant_source: "builtin",
+        assistant_name: "Failure Order",
+        assistant_avatar_type: "emoji",
+        assistant_avatar_value: None,
+        agent_id: "632f31d2",
+        rules_content: "",
+        default_model_mode: "auto",
+        resolved_model_id: Some("model-old"),
+        default_permission_mode: "auto",
+        resolved_permission_value: None,
+        default_skills_mode: "auto",
+        resolved_skill_ids: "[]",
+        resolved_disabled_builtin_skill_ids: "[]",
+        default_mcps_mode: "auto",
+        resolved_mcp_ids: "[]",
+    })
+    .await
+    .unwrap();
+    repo.fail_next_assistant_snapshot_upsert();
+
+    let error = svc
+        .update(
+            "user_1",
+            &conv.id,
+            UpdateConversationRequest {
+                name: None,
+                pinned: None,
+                model: Some(ProviderWithModel {
+                    provider_id: "provider-new".to_owned(),
+                    model: "model-new".to_owned(),
+                    use_model: Some("model-new".to_owned()),
+                }),
+                extra: None,
+                expected_project_binding: None,
+                project_binding_operation_id: None,
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ConversationError::Internal { .. }));
+    assert_eq!(
+        task_mgr.kill_count(),
+        1,
+        "old runtime must be invalidated before the fallible snapshot write"
+    );
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    assert!(stored.model.as_deref().is_some_and(|model| model.contains("model-new")));
+    let snapshot = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
+    assert_eq!(snapshot.resolved_model_id.as_deref(), Some("model-old"));
 }
 
 #[tokio::test]
@@ -5954,7 +7148,7 @@ async fn project_warmup_requires_transient_binding_and_never_persists_path() {
     let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
     install_project_attestation_verifier(&svc);
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
-    let project_id = "018f0c00-0000-7000-8000-000000000001";
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
     let workspace_root_ref = TEST_PROJECT_ROOT_REF;
     let conv = svc
         .create("user_1", make_project_create_req(project_id, workspace_root_ref))
@@ -5965,7 +7159,7 @@ async fn project_warmup_requires_transient_binding_and_never_persists_path() {
     assert!(matches!(err, ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_BINDING_REQUIRED"));
 
     let runtime_dir = tempfile::TempDir::new().unwrap();
-    let runtime_workspace = project_runtime_workspace(project_id, workspace_root_ref, runtime_dir.path());
+    let runtime_workspace = project_runtime_workspace(project_id, workspace_root_ref, &conv.extra, runtime_dir.path());
     let missing_ticket = svc
         .warmup_with_project_workspace("user_1", &conv.id, &runtime_workspace, &task_mgr)
         .await
@@ -7138,7 +8332,7 @@ async fn update_allows_other_extra_fields() {
 }
 
 #[tokio::test]
-async fn get_backfills_legacy_row_and_persists() {
+async fn get_backfills_legacy_row_in_response_without_read_path_persistence() {
     let resolver = Arc::new(FixedSkillResolver {
         names: vec!["cron".into(), "todo-tracker".into()],
     });
@@ -7179,13 +8373,13 @@ async fn get_backfills_legacy_row_and_persists() {
     let resp2 = svc.get("user-1", "legacy-1").await.unwrap();
     assert_eq!(resp2.extra["skills"], json!(["cron", "pdf"]));
 
-    // Verify the row on disk was persisted with the new shape.
+    // Read compatibility must not persist a stale whole-object snapshot.
     let persisted = repo.get("legacy-1").await.unwrap().unwrap();
     let persisted_extra: serde_json::Value = serde_json::from_str(&persisted.extra).unwrap();
-    assert_eq!(persisted_extra["skills"], json!(["cron", "pdf"]));
-    assert!(persisted_extra.get("enabled_skills").is_none());
-    assert!(persisted_extra.get("exclude_builtin_skills").is_none());
-    assert!(persisted_extra.get("loaded_skills").is_none());
+    assert!(persisted_extra.get("skills").is_none());
+    assert_eq!(persisted_extra["enabled_skills"], json!(["pdf"]));
+    assert_eq!(persisted_extra["exclude_builtin_skills"], json!(["todo-tracker"]));
+    assert_eq!(persisted_extra["loaded_skills"][0]["name"], "cron");
 }
 
 #[tokio::test]

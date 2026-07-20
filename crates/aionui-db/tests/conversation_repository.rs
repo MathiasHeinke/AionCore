@@ -1,7 +1,7 @@
 use aionui_db::{
-    ConversationFilters, ConversationProjectBindingExpectation, ConversationRowUpdate, IConversationRepository,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, MessageRowUpdate, SqliteConversationRepository,
-    init_database_memory, models::ConversationRow, models::MessageRow,
+    ConversationExtraPatch, ConversationFilters, ConversationProjectBindingExpectation, ConversationRowUpdate,
+    IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, MessageRowUpdate,
+    SqliteConversationRepository, init_database_memory, models::ConversationRow, models::MessageRow,
 };
 
 const USER_ID: &str = "system_default_user";
@@ -116,8 +116,10 @@ async fn project_binding_cas_binds_unbound_row_and_preserves_unrelated_extra() {
             extra: Some(
                 serde_json::json!({
                     "marker": "keep-me",
-                    "project_id": "018f0c00-0000-7000-8000-000000000001",
-                    "workspace_root_ref": "root:primary-projects"
+                    "project_id": "018f0c00-0000-4000-8000-000000000001",
+                    "workspace_root_ref": "root:018f0c00-0000-4000-8000-000000000010",
+                    "project_binding_revision": 1,
+                    "project_binding_receipt_id": "00000000-0000-4000-8000-000000000001"
                 })
                 .to_string(),
             ),
@@ -130,8 +132,118 @@ async fn project_binding_cas_binds_unbound_row_and_preserves_unrelated_extra() {
 
     let stored: serde_json::Value = serde_json::from_str(&repo.get(&conv.id).await.unwrap().unwrap().extra).unwrap();
     assert_eq!(stored["marker"], "keep-me");
-    assert_eq!(stored["project_id"], "018f0c00-0000-7000-8000-000000000001");
-    assert_eq!(stored["workspace_root_ref"], "root:primary-projects");
+    assert_eq!(stored["project_id"], "018f0c00-0000-4000-8000-000000000001");
+    assert_eq!(
+        stored["workspace_root_ref"],
+        "root:018f0c00-0000-4000-8000-000000000010"
+    );
+    assert_eq!(stored["project_binding_revision"], 1);
+    assert_eq!(
+        stored["project_binding_receipt_id"],
+        "00000000-0000-4000-8000-000000000001"
+    );
+}
+
+#[tokio::test]
+async fn atomic_extra_patch_cas_preserves_two_concurrent_disjoint_keys() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("atomic-extra-disjoint");
+    repo.create(&conv).await.unwrap();
+    let repo = Arc::new(repo);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut joins = Vec::new();
+    for (key, value) in [("display_label", "Project Alpha"), ("panel_state", "expanded")] {
+        let repo = repo.clone();
+        let barrier = barrier.clone();
+        let conversation_id = conv.id.clone();
+        joins.push(tokio::spawn(async move {
+            let mut patch = ConversationExtraPatch::default();
+            patch.set.insert(key.to_owned(), serde_json::json!(value));
+            barrier.wait().await;
+            repo.update_with_extra_patch_cas(&conversation_id, &ConversationRowUpdate::default(), &patch, None)
+                .await
+        }));
+    }
+    barrier.wait().await;
+    for join in joins {
+        join.await.unwrap().unwrap();
+    }
+
+    let stored: serde_json::Value = serde_json::from_str(&repo.get(&conv.id).await.unwrap().unwrap().extra).unwrap();
+    assert_eq!(stored["display_label"], "Project Alpha");
+    assert_eq!(stored["panel_state"], "expanded");
+    assert_eq!(stored["workspace"], "/home/user/project");
+}
+
+#[tokio::test]
+async fn atomic_opaque_patch_and_project_bind_both_commit_without_lost_keys() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let (repo, _db) = setup().await;
+    let mut conv = make_conversation("atomic-extra-bind");
+    conv.extra = serde_json::json!({ "marker": "original" }).to_string();
+    repo.create(&conv).await.unwrap();
+    let repo = Arc::new(repo);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let opaque_repo = repo.clone();
+    let opaque_barrier = barrier.clone();
+    let opaque_id = conv.id.clone();
+    let opaque = tokio::spawn(async move {
+        let mut patch = ConversationExtraPatch::default();
+        patch
+            .set
+            .insert("display_label".to_owned(), serde_json::json!("Project Alpha"));
+        opaque_barrier.wait().await;
+        opaque_repo
+            .update_with_extra_patch_cas(&opaque_id, &ConversationRowUpdate::default(), &patch, None)
+            .await
+    });
+
+    let binding_repo = repo.clone();
+    let binding_barrier = barrier.clone();
+    let binding_id = conv.id.clone();
+    let binding = tokio::spawn(async move {
+        let mut patch = ConversationExtraPatch::default();
+        patch.set.insert(
+            "project_id".to_owned(),
+            serde_json::json!("018f0c00-0000-4000-8000-000000000001"),
+        );
+        patch.set.insert(
+            "workspace_root_ref".to_owned(),
+            serde_json::json!("root:018f0c00-0000-4000-8000-000000000010"),
+        );
+        patch
+            .set
+            .insert("project_binding_revision".to_owned(), serde_json::json!(1));
+        patch.set.insert(
+            "project_binding_receipt_id".to_owned(),
+            serde_json::json!("00000000-0000-4000-8000-000000000001"),
+        );
+        binding_barrier.wait().await;
+        binding_repo
+            .update_with_extra_patch_cas(
+                &binding_id,
+                &ConversationRowUpdate::default(),
+                &patch,
+                Some(&ConversationProjectBindingExpectation::unbound()),
+            )
+            .await
+    });
+
+    barrier.wait().await;
+    opaque.await.unwrap().unwrap();
+    binding.await.unwrap().unwrap();
+
+    let stored: serde_json::Value = serde_json::from_str(&repo.get(&conv.id).await.unwrap().unwrap().extra).unwrap();
+    assert_eq!(stored["marker"], "original");
+    assert_eq!(stored["display_label"], "Project Alpha");
+    assert_eq!(stored["project_id"], "018f0c00-0000-4000-8000-000000000001");
+    assert_eq!(stored["project_binding_revision"], 1);
 }
 
 #[tokio::test]
@@ -150,7 +262,7 @@ async fn concurrent_project_binding_cas_has_exactly_one_committer() {
         let repo = Arc::clone(&repo);
         let barrier = Arc::clone(&barrier);
         let conversation_id = conv.id.clone();
-        let project_id = format!("018f0c00-0000-7000-8000-000000000{suffix}");
+        let project_id = format!("018f0c00-0000-4000-8000-000000000{suffix}");
         joins.push(tokio::spawn(async move {
             barrier.wait().await;
             repo.update_project_binding_cas(
@@ -160,7 +272,9 @@ async fn concurrent_project_binding_cas_has_exactly_one_committer() {
                         serde_json::json!({
                             "marker": suffix,
                             "project_id": project_id,
-                            "workspace_root_ref": "root:primary-projects"
+                            "workspace_root_ref": "root:018f0c00-0000-4000-8000-000000000010",
+                            "project_binding_revision": 1,
+                            "project_binding_receipt_id": format!("00000000-0000-4000-8000-000000000{suffix}")
                         })
                         .to_string(),
                     ),
@@ -176,7 +290,7 @@ async fn concurrent_project_binding_cas_has_exactly_one_committer() {
     for join in joins {
         results.push(join.await);
     }
-    let success_count = results.iter().filter(|result| matches!(result, Ok(Ok(())))).count();
+    let success_count = results.iter().filter(|result| matches!(result, Ok(Ok(_)))).count();
     let conflict_count = results
         .iter()
         .filter(|result| {
@@ -193,13 +307,15 @@ async fn concurrent_project_binding_cas_has_exactly_one_committer() {
 #[tokio::test]
 async fn stale_project_unbind_cannot_overwrite_newer_manual_rebind() {
     let (repo, _db) = setup().await;
-    let project_a = "018f0c00-0000-7000-8000-000000000001";
-    let project_b = "018f0c00-0000-7000-8000-000000000002";
+    let project_a = "018f0c00-0000-4000-8000-000000000001";
+    let project_b = "018f0c00-0000-4000-8000-000000000002";
     let mut conv = make_conversation("project-cas-stale-rollback");
     conv.extra = serde_json::json!({
         "marker": "before",
         "project_id": project_a,
-        "workspace_root_ref": "root:primary-projects"
+        "workspace_root_ref": "root:018f0c00-0000-4000-8000-000000000010",
+        "project_binding_revision": 1,
+        "project_binding_receipt_id": "00000000-0000-4000-8000-000000000001"
     })
     .to_string();
     repo.create(&conv).await.unwrap();
@@ -211,13 +327,20 @@ async fn stale_project_unbind_cannot_overwrite_newer_manual_rebind() {
                 serde_json::json!({
                     "marker": "manual-winner",
                     "project_id": project_b,
-                    "workspace_root_ref": "root:secondary-projects"
+                    "workspace_root_ref": "root:018f0c00-0000-4000-8000-000000000011",
+                    "project_binding_revision": 2,
+                    "project_binding_receipt_id": "00000000-0000-4000-8000-000000000002"
                 })
                 .to_string(),
             ),
             ..Default::default()
         },
-        &ConversationProjectBindingExpectation::bound(project_a, "root:primary-projects"),
+        &ConversationProjectBindingExpectation::bound(
+            project_a,
+            "root:018f0c00-0000-4000-8000-000000000010",
+            1,
+            Some("00000000-0000-4000-8000-000000000001".to_owned()),
+        ),
     )
     .await
     .unwrap();
@@ -229,7 +352,12 @@ async fn stale_project_unbind_cannot_overwrite_newer_manual_rebind() {
                 extra: Some(serde_json::json!({ "marker": "stale-rollback" }).to_string()),
                 ..Default::default()
             },
-            &ConversationProjectBindingExpectation::bound(project_a, "root:primary-projects"),
+            &ConversationProjectBindingExpectation::bound(
+                project_a,
+                "root:018f0c00-0000-4000-8000-000000000010",
+                1,
+                Some("00000000-0000-4000-8000-000000000001".to_owned()),
+            ),
         )
         .await;
     assert!(
@@ -237,9 +365,72 @@ async fn stale_project_unbind_cannot_overwrite_newer_manual_rebind() {
     );
 
     let stored: serde_json::Value = serde_json::from_str(&repo.get(&conv.id).await.unwrap().unwrap().extra).unwrap();
-    assert_eq!(stored["marker"], "manual-winner");
+    assert_eq!(stored["marker"], "before");
     assert_eq!(stored["project_id"], project_b);
-    assert_eq!(stored["workspace_root_ref"], "root:secondary-projects");
+    assert_eq!(
+        stored["workspace_root_ref"],
+        "root:018f0c00-0000-4000-8000-000000000011"
+    );
+}
+
+#[tokio::test]
+async fn generic_extra_update_preserves_reserved_fields_for_every_json_type_and_absence() {
+    let (repo, _db) = setup().await;
+    let keys = [
+        "project_id",
+        "workspace_root_ref",
+        "project_binding_revision",
+        "project_binding_receipt_id",
+    ];
+    let values = [
+        serde_json::Value::Null,
+        serde_json::json!(true),
+        serde_json::json!(42),
+        serde_json::json!("opaque"),
+        serde_json::json!(["future", 1]),
+        serde_json::json!({"future": "shape"}),
+    ];
+
+    for key in keys {
+        for original in values.iter().cloned().map(Some).chain(std::iter::once(None)) {
+            let mut conv = make_conversation("generic-reserved-preservation");
+            let mut persisted = serde_json::json!({"marker": "before"});
+            if let Some(value) = original.clone() {
+                persisted[key] = value;
+            }
+            conv.extra = persisted.to_string();
+            repo.create(&conv).await.unwrap();
+
+            let mut candidate = serde_json::json!({
+                "marker": "after",
+                "project_id": "forged-project",
+                "workspace_root_ref": "root:forged",
+                "project_binding_revision": 999,
+                "project_binding_receipt_id": "forged-receipt"
+            });
+            candidate[key] = serde_json::json!("different-forged-value");
+            repo.update(
+                &conv.id,
+                &ConversationRowUpdate {
+                    extra: Some(candidate.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let stored: serde_json::Value =
+                serde_json::from_str(&repo.get(&conv.id).await.unwrap().unwrap().extra).unwrap();
+            assert_eq!(stored["marker"], "after");
+            match original {
+                Some(value) => assert_eq!(stored.get(key), Some(&value), "key={key}"),
+                None => assert!(stored.get(key).is_none(), "key={key} must remain absent"),
+            }
+            for other in keys.into_iter().filter(|other| *other != key) {
+                assert!(stored.get(other).is_none(), "forged key {other} must remain absent");
+            }
+        }
+    }
 }
 
 #[tokio::test]

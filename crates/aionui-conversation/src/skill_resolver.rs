@@ -38,6 +38,17 @@ pub trait SkillResolver: Send + Sync {
     /// the list of relative paths (e.g. `.claude/skills`) to populate.
     /// Returns the number of symlinks successfully created.
     async fn link_workspace_skills(&self, workspace: &Path, rel_dirs: &[&str], skills: &[ResolvedAgentSkill]) -> usize;
+
+    /// Privacy-preserving project-runtime variant. Implementations may
+    /// override this to suppress transient workspace paths in lower layers.
+    async fn link_project_workspace_skills(
+        &self,
+        workspace: &Path,
+        rel_dirs: &[&str],
+        skills: &[ResolvedAgentSkill],
+    ) -> usize {
+        self.link_workspace_skills(workspace, rel_dirs, skills).await
+    }
 }
 
 /// Production adapter backed by `aionui_extension::skill_service`.
@@ -154,6 +165,24 @@ impl SkillResolver for ExtensionSkillResolver {
                     error = %e,
                     "link_workspace_skills failed"
                 );
+                0
+            }
+        }
+    }
+
+    async fn link_project_workspace_skills(
+        &self,
+        workspace: &Path,
+        rel_dirs: &[&str],
+        skills: &[ResolvedAgentSkill],
+    ) -> usize {
+        if rel_dirs.is_empty() || skills.is_empty() {
+            return 0;
+        }
+        match aionui_extension::link_project_workspace_skills(workspace, rel_dirs, skills).await {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(error_code = "PROJECT_SKILL_LINK_FAILED", "project skill linking failed");
                 0
             }
         }

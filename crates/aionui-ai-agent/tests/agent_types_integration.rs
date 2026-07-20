@@ -207,6 +207,7 @@ async fn collect_idle_ignores_aionrs_agent_type() {
                 path: "/tmp".into(),
                 stored_path: "/tmp".into(),
                 is_custom: true,
+                project_environment_hint: None,
             },
             model: ProviderWithModel {
                 provider_id: "p".into(),

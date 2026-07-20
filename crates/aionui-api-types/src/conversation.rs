@@ -78,12 +78,19 @@ pub struct UpdateConversationRequest {
     /// observed pair (or two nulls when the conversation is unbound).
     #[serde(default)]
     pub expected_project_binding: Option<ProjectBindingExpectation>,
+    /// Stable client operation UUID for a project pair mutation. It becomes
+    /// the server-owned persisted provenance receipt only after a winning CAS.
+    pub project_binding_operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectBindingExpectation {
     pub project_id: Option<String>,
     pub workspace_root_ref: Option<String>,
+    /// Monotone, path-free receipt for the exact binding snapshot observed
+    /// by the caller. Missing legacy storage is represented as revision 0.
+    pub project_binding_revision: u64,
+    pub project_binding_receipt_id: Option<String>,
 }
 
 /// Body for `POST /api/conversations/clone`.
@@ -104,6 +111,8 @@ pub struct CloneConversationRequest {
 pub struct ProjectRuntimeWorkspaceRequest {
     pub project_id: String,
     pub workspace_root_ref: String,
+    pub project_binding_revision: u64,
+    pub project_binding_receipt_id: Option<String>,
     pub path: String,
 }
 
@@ -489,11 +498,13 @@ mod tests {
         let raw = json!({
             "expected_project_binding": {
                 "project_id": null,
-                "workspace_root_ref": null
+                "workspace_root_ref": null,
+                "project_binding_revision": 0,
+                "project_binding_receipt_id": null
             },
             "extra": {
-                "project_id": "018f0c00-0000-7000-8000-000000000001",
-                "workspace_root_ref": "root:primary-projects"
+                "project_id": "018f0c00-0000-4000-8000-000000000001",
+                "workspace_root_ref": "root:018f0c00-0000-4000-8000-000000000010"
             }
         });
         let req: UpdateConversationRequest = serde_json::from_value(raw).unwrap();
@@ -502,6 +513,8 @@ mod tests {
             Some(ProjectBindingExpectation {
                 project_id: None,
                 workspace_root_ref: None,
+                project_binding_revision: 0,
+                project_binding_receipt_id: None,
             })
         );
     }
@@ -862,8 +875,10 @@ mod tests {
             "inject_skills": ["security-review"],
             "hidden": true,
             "runtime_workspace": {
-                "project_id": "018f0c00-0000-7000-8000-000000000001",
-                "workspace_root_ref": "root:primary-projects",
+                "project_id": "018f0c00-0000-4000-8000-000000000001",
+                "workspace_root_ref": "root:018f0c00-0000-4000-8000-000000000010",
+                "project_binding_revision": 1,
+                "project_binding_receipt_id": "00000000-0000-4000-8000-000000000001",
                 "path": "/tmp/portable-project"
             }
         });
@@ -875,8 +890,10 @@ mod tests {
         assert_eq!(
             req.runtime_workspace,
             Some(ProjectRuntimeWorkspaceRequest {
-                project_id: "018f0c00-0000-7000-8000-000000000001".into(),
-                workspace_root_ref: "root:primary-projects".into(),
+                project_id: "018f0c00-0000-4000-8000-000000000001".into(),
+                workspace_root_ref: "root:018f0c00-0000-4000-8000-000000000010".into(),
+                project_binding_revision: 1,
+                project_binding_receipt_id: Some("00000000-0000-4000-8000-000000000001".into()),
                 path: "/tmp/portable-project".into(),
             })
         );
@@ -911,15 +928,17 @@ mod tests {
     fn deserialize_warmup_project_runtime_workspace() {
         let raw = json!({
             "runtime_workspace": {
-                "project_id": "018f0c00-0000-7000-8000-000000000001",
-                "workspace_root_ref": "root:primary-projects",
+                "project_id": "018f0c00-0000-4000-8000-000000000001",
+                "workspace_root_ref": "root:018f0c00-0000-4000-8000-000000000010",
+                "project_binding_revision": 1,
+                "project_binding_receipt_id": "00000000-0000-4000-8000-000000000001",
                 "path": "/tmp/portable-project"
             }
         });
         let req: WarmupConversationRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(
             req.runtime_workspace.unwrap().workspace_root_ref,
-            "root:primary-projects"
+            "root:018f0c00-0000-4000-8000-000000000010"
         );
     }
 

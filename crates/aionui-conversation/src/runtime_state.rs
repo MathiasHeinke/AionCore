@@ -19,6 +19,7 @@ pub struct ConversationRuntimeStateService {
 #[derive(Debug, Default)]
 struct ConversationRuntimeState {
     active_turns: HashMap<String, String>,
+    runtime_identity_mutations: HashSet<String>,
     accepted_steer_requests: HashMap<String, HashMap<String, RegisteredSteerRequest>>,
     deleting_conversations: HashSet<String>,
     cancelling_conversations: HashSet<String>,
@@ -29,6 +30,13 @@ struct ConversationRuntimeState {
 pub struct TurnClaim {
     conversation_id: String,
     turn_id: String,
+    state: Weak<ConversationRuntimeStateService>,
+    released: bool,
+}
+
+#[derive(Debug)]
+pub struct RuntimeIdentityMutationClaim {
+    conversation_id: String,
     state: Weak<ConversationRuntimeStateService>,
     released: bool,
 }
@@ -106,6 +114,11 @@ impl ConversationRuntimeStateService {
                 reason: format!("conversation {conversation_id} is already running"),
             });
         }
+        if state.runtime_identity_mutations.contains(conversation_id) {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} runtime identity is being updated"),
+            });
+        }
 
         state
             .active_turns
@@ -116,6 +129,34 @@ impl ConversationRuntimeStateService {
         Ok(TurnClaim {
             conversation_id: conversation_id.to_owned(),
             turn_id: turn_id.to_owned(),
+            state: Arc::downgrade(self),
+            released: false,
+        })
+    }
+
+    /// Atomically excludes both active turns and future turn claims while a
+    /// model/project runtime identity mutation is in flight. This also fences
+    /// legacy unbound turns, which do not own a project epoch read permit.
+    pub fn try_claim_runtime_identity_mutation(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<RuntimeIdentityMutationClaim, ConversationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConversationError::internal("conversation runtime state lock poisoned"))?;
+        if state.shutting_down
+            || state.deleting_conversations.contains(conversation_id)
+            || state.active_turns.contains_key(conversation_id)
+            || state.runtime_identity_mutations.contains(conversation_id)
+        {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} runtime identity is busy"),
+            });
+        }
+        state.runtime_identity_mutations.insert(conversation_id.to_owned());
+        Ok(RuntimeIdentityMutationClaim {
+            conversation_id: conversation_id.to_owned(),
             state: Arc::downgrade(self),
             released: false,
         })
@@ -465,6 +506,33 @@ impl ConversationRuntimeStateService {
             }
         }
     }
+
+    fn release_runtime_identity_mutation(&self, conversation_id: &str) {
+        if let Ok(mut state) = self.state.lock()
+            && state.runtime_identity_mutations.remove(conversation_id)
+        {
+            drop(state);
+            self.release_notify.notify_waiters();
+        }
+    }
+}
+
+impl RuntimeIdentityMutationClaim {
+    fn release_inner(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Some(state) = self.state.upgrade() {
+            state.release_runtime_identity_mutation(&self.conversation_id);
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for RuntimeIdentityMutationClaim {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
 }
 
 impl TurnClaim {
@@ -522,6 +590,25 @@ mod tests {
         let summary = state.summary_from_parts("conv-1", None, false, 0);
         assert_eq!(summary.turn_id.as_deref(), Some("turn-a"));
         assert_eq!(summary.state, ConversationRuntimeStateKind::Starting);
+    }
+
+    #[test]
+    fn active_turn_and_runtime_identity_mutation_are_atomically_exclusive() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let turn = state.try_claim_turn("conv-1", "turn-a").unwrap();
+        assert!(matches!(
+            state.try_claim_runtime_identity_mutation("conv-1"),
+            Err(ConversationError::Busy { .. })
+        ));
+        drop(turn);
+
+        let mutation = state.try_claim_runtime_identity_mutation("conv-1").unwrap();
+        assert!(matches!(
+            state.try_claim_turn("conv-1", "turn-b"),
+            Err(ConversationError::Busy { .. })
+        ));
+        drop(mutation);
+        assert!(state.try_claim_turn("conv-1", "turn-c").is_ok());
     }
 
     #[test]

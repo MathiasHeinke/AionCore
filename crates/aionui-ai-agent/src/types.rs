@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::project_runtime_fence::ProjectRuntimeExecutionPermit;
 use crate::session_context::AgentSessionContext;
 
 /// Data payload for sending a user message to an Agent.
@@ -30,12 +31,19 @@ pub struct BuildTaskOptions {
     /// Pathless, attested identity for a project runtime. `None` preserves
     /// the legacy non-project cache semantics.
     pub project_runtime_context: Option<ProjectRuntimeContext>,
+    /// Shared epoch/fence and authoritative binding revalidation. Present
+    /// exactly when `project_runtime_context` is present.
+    pub project_runtime_execution: Option<ProjectRuntimeExecutionPermit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRuntimeContext {
     pub runtime_fingerprint: String,
     pub environment_hint_fingerprint: String,
+    pub project_binding_revision: u64,
+    /// Monotone only for the lifetime of this process. Binding and other
+    /// runtime-identity mutations advance it before invalidating task slots.
+    pub process_runtime_generation: u64,
     pub backend_generation: String,
     pub root_catalog_revision: u64,
     pub root_ownership_revision: u64,
@@ -46,11 +54,23 @@ impl ProjectRuntimeContext {
     pub fn same_runtime_as(&self, other: &Self) -> bool {
         self.runtime_fingerprint == other.runtime_fingerprint
             && self.environment_hint_fingerprint == other.environment_hint_fingerprint
+            && self.project_binding_revision == other.project_binding_revision
+            && self.process_runtime_generation == other.process_runtime_generation
     }
 
     pub fn is_strictly_newer_than(&self, previous: &Self) -> bool {
-        self.backend_generation == previous.backend_generation
-            && self.root_catalog_revision >= previous.root_catalog_revision
+        if self.backend_generation != previous.backend_generation
+            || self.process_runtime_generation < previous.process_runtime_generation
+            || self.project_binding_revision < previous.project_binding_revision
+        {
+            return false;
+        }
+        if self.process_runtime_generation > previous.process_runtime_generation
+            || self.project_binding_revision > previous.project_binding_revision
+        {
+            return true;
+        }
+        self.root_catalog_revision >= previous.root_catalog_revision
             && self.root_ownership_revision >= previous.root_ownership_revision
             && self.project_catalog_revision >= previous.project_catalog_revision
             && (self.root_catalog_revision > previous.root_catalog_revision
@@ -64,11 +84,17 @@ impl BuildTaskOptions {
         Self {
             context,
             project_runtime_context: None,
+            project_runtime_execution: None,
         }
     }
 
     pub fn with_project_runtime_context(mut self, context: ProjectRuntimeContext) -> Self {
         self.project_runtime_context = Some(context);
+        self
+    }
+
+    pub fn with_project_runtime_execution(mut self, permit: ProjectRuntimeExecutionPermit) -> Self {
+        self.project_runtime_execution = Some(permit);
         self
     }
 

@@ -100,7 +100,7 @@ bcrypt = "0.17"
 aes-gcm = "0.10"
 
 # UUID
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 
 # HTTP client — use rustls with native roots to align backend trust with the host system.
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls-native-roots"], default-features = false }

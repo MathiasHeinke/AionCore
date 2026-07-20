@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aionui_common::{
     AgentKillReason, AgentType, ConversationStatus, ErrorChain, OnConversationDelete, TimestampMs, now_ms,
@@ -13,6 +14,7 @@ use tracing::{info, warn};
 
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
+use crate::project_runtime_fence::{ProjectRuntimeExecutionPermit, ProjectRuntimeUse};
 use crate::types::{BuildTaskOptions, ProjectRuntimeContext};
 
 /// Factory function that creates an [`AgentInstance`] from build options.
@@ -74,39 +76,172 @@ pub trait IWorkerTaskManager: Send + Sync {
 /// identity it was built for. Invalidation fences a late factory result after
 /// kill/remap so the spawned process cannot leak outside the map.
 type TaskTerminationFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+static NEXT_TASK_SLOT_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_task_slot_registration_id(counter: &AtomicU64) -> Result<u64, AgentError> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current != 0).then(|| current.checked_add(1)).flatten()
+        })
+        .map_err(|_| AgentError::internal("PROJECT_RUNTIME_LIFECYCLE_EXHAUSTED"))
+}
 
 struct TaskSlot {
+    registration_id: u64,
     project_runtime_context: Option<ProjectRuntimeContext>,
     instance: OnceCell<AgentInstance>,
-    invalidated: AtomicBool,
+    lifecycle: Mutex<TaskSlotLifecycle>,
     cleanup_started: AtomicBool,
     prior_termination: Mutex<Option<TaskTerminationFuture>>,
+    turn_holders: Mutex<HashSet<usize>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskSlotLifecycle {
+    Building(Option<ProjectRuntimeUse>),
+    Ready,
+    WarmIdle,
+    TurnActive { turn_id: String },
+    Finished,
+    FailedEmpty,
+    Invalidated,
 }
 
 impl TaskSlot {
     fn new(
         project_runtime_context: Option<ProjectRuntimeContext>,
+        project_runtime_use: Option<ProjectRuntimeUse>,
         prior_termination: Option<TaskTerminationFuture>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Result<Arc<Self>, AgentError> {
+        Ok(Arc::new(Self {
+            registration_id: allocate_task_slot_registration_id(&NEXT_TASK_SLOT_REGISTRATION_ID)?,
             project_runtime_context,
             instance: OnceCell::new(),
-            invalidated: AtomicBool::new(false),
+            lifecycle: Mutex::new(TaskSlotLifecycle::Building(project_runtime_use)),
             cleanup_started: AtomicBool::new(false),
             prior_termination: Mutex::new(prior_termination),
-        })
+            turn_holders: Mutex::new(HashSet::new()),
+        }))
     }
 
     fn get(&self) -> Option<&AgentInstance> {
-        self.instance.get()
+        let ready = self.lifecycle.lock().is_ok_and(|lifecycle| {
+            matches!(
+                *lifecycle,
+                TaskSlotLifecycle::Ready
+                    | TaskSlotLifecycle::WarmIdle
+                    | TaskSlotLifecycle::TurnActive { .. }
+                    | TaskSlotLifecycle::Finished
+            )
+        });
+        ready.then(|| self.instance.get()).flatten()
+    }
+
+    fn lifecycle(&self) -> Result<TaskSlotLifecycle, AgentError> {
+        self.lifecycle
+            .lock()
+            .map(|lifecycle| lifecycle.clone())
+            .map_err(|_| AgentError::internal("PROJECT_RUNTIME_LIFECYCLE_UNAVAILABLE"))
+    }
+
+    fn admit_exact(&self, requested_use: Option<&ProjectRuntimeUse>) -> Result<(), AgentError> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| AgentError::internal("PROJECT_RUNTIME_LIFECYCLE_UNAVAILABLE"))?;
+        match (&mut *lifecycle, requested_use) {
+            (TaskSlotLifecycle::Building(None), None) | (TaskSlotLifecycle::Ready, None) => Ok(()),
+            (TaskSlotLifecycle::Building(Some(current)), Some(requested)) => match (&*current, requested) {
+                (ProjectRuntimeUse::Warmup, ProjectRuntimeUse::Turn { .. }) => {
+                    *current = requested.clone();
+                    Ok(())
+                }
+                (ProjectRuntimeUse::Turn { turn_id: active }, ProjectRuntimeUse::Turn { turn_id })
+                    if active == turn_id =>
+                {
+                    Ok(())
+                }
+                (ProjectRuntimeUse::Turn { .. }, ProjectRuntimeUse::Warmup)
+                | (ProjectRuntimeUse::Warmup, ProjectRuntimeUse::Warmup) => Ok(()),
+                _ => Err(AgentError::conflict("PROJECT_RUNTIME_TURN_ACTIVE")),
+            },
+            (TaskSlotLifecycle::WarmIdle | TaskSlotLifecycle::Finished, Some(ProjectRuntimeUse::Warmup)) => Ok(()),
+            (TaskSlotLifecycle::WarmIdle | TaskSlotLifecycle::Finished, Some(ProjectRuntimeUse::Turn { turn_id })) => {
+                *lifecycle = TaskSlotLifecycle::TurnActive {
+                    turn_id: turn_id.clone(),
+                };
+                Ok(())
+            }
+            (TaskSlotLifecycle::TurnActive { .. }, Some(ProjectRuntimeUse::Warmup)) => Ok(()),
+            (TaskSlotLifecycle::TurnActive { turn_id: active }, Some(ProjectRuntimeUse::Turn { turn_id }))
+                if active == turn_id =>
+            {
+                Ok(())
+            }
+            (TaskSlotLifecycle::FailedEmpty, requested_use) => {
+                *lifecycle = TaskSlotLifecycle::Building(requested_use.cloned());
+                Ok(())
+            }
+            (TaskSlotLifecycle::Invalidated, _) => Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED")),
+            _ => Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT")),
+        }
+    }
+
+    fn mark_ready(&self) {
+        if let Ok(mut lifecycle) = self.lifecycle.lock()
+            && let TaskSlotLifecycle::Building(runtime_use) = &*lifecycle
+        {
+            let runtime_use = runtime_use.clone();
+            *lifecycle = match runtime_use {
+                None => TaskSlotLifecycle::Ready,
+                Some(ProjectRuntimeUse::Warmup) => TaskSlotLifecycle::WarmIdle,
+                Some(ProjectRuntimeUse::Turn { turn_id }) => TaskSlotLifecycle::TurnActive { turn_id },
+            };
+        }
+    }
+
+    fn mark_failed(&self) {
+        if let Ok(mut lifecycle) = self.lifecycle.lock()
+            && matches!(*lifecycle, TaskSlotLifecycle::Building(_))
+        {
+            *lifecycle = TaskSlotLifecycle::FailedEmpty;
+        }
     }
 
     fn mark_invalidated(&self) {
-        self.invalidated.store(true, Ordering::Release);
+        if let Ok(mut lifecycle) = self.lifecycle.lock() {
+            *lifecycle = TaskSlotLifecycle::Invalidated;
+        }
     }
 
     fn is_invalidated(&self) -> bool {
-        self.invalidated.load(Ordering::Acquire)
+        self.lifecycle()
+            .is_ok_and(|lifecycle| lifecycle == TaskSlotLifecycle::Invalidated)
+    }
+
+    fn register_turn_holder(&self, permit_id: usize) -> Result<(), AgentError> {
+        self.turn_holders
+            .lock()
+            .map_err(|_| AgentError::internal("PROJECT_RUNTIME_LIFECYCLE_UNAVAILABLE"))?
+            .insert(permit_id);
+        Ok(())
+    }
+
+    fn release_turn_holder(&self, turn_id: &str, permit_id: usize) {
+        let no_holders = self
+            .turn_holders
+            .lock()
+            .map(|mut holders| {
+                holders.remove(&permit_id);
+                holders.is_empty()
+            })
+            .unwrap_or(false);
+        if no_holders
+            && let Ok(mut lifecycle) = self.lifecycle.lock()
+            && matches!(&*lifecycle, TaskSlotLifecycle::TurnActive { turn_id: active } if active == turn_id)
+        {
+            *lifecycle = TaskSlotLifecycle::Finished;
+        }
     }
 
     fn start_cleanup(&self) -> bool {
@@ -148,20 +283,25 @@ impl WorkerTaskManagerImpl {
         &self,
         conversation_id: &str,
         requested_context: Option<ProjectRuntimeContext>,
+        requested_use: Option<&ProjectRuntimeUse>,
     ) -> Result<SharedTaskSlot, AgentError> {
         use dashmap::mapref::entry::Entry;
 
         match self.tasks.entry(conversation_id.to_owned()) {
             Entry::Vacant(entry) => {
-                let slot = TaskSlot::new(requested_context, None);
+                let slot = TaskSlot::new(requested_context, requested_use.cloned(), None)?;
                 entry.insert(Arc::clone(&slot));
                 Ok(slot)
             }
             Entry::Occupied(mut entry) => {
                 let existing = Arc::clone(entry.get());
                 match (existing.project_runtime_context.as_ref(), requested_context.as_ref()) {
-                    (None, None) => return Ok(existing),
+                    (None, None) => {
+                        existing.admit_exact(None)?;
+                        return Ok(existing);
+                    }
                     (Some(previous), Some(requested)) if previous.same_runtime_as(requested) => {
+                        existing.admit_exact(requested_use)?;
                         return Ok(existing);
                     }
                     _ => {}
@@ -172,16 +312,34 @@ impl WorkerTaskManagerImpl {
                 else {
                     return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
                 };
-                let Some(agent) = existing.get() else {
-                    return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
-                };
-                if agent.status() != Some(ConversationStatus::Finished) || !requested.is_strictly_newer_than(previous) {
+                if !requested.is_strictly_newer_than(previous) {
                     return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
                 }
 
+                let prior_termination = match existing.lifecycle()? {
+                    TaskSlotLifecycle::Building(_) | TaskSlotLifecycle::TurnActive { .. } => {
+                        return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+                    }
+                    TaskSlotLifecycle::WarmIdle | TaskSlotLifecycle::Finished => {
+                        let Some(agent) = existing.get() else {
+                            return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+                        };
+                        if agent.status() == Some(ConversationStatus::Running) {
+                            return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+                        }
+                        existing.start_cleanup().then(|| agent.kill_and_wait(None))
+                    }
+                    TaskSlotLifecycle::FailedEmpty => None,
+                    TaskSlotLifecycle::Invalidated => {
+                        return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"));
+                    }
+                    TaskSlotLifecycle::Ready => {
+                        return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+                    }
+                };
+
                 existing.mark_invalidated();
-                let prior_termination = existing.start_cleanup().then(|| agent.kill_and_wait(None));
-                let replacement = TaskSlot::new(requested_context, prior_termination);
+                let replacement = TaskSlot::new(requested_context, requested_use.cloned(), prior_termination)?;
                 entry.insert(Arc::clone(&replacement));
                 Ok(replacement)
             }
@@ -201,36 +359,16 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
         let project_runtime = options.project_runtime_context.is_some();
-        let slot = self.select_slot(conversation_id, options.project_runtime_context.clone())?;
-
-        // `OnceCell::get_or_try_init` serialises concurrent initialisers:
-        // the first caller to reach it runs the factory, every other caller
-        // awaits the same future and ends up with the same instance. On
-        // failure the cell stays empty so a later caller can retry.
-        let factory = self.factory.clone();
-        let slot_for_initialisation = Arc::clone(&slot);
-        let instance = slot
-            .instance
-            .get_or_try_init(|| async move {
-                if let Some(prior_termination) = slot_for_initialisation.take_prior_termination()? {
-                    prior_termination.await;
-                }
-                factory(options).await
-            })
-            .await
-            .map_err(|error| match error {
-                AgentError::WorkspacePathRuntimeUnavailable(_) if project_runtime => {
-                    AgentError::bad_request("PROJECT_RUNTIME_PATH_UNAVAILABLE")
-                }
-                other => other,
-            })?;
-        if slot.is_invalidated() {
-            if slot.start_cleanup() {
-                let _ = instance.kill(None);
+        let project_execution = match (&options.project_runtime_context, &options.project_runtime_execution) {
+            (Some(context), Some(permit)) if permit.matches(conversation_id, context) => Some(permit.clone()),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(AgentError::bad_request("PROJECT_RUNTIME_PERMIT_REQUIRED"));
             }
-            return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"));
-        }
-        Ok(instance.clone())
+            (Some(_), Some(_)) => return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED")),
+            (None, None) => None,
+        };
+        self.get_or_build_task_under_project_fence(conversation_id, options, project_runtime, project_execution)
+            .await
     }
 
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
@@ -247,7 +385,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                 info!(conversation_id = %id, ?reason, "Killing agent task");
             }
             slot.mark_invalidated();
-            if let Some(agent) = slot.get()
+            if let Some(agent) = slot.instance.get()
                 && slot.start_cleanup()
             {
                 agent.kill(reason)?;
@@ -274,7 +412,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                 info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
             }
             slot.mark_invalidated();
-            if let Some(agent) = slot.get()
+            if let Some(agent) = slot.instance.get()
                 && slot.start_cleanup()
             {
                 return agent.kill_and_wait(reason);
@@ -290,7 +428,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             if let Some((id, slot)) = self.tasks.remove(&key) {
                 info!(conversation_id = %id, "Clearing agent task");
                 slot.mark_invalidated();
-                if let Some(agent) = slot.get()
+                if let Some(agent) = slot.instance.get()
                     && slot.start_cleanup()
                 {
                     waits.push(agent.kill_and_wait(None));
@@ -334,6 +472,78 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                 }
             })
             .collect()
+    }
+}
+
+impl WorkerTaskManagerImpl {
+    async fn get_or_build_task_under_project_fence(
+        &self,
+        conversation_id: &str,
+        options: BuildTaskOptions,
+        project_runtime: bool,
+        project_execution: Option<ProjectRuntimeExecutionPermit>,
+    ) -> Result<AgentInstance, AgentError> {
+        let requested_use = project_execution
+            .as_ref()
+            .map(ProjectRuntimeExecutionPermit::runtime_use);
+        let slot = self.select_slot(conversation_id, options.project_runtime_context.clone(), requested_use)?;
+        if let Some(ProjectRuntimeUse::Turn { turn_id }) = requested_use {
+            let weak_slot = Arc::downgrade(&slot);
+            let turn_id = turn_id.clone();
+            let permit = project_execution
+                .as_ref()
+                .expect("requested use came from execution permit");
+            let permit_id = permit.identity();
+            let slot_id = slot.registration_id;
+            let registered = permit.register_release_callback(
+                slot_id,
+                Arc::new(move || {
+                    if let Some(slot) = weak_slot.upgrade() {
+                        slot.release_turn_holder(&turn_id, permit_id);
+                    }
+                }),
+            )?;
+            if registered {
+                slot.register_turn_holder(permit_id)?;
+            }
+        }
+
+        // `OnceCell::get_or_try_init` serialises concurrent initialisers:
+        // the first caller to reach it runs the factory, every other caller
+        // awaits the same future and ends up with the same instance. On
+        // failure the cell stays empty so a later caller can retry.
+        let factory = self.factory.clone();
+        let slot_for_initialisation = Arc::clone(&slot);
+        let instance = slot
+            .instance
+            .get_or_try_init(|| async move {
+                if let Some(prior_termination) = slot_for_initialisation.take_prior_termination()? {
+                    prior_termination.await;
+                }
+                factory(options).await
+            })
+            .await
+            .map_err(|error| match error {
+                AgentError::WorkspacePathRuntimeUnavailable(_) if project_runtime => {
+                    AgentError::bad_request("PROJECT_RUNTIME_PATH_UNAVAILABLE")
+                }
+                other => other,
+            });
+        let instance = match instance {
+            Ok(instance) => instance,
+            Err(error) => {
+                slot.mark_failed();
+                return Err(error);
+            }
+        };
+        if slot.is_invalidated() {
+            if slot.start_cleanup() {
+                let _ = instance.kill(None);
+            }
+            return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"));
+        }
+        slot.mark_ready();
+        Ok(instance.clone())
     }
 }
 
@@ -463,6 +673,7 @@ mod tests {
                 path: "/tmp/test".into(),
                 stored_path: "/tmp/test".into(),
                 is_custom: true,
+                project_environment_hint: None,
             },
             model: ProviderWithModel {
                 provider_id: "p1".into(),
@@ -490,6 +701,8 @@ mod tests {
         ProjectRuntimeContext {
             runtime_fingerprint: runtime.to_owned(),
             environment_hint_fingerprint: hint.to_owned(),
+            project_binding_revision: 1,
+            process_runtime_generation: 1,
             backend_generation: format!("bg1:{backend_generation}"),
             root_catalog_revision: root_generation,
             root_ownership_revision: root_generation,
@@ -504,12 +717,17 @@ mod tests {
         root_generation: u64,
         backend_generation: u64,
     ) -> BuildTaskOptions {
-        BuildTaskOptions::new(make_options(conversation_id).context).with_project_runtime_context(project_context(
-            runtime,
-            hint,
-            root_generation,
-            backend_generation,
-        ))
+        let context = project_context(runtime, hint, root_generation, backend_generation);
+        let permit = ProjectRuntimeExecutionPermit::test_only(
+            conversation_id,
+            &context,
+            ProjectRuntimeUse::Turn {
+                turn_id: "test-turn".to_owned(),
+            },
+        );
+        BuildTaskOptions::new(make_options(conversation_id).context)
+            .with_project_runtime_context(context)
+            .with_project_runtime_execution(permit)
     }
 
     fn mock_instance(agent: MockAgent) -> AgentInstance {
@@ -622,9 +840,19 @@ mod tests {
     #[tokio::test]
     async fn project_task_rejects_context_change_while_active() {
         let mgr = make_manager();
+        let active_context = project_context("runtime-a", "hint-a", 1, 1);
+        let active_permit = ProjectRuntimeExecutionPermit::test_only(
+            "conv-project",
+            &active_context,
+            ProjectRuntimeUse::Turn {
+                turn_id: "active-turn".to_owned(),
+            },
+        );
         mgr.get_or_build_task(
             "conv-project",
-            make_project_options("conv-project", "runtime-a", "hint-a", 1, 1),
+            BuildTaskOptions::new(make_options("conv-project").context)
+                .with_project_runtime_context(active_context)
+                .with_project_runtime_execution(active_permit.clone()),
         )
         .await
         .unwrap();
@@ -637,6 +865,7 @@ mod tests {
             .await,
         );
         assert!(matches!(error, AgentError::Conflict(reason) if reason == "PROJECT_RUNTIME_CONTEXT_CONFLICT"));
+        drop(active_permit);
     }
 
     #[tokio::test]
@@ -871,6 +1100,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_turn_permit_rebinds_release_callback_after_kill_and_rebuild() {
+        let mgr = make_manager();
+        let context = project_context("runtime-a", "hint-a", 1, 1);
+        let permit = ProjectRuntimeExecutionPermit::test_only(
+            "conv-project",
+            &context,
+            ProjectRuntimeUse::Turn {
+                turn_id: "turn-replay".to_owned(),
+            },
+        );
+        let options = || {
+            BuildTaskOptions::new(make_options("conv-project").context)
+                .with_project_runtime_context(context.clone())
+                .with_project_runtime_execution(permit.clone())
+        };
+
+        mgr.get_or_build_task("conv-project", options()).await.unwrap();
+        let first_registration_id = mgr.tasks.get("conv-project").unwrap().registration_id;
+        assert!(matches!(
+            mgr.tasks.get("conv-project").unwrap().lifecycle().unwrap(),
+            TaskSlotLifecycle::TurnActive { ref turn_id } if turn_id == "turn-replay"
+        ));
+
+        mgr.kill("conv-project", None).unwrap();
+        mgr.get_or_build_task("conv-project", options()).await.unwrap();
+        let second_registration_id = mgr.tasks.get("conv-project").unwrap().registration_id;
+        assert_ne!(first_registration_id, second_registration_id);
+        assert!(matches!(
+            mgr.tasks.get("conv-project").unwrap().lifecycle().unwrap(),
+            TaskSlotLifecycle::TurnActive { ref turn_id } if turn_id == "turn-replay"
+        ));
+
+        drop(permit);
+        assert_eq!(
+            mgr.tasks.get("conv-project").unwrap().lifecycle().unwrap(),
+            TaskSlotLifecycle::Finished
+        );
+    }
+
+    #[tokio::test]
     async fn project_factory_workspace_error_is_pathless_but_legacy_error_is_preserved() {
         let secret_path = "/private/seat-owner/project-alpha";
         let factory: AgentFactory = Arc::new(move |_| {
@@ -987,6 +1256,15 @@ mod tests {
         assert!(mgr.kill("nothing", None).is_ok());
     }
 
+    #[test]
+    fn task_slot_registration_id_exhaustion_fails_closed() {
+        let exhausted = AtomicU64::new(u64::MAX);
+        assert!(matches!(
+            allocate_task_slot_registration_id(&exhausted),
+            Err(AgentError::Internal(reason)) if reason == "PROJECT_RUNTIME_LIFECYCLE_EXHAUSTED"
+        ));
+    }
+
     #[tokio::test]
     async fn clear_removes_all() {
         let mgr = make_manager();
@@ -1005,8 +1283,9 @@ mod tests {
 
         // Helper: insert a pre-initialised slot bypassing the async factory path.
         let insert = |id: &str, instance: AgentInstance| {
-            let slot = TaskSlot::new(None, None);
+            let slot = TaskSlot::new(None, None, None).unwrap();
             slot.instance.set(instance).ok();
+            slot.mark_ready();
             mgr.tasks.insert(id.into(), slot);
         };
 
@@ -1058,8 +1337,9 @@ mod tests {
         let now = now_ms();
         let agent =
             Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)).with_last_activity(now - 10_000));
-        let slot = TaskSlot::new(None, None);
+        let slot = TaskSlot::new(None, None, None).unwrap();
         assert!(slot.instance.set(AgentInstance::Mock(agent)).is_ok());
+        slot.mark_ready();
         manager.tasks.insert("conv_idle".to_owned(), slot);
 
         let captured = capture_logs(tracing::Level::INFO, || {
@@ -1082,8 +1362,9 @@ mod tests {
             async { Err(AgentError::bad_gateway("not used")) }.boxed()
         }));
         let agent = Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)));
-        let slot = TaskSlot::new(None, None);
+        let slot = TaskSlot::new(None, None, None).unwrap();
         assert!(slot.instance.set(AgentInstance::Mock(agent)).is_ok());
+        slot.mark_ready();
         manager.tasks.insert("conv_idle".to_owned(), slot);
 
         let captured = capture_logs(tracing::Level::INFO, || {

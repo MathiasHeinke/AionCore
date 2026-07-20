@@ -535,6 +535,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 path: workspace.clone(),
                 stored_path: workspace,
                 is_custom: false,
+                project_environment_hint: None,
             },
             model: ProviderWithModel {
                 provider_id,
@@ -1125,6 +1126,7 @@ fn test_acp_build_options(conversation_id: String, workspace: String) -> BuildTa
             path: workspace.clone(),
             stored_path: workspace,
             is_custom: true,
+            project_environment_hint: None,
         },
         model: ProviderWithModel {
             provider_id: "test".into(),

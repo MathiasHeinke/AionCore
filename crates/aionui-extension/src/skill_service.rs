@@ -1264,47 +1264,92 @@ pub async fn link_workspace_skills(
     skills_rel_dirs: &[&str],
     skills: &[ResolvedAgentSkill],
 ) -> Result<usize, ExtensionError> {
+    link_workspace_skills_inner(workspace, skills_rel_dirs, skills, false).await
+}
+
+/// Project-runtime variant whose logs and returned errors never contain the
+/// transient workspace path.
+pub async fn link_project_workspace_skills(
+    workspace: &Path,
+    skills_rel_dirs: &[&str],
+    skills: &[ResolvedAgentSkill],
+) -> Result<usize, ExtensionError> {
+    link_workspace_skills_inner(workspace, skills_rel_dirs, skills, true).await
+}
+
+async fn link_workspace_skills_inner(
+    workspace: &Path,
+    skills_rel_dirs: &[&str],
+    skills: &[ResolvedAgentSkill],
+    project_private: bool,
+) -> Result<usize, ExtensionError> {
     let mut created = 0usize;
     for rel in skills_rel_dirs {
         let target_skills_dir = resolve_workspace_skills_dir(workspace, rel).await;
-        tokio::fs::create_dir_all(&target_skills_dir).await?;
+        if let Err(error) = tokio::fs::create_dir_all(&target_skills_dir).await {
+            if project_private {
+                warn!(error_kind = ?error.kind(), "project skill link directory creation failed");
+                return Err(ExtensionError::Internal("PROJECT_SKILL_LINK_FAILED".to_owned()));
+            }
+            return Err(error.into());
+        }
 
         for skill in skills {
             let target = target_skills_dir.join(&skill.name);
-            match tokio::fs::symlink_metadata(&target).await {
+            match symlink_metadata_for_link(&target).await {
                 // Target already exists — leave it alone.
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    warn!(
-                        target = %target.display(),
-                        error = %e,
-                        "skipping skill link: failed to stat target"
-                    );
+                    if project_private {
+                        warn!(skill = %skill.name, error_kind = ?e.kind(), "skipping project skill link: stat failed");
+                    } else {
+                        warn!(target = %target.display(), error = %e, "skipping skill link: failed to stat target");
+                    }
                     continue;
                 }
             }
-            match link_skill_or_fallback_copy(&skill.source_path, &target).await {
+            match link_skill_or_fallback_copy(&skill.source_path, &target, project_private).await {
                 Ok(()) => {
-                    debug!(
-                        skill = %skill.name,
-                        target = %target.display(),
-                        "linked workspace skill"
-                    );
+                    if project_private {
+                        debug!(skill = %skill.name, "linked project workspace skill");
+                    } else {
+                        debug!(skill = %skill.name, target = %target.display(), "linked workspace skill");
+                    }
                     created += 1;
                 }
                 Err(e) => {
-                    warn!(
-                        skill = %skill.name,
-                        target = %target.display(),
-                        error = %e,
-                        "failed to link workspace skill"
-                    );
+                    if project_private {
+                        warn!(
+                            skill = %skill.name,
+                            error_kind = extension_error_kind(&e),
+                            "failed to link project workspace skill"
+                        );
+                    } else {
+                        warn!(skill = %skill.name, target = %target.display(), error = %e, "failed to link workspace skill");
+                    }
                 }
             }
         }
     }
     Ok(created)
+}
+
+async fn symlink_metadata_for_link(path: &Path) -> io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    if test_overrides::should_force_stat_failure() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "forced stat failure"));
+    }
+    tokio::fs::symlink_metadata(path).await
+}
+
+fn extension_error_kind(error: &ExtensionError) -> &'static str {
+    match error {
+        ExtensionError::Io(_) => "io",
+        ExtensionError::Internal(_) => "internal",
+        ExtensionError::Db(_) => "db",
+        _ => "extension",
+    }
 }
 
 async fn resolve_workspace_skills_dir(workspace: &Path, skills_rel_dir: &str) -> PathBuf {
@@ -2036,7 +2081,7 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ExtensionError
 /// user-identifying data is logged — only the source/target paths
 /// (already considered safe to log elsewhere in this module) and the
 /// error code.
-async fn link_skill_or_fallback_copy(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
+async fn link_skill_or_fallback_copy(src: &Path, dst: &Path, project_private: bool) -> Result<(), ExtensionError> {
     match create_symlink_for_link(src, dst).await {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -2046,13 +2091,21 @@ async fn link_skill_or_fallback_copy(src: &Path, dst: &Path) -> Result<(), Exten
                 ExtensionError::Io(io_err) => io_err.raw_os_error(),
                 _ => None,
             };
-            warn!(
-                src = %src.display(),
-                dst = %dst.display(),
-                error = %e,
-                raw_os_error = ?raw_os_error,
-                "create_symlink failed; falling back to copy_dir_recursive"
-            );
+            if project_private {
+                warn!(
+                    error_kind = extension_error_kind(&e),
+                    raw_os_error = ?raw_os_error,
+                    "project skill symlink failed; falling back to copy"
+                );
+            } else {
+                warn!(
+                    src = %src.display(),
+                    dst = %dst.display(),
+                    error = %e,
+                    raw_os_error = ?raw_os_error,
+                    "create_symlink failed; falling back to copy_dir_recursive"
+                );
+            }
             copy_dir_recursive(src, dst).await
         }
     }
@@ -2085,9 +2138,14 @@ mod test_overrides {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static FORCE_SYMLINK_FAILURE: AtomicBool = AtomicBool::new(false);
+    static FORCE_STAT_FAILURE: AtomicBool = AtomicBool::new(false);
 
     pub fn should_force_symlink_failure() -> bool {
         FORCE_SYMLINK_FAILURE.load(Ordering::SeqCst)
+    }
+
+    pub fn should_force_stat_failure() -> bool {
+        FORCE_STAT_FAILURE.load(Ordering::SeqCst)
     }
 
     /// RAII guard that flips `FORCE_SYMLINK_FAILURE` on creation and
@@ -2107,6 +2165,21 @@ mod test_overrides {
     impl Drop for ForceFailureGuard {
         fn drop(&mut self) {
             FORCE_SYMLINK_FAILURE.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub struct ForceStatFailureGuard;
+
+    impl ForceStatFailureGuard {
+        pub fn new() -> Self {
+            FORCE_STAT_FAILURE.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for ForceStatFailureGuard {
+        fn drop(&mut self) {
+            FORCE_STAT_FAILURE.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -2151,8 +2224,38 @@ async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
 mod tests {
     use super::*;
     use aionui_db::{ISkillRepository, SqliteSkillRepository, init_database_memory};
+    use std::future::Future;
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tracing::instrument::WithSubscriber as _;
+
+    async fn capture_logs<F: Future>(future: F) -> (F::Output, String) {
+        #[derive(Clone)]
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedWriter {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || SharedWriter(Arc::clone(&writer)))
+            .finish();
+        let result = future.with_subscriber(subscriber).await;
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
 
     // -----------------------------------------------------------------------
     // Frontmatter parsing
@@ -3516,6 +3619,67 @@ mod tests {
         assert!(manifest.contains("name: my-skill"));
         let nested = std::fs::read_to_string(target.join("nested").join("data.txt")).unwrap();
         assert_eq!(nested, "payload");
+    }
+
+    #[tokio::test]
+    async fn project_skill_link_logs_are_pathless_on_success_stat_link_and_create_dir_failures() {
+        let tmp = TempDir::new().unwrap();
+        let secret_workspace = tmp.path().join("private-project-workspace");
+        let source_root = tmp.path().join("private-sources");
+        let resolved = vec![create_resolved_test_skill(&source_root, "my-skill")];
+
+        let (success, success_logs) = capture_logs(link_project_workspace_skills(
+            &secret_workspace,
+            &[".claude/skills"],
+            &resolved,
+        ))
+        .await;
+        assert_eq!(success.unwrap(), 1);
+        assert!(!success_logs.contains(secret_workspace.to_string_lossy().as_ref()));
+        assert!(!success_logs.contains(source_root.to_string_lossy().as_ref()));
+
+        let stat_workspace = tmp.path().join("private-stat-workspace");
+        let stat_guard = test_overrides::ForceStatFailureGuard::new();
+        let (stat_result, stat_logs) = capture_logs(link_project_workspace_skills(
+            &stat_workspace,
+            &[".claude/skills"],
+            &resolved,
+        ))
+        .await;
+        drop(stat_guard);
+        assert_eq!(stat_result.unwrap(), 0);
+        assert!(!stat_logs.contains(stat_workspace.to_string_lossy().as_ref()));
+        assert!(!stat_logs.contains(source_root.to_string_lossy().as_ref()));
+
+        let missing_source = tmp.path().join("private-missing-source");
+        let unresolved = vec![ResolvedAgentSkill {
+            name: "missing".to_owned(),
+            source_path: missing_source.clone(),
+        }];
+        let link_workspace = tmp.path().join("private-link-workspace");
+        let link_guard = test_overrides::ForceFailureGuard::new();
+        let (link_result, link_logs) = capture_logs(link_project_workspace_skills(
+            &link_workspace,
+            &[".claude/skills"],
+            &unresolved,
+        ))
+        .await;
+        drop(link_guard);
+        assert_eq!(link_result.unwrap(), 0);
+        assert!(!link_logs.contains(link_workspace.to_string_lossy().as_ref()));
+        assert!(!link_logs.contains(missing_source.to_string_lossy().as_ref()));
+
+        let blocked_workspace = tmp.path().join("private-create-workspace");
+        std::fs::write(&blocked_workspace, "not a directory").unwrap();
+        let (create_result, create_logs) = capture_logs(link_project_workspace_skills(
+            &blocked_workspace,
+            &[".claude/skills"],
+            &resolved,
+        ))
+        .await;
+        assert!(matches!(create_result, Err(ExtensionError::Internal(code)) if code == "PROJECT_SKILL_LINK_FAILED"));
+        assert!(!create_logs.contains(blocked_workspace.to_string_lossy().as_ref()));
+        assert!(!create_logs.contains(source_root.to_string_lossy().as_ref()));
     }
 
     #[tokio::test]

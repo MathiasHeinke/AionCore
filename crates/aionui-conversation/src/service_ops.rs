@@ -18,9 +18,11 @@ use aionui_common::{AgentKillReason, ErrorChain};
 use tracing::warn;
 
 use crate::ConversationError;
+use crate::project_workspace::project_binding_revision;
 use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 
 const MAX_DIR_DEPTH: usize = 10;
+const RUNTIME_IDENTITY_PERSISTENCE_FAILED: &str = "RUNTIME_IDENTITY_PERSISTENCE_FAILED";
 
 impl ConversationService {
     // ── Config Options ──────────────────────────────────────────────
@@ -51,23 +53,64 @@ impl ConversationService {
                 reason: "value must not be empty".into(),
             });
         }
+
+        let runtime_identity_option = matches!(option_id, "model" | "mode");
+        let _runtime_identity_mutation = if runtime_identity_option {
+            Some(
+                self.runtime_state()
+                    .try_claim_runtime_identity_mutation(conversation_id)?,
+            )
+        } else {
+            None
+        };
+        let project_mutation = if runtime_identity_option {
+            Some(self.project_runtime_epochs().try_begin_mutation(conversation_id)?)
+        } else {
+            None
+        };
+        let project_revision = if runtime_identity_option {
+            let row = self
+                .conversation_repo()
+                .get(conversation_id)
+                .await
+                .map_err(|error| ConversationError::internal(format!("Failed to load conversation: {error}")))?
+                .ok_or_else(|| ConversationError::NotFound {
+                    id: conversation_id.to_owned(),
+                })?;
+            let extra: serde_json::Value = serde_json::from_str(&row.extra)
+                .map_err(|error| ConversationError::internal(format!("Invalid extra JSON: {error}")))?;
+            Some(project_binding_revision(&extra)?)
+        } else {
+            None
+        };
+
         let agent = self.task(conversation_id)?;
         let response = match agent.set_config_option(option_id, &req.value).await {
             Ok(response) => response,
-            Err(err @ AgentError::Acp(AcpError::NotConnected)) => {
-                warn!(
-                    conversation_id,
-                    option_id,
-                    reason = ?AgentKillReason::AgentErrorRecovery,
-                    error = %ErrorChain(&err),
-                    "ACP config option failed because protocol is disconnected; evicting task"
-                );
-                self.task_manager()
-                    .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
-                    .await;
+            Err(err) => {
+                let kill_reason = matches!(&err, AgentError::Acp(AcpError::NotConnected))
+                    .then_some(AgentKillReason::AgentErrorRecovery);
+                if kill_reason.is_some() {
+                    warn!(
+                        conversation_id,
+                        option_id,
+                        reason = ?kill_reason,
+                        error = %ErrorChain(&err),
+                        "ACP config option failed because protocol is disconnected; evicting task"
+                    );
+                }
+                if let Some(mutation) = project_mutation.as_ref() {
+                    let commit = mutation.commit_runtime_identity(
+                        project_revision.expect("runtime identity options load a project revision"),
+                        true,
+                    );
+                    self.task_manager().kill_and_wait(conversation_id, kill_reason).await;
+                    commit?;
+                } else if kill_reason.is_some() {
+                    self.task_manager().kill_and_wait(conversation_id, kill_reason).await;
+                }
                 return Err(ConversationError::from(err));
             }
-            Err(err) => return Err(ConversationError::from(err)),
         };
 
         // Mirror runtime model/mode switches into the persisted assistant
@@ -76,8 +119,9 @@ impl ConversationService {
         // observed confirmations — `command_ack` means the agent merely
         // accepted the request, not that the value is in effect, and
         // unrelated option ids (e.g. `thought_level`) have no preference
-        // mapping. Persistence failures are logged but do not roll back the
-        // user-facing config switch.
+        // mapping. A persistence failure cannot roll back the already-observed
+        // agent mutation, so publish the new generation, evict that task, and
+        // fail closed instead of reporting a durable success.
         if response.confirmation == ConfigOptionConfirmation::Observed {
             let updates = match option_id {
                 "model" => Some(AssistantRuntimePreferenceUpdate {
@@ -91,7 +135,18 @@ impl ConversationService {
                 _ => None,
             };
             if let Some(updates) = updates {
+                if let Some(mutation) = project_mutation.as_ref()
+                    && let Err(error) = mutation.commit_runtime_identity(
+                        project_revision.expect("runtime identity options load a project revision"),
+                        true,
+                    )
+                {
+                    self.task_manager().kill_and_wait(conversation_id, None).await;
+                    return Err(error.into());
+                }
+                let mut persistence_failed = false;
                 if let Err(err) = self.persist_runtime_assistant_snapshot(conversation_id, updates).await {
+                    persistence_failed = true;
                     warn!(
                         conversation_id,
                         option_id,
@@ -103,12 +158,17 @@ impl ConversationService {
                     .persist_runtime_assistant_preferences(conversation_id, updates)
                     .await
                 {
+                    persistence_failed = true;
                     warn!(
                         conversation_id,
                         option_id,
                         error = %ErrorChain(&err),
                         "Failed to persist runtime assistant preferences after set_config_option",
                     );
+                }
+                if persistence_failed {
+                    self.task_manager().kill_and_wait(conversation_id, None).await;
+                    return Err(ConversationError::internal(RUNTIME_IDENTITY_PERSISTENCE_FAILED));
                 }
             }
         }

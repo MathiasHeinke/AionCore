@@ -28,7 +28,7 @@ pub use local_capability::sign_local_capability_attestation;
 pub use local_capability::{LocalCapabilityError, LocalCapabilityVerifier};
 pub use project_runtime_attestation::{
     DEFAULT_PROJECT_RUNTIME_NONCE_CAPACITY, ProjectRuntimeAttestationError, ProjectRuntimeAttestationPurpose,
-    ProjectRuntimeAttestationVerifier, VerifiedProjectRuntimeAttestation,
+    ProjectRuntimeAttestationVerifier, ProjectRuntimeVerificationExpectation, VerifiedProjectRuntimeAttestation,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use project_runtime_attestation::{
