@@ -341,6 +341,13 @@ impl AcpSession {
     /// request is awaited. Unlike generic ACP mode selection, the policy is
     /// validated against AionCore's four-mode contract rather than Hermes'
     /// deliberately pinned transport catalog.
+    /// Mode of an outstanding policy request, if one is waiting for its transport ack.
+    /// Used by the reconcile path to detect that a human asked for something else while
+    /// it was in flight.
+    pub(crate) fn command_eve_pending_mode(&self) -> Option<PermissionMode> {
+        self.command_eve_policy.pending_mode()
+    }
+
     pub(crate) fn request_command_eve_policy(&mut self, mode: ModeId) -> Result<(), PolicyGateError> {
         let Some(permission_mode) = PermissionMode::parse(mode.as_str()) else {
             self.command_eve_policy.revoke();
