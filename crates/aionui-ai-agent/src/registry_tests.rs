@@ -173,7 +173,7 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
         name_i18n: None,
         description: None,
         description_i18n: None,
-        backend: Some("custom".into()),
+        backend: Some("custom"),
         agent_type: "acp",
         agent_source: "custom",
         agent_source_info: Some(r#"{"binary_name":"definitely-missing-cli"}"#),
