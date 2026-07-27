@@ -254,11 +254,17 @@ fn tampered_classification_and_mode_fields_cannot_elevate_unknown_operation() {
     // Stated directly instead of implied by an equality assertion.
     assert_ne!(decision, AuthorityDecision::Allow);
 
-    // An unplaceable execute is now gated on the conversation OWNER rather than on a
-    // card any participant can confirm — strictly narrower than the previous plain
-    // `Ask`, so the anti-elevation invariant above is strengthened, not weakened.
+    // An unplaceable execute now carries its required authority on the decision.
     // (`python3 -c '…'` carries shell quoting and matches none of the escalation
     // lists, so it is exactly the unclassifiable-execute case.)
+    //
+    // This assertion pins the DECISION VALUE, not an enforced gate. An earlier version
+    // of this comment claimed the card was "gated on the conversation OWNER" — that was
+    // wrong and an independent review caught it: `confirm_result` refuses `AllowOnce`
+    // only for `RequireAuthority`, `Block` and `Unsupported`, and receives no principal,
+    // so any participant can still confirm. The real invariant of this test is the
+    // `assert_ne!(…, Allow)` above; this line guards the value that a future owner
+    // enforcement would key on.
     assert_eq!(decision, AuthorityDecision::AskWithOwner(RequiredAuthority::User));
 }
 

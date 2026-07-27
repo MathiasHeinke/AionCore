@@ -461,10 +461,17 @@ impl TrustedClassification {
     /// An EXECUTE operation the trusted classifier could not place.
     ///
     /// Deliberately not the same as a bare `Unknown`: an unclassifiable command must
-    /// never end up BELOW the gate of a classified one. It stays `Unknown` (so it can
-    /// never be auto-allowed and stays `Unsupported` under Guarded), but carries owner
-    /// authority so `decide` surfaces it as `AskWithOwner(User)` rather than a card any
-    /// conversation participant can confirm.
+    /// never end up BELOW the gate of a classified one. It stays `Unknown`, so it can
+    /// never be auto-allowed and stays `Unsupported` under Guarded, and it carries
+    /// owner authority so `decide` surfaces it as `AskWithOwner(User)`.
+    ///
+    /// HONEST SCOPE — `AskWithOwner` is METADATA, not an enforced gate. An independent
+    /// review found the earlier wording here overstated it: `confirm_result` refuses an
+    /// `AllowOnce` confirmation only for `RequireAuthority`, `Block` and `Unsupported`
+    /// (`permission_router.rs`), and it takes no principal at all, so any conversation
+    /// participant can still confirm this card. Enforcing the owner needs the principal
+    /// plumbed into `confirm_result` — a design change, tracked separately. What IS
+    /// guaranteed today: the class stays `Unknown`, so no auto-allow and no grant.
     pub fn unclassified_execute() -> Self {
         Self {
             class: OperationClass::Unknown,
@@ -506,9 +513,10 @@ pub fn decide(input: DecisionInput) -> PermissionDecision {
             PermissionDecision::Unsupported
         } else if let Some(required) = input.classification.required_authority {
             // An unplaceable EXECUTE (see `TrustedClassification::unclassified_execute`)
-            // keeps owner authority instead of collapsing to a card any participant can
-            // confirm. Strictly narrower than the previous plain `Ask`; edits and a
-            // disabled trusted classifier still take the `Ask` path below.
+            // is surfaced with its required authority attached. NOTE: today that is a
+            // metadata distinction only — `confirm_result` does not treat `AskWithOwner`
+            // differently from `Ask`, so this does not yet narrow WHO may confirm.
+            // Edits and a disabled trusted classifier take the plain `Ask` path below.
             PermissionDecision::AskWithOwner(required)
         } else {
             PermissionDecision::Ask
