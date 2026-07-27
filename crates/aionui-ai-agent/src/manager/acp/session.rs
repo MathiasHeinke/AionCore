@@ -71,6 +71,12 @@ pub struct AcpSession {
     /// Persisted preload data is preference input and must never acknowledge a
     /// policy by itself.
     runtime_mode_attested: bool,
+    /// The config selections this session was CONSTRUCTED with, i.e. the persisted
+    /// boot snapshot. Same doctrine as `runtime_mode_attested` one field up, applied
+    /// to the config lane: a preference restored from disk is input, never authority.
+    /// `migrate_command_eve_mode_config_intent` uses it to tell a frozen pre-C7 value
+    /// apart from one the operator set in this session.
+    boot_config_selections: HashMap<ConfigKey, ConfigValue>,
     config_set_in_flight: bool,
     pending_events: Vec<AcpSessionEvent>,
     /// Whether `open_session_new` has just completed and the next prompt
@@ -136,6 +142,7 @@ impl AcpSession {
             session_id: None,
             opened: false,
             pending_session_new_prelude: false,
+            boot_config_selections: config_selections.clone(),
             desired: Desired {
                 mode_id: initial_mode,
                 model_id: initial_model,
@@ -498,8 +505,16 @@ impl AcpSession {
             .collect::<Vec<_>>();
         let mut selected = None;
         let mut changed = false;
+        let mut clamped_boot_value = false;
         for key in mode_keys {
             if let Some(value) = self.desired.config_selections.remove(&key) {
+                // Only a value that is STILL the one the boot snapshot carried counts as
+                // restored-from-disk. Anything the operator set in this session has since
+                // overwritten it and is a deliberate choice.
+                clamped_boot_value = self
+                    .boot_config_selections
+                    .get(&key)
+                    .is_some_and(|boot| boot.as_str() == value.as_str());
                 selected = Some(ModeId::new(value.as_str()));
                 changed = true;
             }
@@ -509,11 +524,40 @@ impl AcpSession {
                 selections: self.desired.config_selections.clone(),
             });
         }
-        let Some(mode) = selected else {
+        let Some(migrated) = selected else {
             return Ok(None);
         };
-        self.request_command_eve_policy(mode.clone())?;
-        Ok(Some(mode))
+
+        // P1 (independent review, Kimi): a mode value that came from the BOOT SNAPSHOT
+        // must not be adopted as policy.
+        //
+        // `desired.config_selections` is seeded at boot from the persisted snapshot, and
+        // that snapshot is only ever written by `ObservedConfigSynced` — so on an upgraded
+        // install it still holds whatever a pre-1820 build froze there (e.g. `dont_ask`).
+        // Adopting it reinstalled a wider policy on the first boot after upgrade with no
+        // fresh user interaction, defeating the sibling fail-closed boot in
+        // `initial_mode_from_params`.
+        //
+        // A value the operator set IN THIS SESSION is a different thing and still applies:
+        // only keys that arrived with the boot snapshot AND were never rewritten since are
+        // clamped. The migration itself — getting the key out of the config lane — happens
+        // either way.
+        let adopted = if clamped_boot_value {
+            let fallback = ModeId::new(PermissionMode::Default.as_str());
+            if migrated.as_str() != fallback.as_str() {
+                tracing::info!(
+                    migrated = %migrated.as_str(),
+                    "Command EVE: a mode config key from the boot snapshot was migrated out of \
+                     the config lane but its value was NOT adopted; policy stays fail-closed at \
+                     default until the operator chooses"
+                );
+            }
+            fallback
+        } else {
+            migrated
+        };
+        self.request_command_eve_policy(adopted.clone())?;
+        Ok(Some(adopted))
     }
 
     fn clear_legacy_desired_for_config_category(&mut self, category: &SessionConfigOptionCategory) {

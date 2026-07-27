@@ -1427,6 +1427,64 @@ fn command_eve_persisted_mode_config_migrates_to_set_mode_once_and_never_set_con
     );
 }
 
+/// Companion to the test above, and the reason it still passes unchanged.
+///
+/// The sibling case migrates a mode preference the operator sets IN THIS SESSION, and its
+/// value is adopted. Here the very same key arrives from the persisted BOOT SNAPSHOT — the
+/// upgrade path, where `config_selections` still carries whatever a pre-C7 build froze
+/// (only `ObservedConfigSynced` ever writes that column). Adopting it would reinstall a
+/// wider policy on the first boot after upgrade with no fresh user interaction, and would
+/// defeat the fail-closed boot in `initial_mode_from_params`.
+///
+/// So: the key is still migrated OUT of the config lane, but its value is NOT adopted.
+#[test]
+fn command_eve_mode_config_from_boot_snapshot_migrates_without_adopting_its_value() {
+    let mut session = AcpSession::new(
+        Some(ModeId::new("default")),
+        None,
+        HashMap::from([(ConfigKey::new("permission_profile"), ConfigValue::new("dont_ask"))]),
+    );
+    assert!(session.apply_command_eve_runtime_hello(RuntimeCapabilityReceipt::test_receipt()));
+    assert!(session.apply_command_eve_transport_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Ask")],
+    )));
+    session.set_session_id(SessionId::new("boot-snapshot-mode"));
+    session.acknowledge_command_eve_policy(ModeId::new("default")).unwrap();
+    session.apply_command_eve_advertised_config_options(vec![
+        agent_client_protocol::schema::SessionConfigOption::select(
+            "permission_profile",
+            "Permission Profile",
+            "default",
+            vec![
+                SessionConfigSelectOption::new("default", "Ask"),
+                SessionConfigSelectOption::new("dont_ask", "Auto"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Mode),
+    ]);
+
+    // Migrated, but clamped: the frozen `dont_ask` must not become the policy.
+    assert_eq!(
+        session.migrate_command_eve_mode_config_intent().unwrap(),
+        Some(ModeId::new("default")),
+        "a mode value restored from the boot snapshot must not be adopted as policy"
+    );
+    // The key still leaves the config lane — that is what the migration is for.
+    assert!(
+        !session
+            .desired_config_selections()
+            .contains_key(&ConfigKey::new("permission_profile"))
+    );
+    // And nothing is reconciled: the session was already at `default`, so clamping to
+    // `default` produces no transport call at all. Stronger than emitting a redundant
+    // SetMode — the frozen preference leaves no trace anywhere.
+    assert!(
+        session.plan_reconcile().is_empty(),
+        "clamping a boot-snapshot mode to the mode already in force must not drift"
+    );
+}
+
 #[test]
 fn pending_command_eve_change_cannot_republish_old_policy_on_transport_update() {
     let mut session = AcpSession::new(Some(ModeId::new("dont_ask")), None, HashMap::new());

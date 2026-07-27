@@ -184,6 +184,15 @@ fn initial_mode_from_params(params: &AcpSessionParams) -> Option<ModeId> {
         .map(ModeId::new)
 }
 
+/// KNOWN LIMITATION (independent review, Kimi): the `Mode` arm matches the literal key
+/// `"mode"`, while mode detection everywhere else is CATEGORY-based
+/// (`is_mode_config_option`, `ConfigOptionCatalog::is_mode_option`). A backend advertising
+/// its mode option under a different id therefore does not suppress the seed here.
+/// It cannot be fixed in place: this function only sees the config KEYS, not the advertised
+/// options that carry the category. Closing it properly means threading the advertised
+/// catalogue in — a change of its own, not a line.
+/// For the hermes backend the gap is moot since the mode seed is blocked outright
+/// (see `seed_startup_config_preferences`); it remains open for other backends.
 fn has_persisted_config_for_category(
     initial_config: &HashMap<ConfigKey, ConfigValue>,
     category: &SessionConfigOptionCategory,
@@ -206,12 +215,20 @@ fn seed_startup_config_preferences(
     params: &AcpSessionParams,
     initial_config: &HashMap<ConfigKey, ConfigValue>,
 ) {
+    // P1 (independent review, Kimi): the MODE seed is the third way a wider policy could
+    // reach hermes at boot without the operator choosing it in this session — after the
+    // persisted `current_mode_id` (closed in `initial_mode_from_params`) and the persisted
+    // `config_selections` (closed in `migrate_command_eve_mode_config_intent`). A launch
+    // config carrying `session_mode = dont_ask` ran straight through the same migration
+    // into the policy lane. Model and thought-level seeds are unaffected.
+    let seed_mode_allowed = params.metadata.backend.as_deref() != Some("hermes");
     if let Some(mode) = params
         .config
         .session_mode
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .filter(|_| seed_mode_allowed)
         .filter(|_| !has_persisted_config_for_category(initial_config, &SessionConfigOptionCategory::Mode))
     {
         session.seed_pending_startup_config(SessionConfigOptionCategory::Mode, ConfigValue::new(mode.to_owned()));
