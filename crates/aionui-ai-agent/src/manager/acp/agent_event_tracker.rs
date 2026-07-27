@@ -92,14 +92,35 @@ impl AcpAgentManager {
     async fn apply_event_to_session(&self, event: &AgentStreamEvent) {
         match event {
             AgentStreamEvent::AcpModeInfo(value) => {
+                let mut policy_snapshot = None;
+                let mut unsafe_command_eve_transport = false;
                 if let Ok(update) = serde_json::from_value::<SessionModeState>(value.clone()) {
                     let mut s = self.session.write().await;
-                    s.apply_advertised_modes(update);
+                    if self.backend() == Some("hermes") {
+                        unsafe_command_eve_transport = !s.apply_command_eve_transport_modes(update);
+                    } else {
+                        s.apply_advertised_modes(update);
+                    }
+                    policy_snapshot = s.command_eve_policy_snapshot();
                     self.commit_session_changes(&mut s).await;
                 } else if let Some(current_id) = value.get("currentModeId").and_then(|v: &Value| v.as_str()) {
                     let mut s = self.session.write().await;
-                    s.apply_observed_mode(ModeId::new(current_id));
+                    if self.backend() == Some("hermes") {
+                        unsafe_command_eve_transport = !s.apply_command_eve_transport_mode(ModeId::new(current_id));
+                    } else {
+                        s.apply_observed_mode(ModeId::new(current_id));
+                    }
+                    policy_snapshot = s.command_eve_policy_snapshot();
                     self.commit_session_changes(&mut s).await;
+                }
+                if self.backend() == Some("hermes")
+                    && let Some(snapshot) = policy_snapshot
+                {
+                    self.permission_router.apply_policy_snapshot(snapshot);
+                }
+                if unsafe_command_eve_transport {
+                    self.permission_router
+                        .revoke_command_eve_policy("live Hermes transport drifted from default");
                 }
             }
             AgentStreamEvent::AcpModelInfo(value) => {
@@ -112,7 +133,11 @@ impl AcpAgentManager {
             AgentStreamEvent::AcpConfigOption(value) => {
                 if let Some(update) = extract_config_options_from_value(value) {
                     let mut s = self.session.write().await;
-                    s.apply_advertised_config_options(update);
+                    if self.backend() == Some("hermes") {
+                        s.apply_command_eve_advertised_config_options(update);
+                    } else {
+                        s.apply_advertised_config_options(update);
+                    }
                     self.commit_session_changes(&mut s).await;
                 }
             }

@@ -11,6 +11,9 @@ use super::config_option_catalog::{
     derive_models_from_config_options, derive_modes_from_config_options, merge_config_options,
 };
 use super::config_options::ConfigSnapshot;
+use super::permission_authority::{
+    CommandEvePolicyState, PermissionMode, PolicyGateError, PolicySnapshot, RuntimeCapabilityReceipt,
+};
 use crate::protocol::error::CloseReason;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState, SessionId};
 
@@ -60,6 +63,14 @@ pub struct AcpSession {
     desired: Desired,
     observed: Observed,
     advertised: Advertised,
+    /// Command-EVE policy lives in the existing session aggregate. Hermes'
+    /// observed mode is transport state; this is the revisioned AionCore
+    /// authority acknowledged for the current session epoch.
+    command_eve_policy: CommandEvePolicyState,
+    /// True only after a mode arrived from a live ACP response/notification.
+    /// Persisted preload data is preference input and must never acknowledge a
+    /// policy by itself.
+    runtime_mode_attested: bool,
     config_set_in_flight: bool,
     pending_events: Vec<AcpSessionEvent>,
     /// Whether `open_session_new` has just completed and the next prompt
@@ -112,6 +123,10 @@ pub(crate) enum PendingStartupConfigSeedResult {
 }
 
 impl AcpSession {
+    pub(crate) fn apply_command_eve_runtime_hello(&mut self, receipt: RuntimeCapabilityReceipt) -> bool {
+        self.command_eve_policy.apply_runtime_hello(receipt)
+    }
+
     pub fn new(
         initial_mode: Option<ModeId>,
         initial_model: Option<ModelId>,
@@ -129,6 +144,8 @@ impl AcpSession {
             },
             observed: Observed::default(),
             advertised: Advertised::default(),
+            command_eve_policy: CommandEvePolicyState::default(),
+            runtime_mode_attested: false,
             config_set_in_flight: false,
             pending_events: Vec::new(),
             last_close_reason: None,
@@ -169,6 +186,25 @@ impl AcpSession {
             return;
         }
         self.session_id = Some(sid.clone());
+        self.command_eve_policy.begin_session();
+        if self.runtime_mode_attested
+            && let Some(mode) = self
+                .observed
+                .mode_id
+                .as_ref()
+                .and_then(|mode| PermissionMode::parse(mode.as_str()))
+        {
+            self.command_eve_policy.acknowledge_runtime_mode(mode);
+        }
+        if let Some(desired) = self
+            .desired
+            .mode_id
+            .as_ref()
+            .and_then(|mode| PermissionMode::parse(mode.as_str()))
+            && self.command_eve_policy.acknowledged().map(|snapshot| snapshot.mode) != Some(desired)
+        {
+            self.command_eve_policy.request_mode(desired);
+        }
         self.pending_events
             .push(AcpSessionEvent::SessionAssigned { session_id: sid });
     }
@@ -185,6 +221,8 @@ impl AcpSession {
         // A rebuilt session must not inherit the prior turn's close reason —
         // otherwise the next user-facing error would surface stale context.
         self.last_close_reason = None;
+        self.runtime_mode_attested = false;
+        self.command_eve_policy.revoke();
     }
 
     /// Record the reason the most recent turn closed. Overwrites any
@@ -285,8 +323,33 @@ impl AcpSession {
             return false;
         }
         self.desired.mode_id = Some(mode.clone());
+        if let Some(permission_mode) = PermissionMode::parse(mode.as_str()) {
+            self.command_eve_policy.request_mode(permission_mode);
+        }
         self.pending_events.push(AcpSessionEvent::DesiredModeChanged { mode });
         true
+    }
+
+    /// Start a Command EVE SetPolicy transition before the Hermes transport
+    /// request is awaited. Unlike generic ACP mode selection, the policy is
+    /// validated against AionCore's four-mode contract rather than Hermes'
+    /// deliberately pinned transport catalog.
+    pub(crate) fn request_command_eve_policy(&mut self, mode: ModeId) -> Result<(), PolicyGateError> {
+        let Some(permission_mode) = PermissionMode::parse(mode.as_str()) else {
+            self.command_eve_policy.revoke();
+            return Err(PolicyGateError::UnsupportedPermissionMode);
+        };
+        if !self.command_eve_policy.mode_available(permission_mode) {
+            self.command_eve_policy.revoke();
+            return Err(PolicyGateError::GuardedAutoUnavailable);
+        }
+        let changed = self.desired.mode_id.as_ref() != Some(&mode);
+        self.desired.mode_id = Some(mode.clone());
+        self.command_eve_policy.begin_mode_change(permission_mode);
+        if changed {
+            self.pending_events.push(AcpSessionEvent::DesiredModeChanged { mode });
+        }
+        Ok(())
     }
 
     /// Set the user's desired model. Emits `DesiredModelChanged` if the
@@ -329,6 +392,20 @@ impl AcpSession {
     pub fn clear_invalid_desired_mode(&mut self) -> Option<ModeId> {
         let mode = self.desired.mode_id.clone()?;
         if self.is_mode_valid(mode.as_str()) {
+            return None;
+        }
+        self.desired.mode_id = None;
+        Some(mode)
+    }
+
+    /// Command EVE policy modes are AionCore-owned and intentionally absent
+    /// from Hermes' transport catalog. Validate them against the policy
+    /// protocol instead of the generic advertised-mode list.
+    pub(crate) fn clear_invalid_command_eve_desired_mode(&mut self) -> Option<ModeId> {
+        let mode = self.desired.mode_id.clone()?;
+        let valid = PermissionMode::parse(mode.as_str())
+            .is_some_and(|permission_mode| self.command_eve_policy.mode_available(permission_mode));
+        if valid {
             return None;
         }
         self.desired.mode_id = None;
@@ -406,6 +483,39 @@ impl AcpSession {
         results
     }
 
+    /// Convert any real ACP `category=Mode` config selection into the
+    /// AionCore-owned Command EVE policy lane. The raw config selection is
+    /// removed so reconcile can never emit `session/set_config_option` for it.
+    pub(crate) fn migrate_command_eve_mode_config_intent(&mut self) -> Result<Option<ModeId>, PolicyGateError> {
+        let mode_keys = self
+            .advertised
+            .config_options
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|option| is_mode_config_option(option))
+            .map(|option| ConfigKey::new(option.id.to_string()))
+            .collect::<Vec<_>>();
+        let mut selected = None;
+        let mut changed = false;
+        for key in mode_keys {
+            if let Some(value) = self.desired.config_selections.remove(&key) {
+                selected = Some(ModeId::new(value.as_str()));
+                changed = true;
+            }
+        }
+        if changed {
+            self.pending_events.push(AcpSessionEvent::DesiredConfigChanged {
+                selections: self.desired.config_selections.clone(),
+            });
+        }
+        let Some(mode) = selected else {
+            return Ok(None);
+        };
+        self.request_command_eve_policy(mode.clone())?;
+        Ok(Some(mode))
+    }
+
     fn clear_legacy_desired_for_config_category(&mut self, category: &SessionConfigOptionCategory) {
         match category {
             SessionConfigOptionCategory::Mode => {
@@ -468,10 +578,21 @@ impl AcpSession {
     }
 
     pub(crate) fn config_snapshot(&self) -> ConfigSnapshot {
-        if let Some(options) = self.advertised.config_options.clone() {
-            return ConfigSnapshot::from_real_options(options);
+        let mut snapshot = if let Some(options) = self.advertised.config_options.clone() {
+            ConfigSnapshot::from_real_options(options)
+        } else {
+            ConfigSnapshot::from_legacy_catalogs(self.advertised.modes.as_ref(), self.advertised.models.as_ref())
+        };
+        if let Some(policy) = self.command_eve_policy.acknowledged() {
+            for mode in snapshot
+                .options
+                .iter_mut()
+                .filter(|option| option.id == "mode" || option.category.as_deref() == Some("mode"))
+            {
+                mode.current_value = Some(policy.mode.as_str().to_owned());
+            }
         }
-        ConfigSnapshot::from_legacy_catalogs(self.advertised.modes.as_ref(), self.advertised.models.as_ref())
+        snapshot
     }
 
     pub fn context_usage(&self) -> Option<&UsageUpdate> {
@@ -507,6 +628,10 @@ impl AcpSession {
     pub fn apply_observed_mode(&mut self, mode: ModeId) {
         let changed = self.observed.mode_id.as_ref() != Some(&mode);
         self.observed.mode_id = Some(mode.clone());
+        self.runtime_mode_attested = true;
+        if let Some(permission_mode) = PermissionMode::parse(mode.as_str()) {
+            self.command_eve_policy.acknowledge_runtime_mode(permission_mode);
+        }
         let available = self
             .advertised
             .modes
@@ -517,6 +642,25 @@ impl AcpSession {
         if changed {
             self.pending_events.push(AcpSessionEvent::ObservedModeSynced { mode });
         }
+    }
+
+    /// Record Hermes' real transport mode without treating it as a Command
+    /// EVE policy acknowledgement. Hermes remains pinned to `default`; the
+    /// selected AionCore policy is a separate server-local state machine.
+    pub fn apply_command_eve_transport_mode(&mut self, mode: ModeId) -> bool {
+        let safe = mode.as_str() == "default";
+        if !safe {
+            self.command_eve_policy.revoke();
+        }
+        self.observed.mode_id = Some(mode.clone());
+        let available = self
+            .advertised
+            .modes
+            .as_ref()
+            .map(|m| m.available_modes.clone())
+            .unwrap_or_default();
+        self.advertised.modes = Some(SessionModeState::new(mode.as_str().to_owned(), available));
+        safe
     }
 
     /// Record the CLI's current model. Updates both `observed.model_id` and
@@ -545,6 +689,29 @@ impl AcpSession {
     pub fn confirm_mode(&mut self, mode: ModeId) {
         self.desired.mode_id = Some(mode.clone());
         self.apply_observed_mode(mode);
+    }
+
+    /// Acknowledge the AionCore-owned Command EVE policy only after the
+    /// synchronous Hermes `session/set_mode(default)` transport call succeeds.
+    /// This deliberately leaves observed/advertised transport state unchanged.
+    pub fn acknowledge_command_eve_policy(&mut self, mode: ModeId) -> Option<PolicySnapshot> {
+        let permission_mode = PermissionMode::parse(mode.as_str())?;
+        if !self.command_eve_policy.mode_available(permission_mode) {
+            return None;
+        }
+        if self.desired.mode_id.as_ref() != Some(&mode) {
+            self.desired.mode_id = Some(mode.clone());
+            self.pending_events.push(AcpSessionEvent::DesiredModeChanged { mode });
+        }
+        // P1 (C7 integrator review): do NOT force `pending` to the acknowledged mode
+        // here. `acknowledge_runtime_mode` guards against a stale acknowledgement with
+        // `if pending.mode != mode { return None }` — rewriting `pending` first made
+        // that guard unreachable, so a slow reconcile acknowledgement returning
+        // `dont_ask` could replace a NARROWER policy the user had meanwhile chosen.
+        // Without the rewrite the guard rejects the stale ack (both callers already
+        // treat `None` as a failure), and an acknowledgement with no pending request
+        // still succeeds through the `or_else`/`take_revision` path below.
+        self.command_eve_policy.acknowledge_runtime_mode(permission_mode)
     }
 
     /// Confirm a user command after the ACP backend accepted it.
@@ -576,11 +743,28 @@ impl AcpSession {
         let new_id = ModeId::new(modes.current_mode_id.to_string());
         let changed = self.observed.mode_id.as_ref() != Some(&new_id);
         self.observed.mode_id = Some(new_id.clone());
+        self.runtime_mode_attested = true;
+        if let Some(permission_mode) = PermissionMode::parse(new_id.as_str()) {
+            self.command_eve_policy.acknowledge_runtime_mode(permission_mode);
+        }
         self.advertised.modes = Some(modes);
         if changed {
             self.pending_events
                 .push(AcpSessionEvent::ObservedModeSynced { mode: new_id });
         }
+    }
+
+    /// Store Hermes' advertised transport catalog/current mode without using
+    /// it as PolicyApplied and without emitting a persisted policy preference.
+    pub fn apply_command_eve_transport_modes(&mut self, modes: SessionModeState) -> bool {
+        let new_id = ModeId::new(modes.current_mode_id.to_string());
+        let safe = new_id.as_str() == "default";
+        if !safe {
+            self.command_eve_policy.revoke();
+        }
+        self.observed.mode_id = Some(new_id);
+        self.advertised.modes = Some(modes);
+        safe
     }
 
     pub fn apply_advertised_models(&mut self, models: SessionModelState) {
@@ -613,9 +797,19 @@ impl AcpSession {
     }
 
     pub fn apply_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {
+        self.apply_advertised_config_options_inner(options, true);
+    }
+
+    /// Store Hermes config options without allowing a real `category=Mode`
+    /// option to mutate transport state or acknowledge an AionCore policy.
+    pub(crate) fn apply_command_eve_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {
+        self.apply_advertised_config_options_inner(options, false);
+    }
+
+    fn apply_advertised_config_options_inner(&mut self, options: Vec<SessionConfigOption>, derive_mode: bool) {
         let options = merge_config_options(self.advertised.config_options.as_deref(), options);
 
-        if let Some(modes) = derive_modes_from_config_options(&options) {
+        if derive_mode && let Some(modes) = derive_modes_from_config_options(&options) {
             self.apply_advertised_modes(modes);
         }
 
@@ -625,6 +819,11 @@ impl AcpSession {
 
         let mut changed = false;
         for opt in &options {
+            if !derive_mode && is_mode_config_option(opt) {
+                let key = ConfigKey::new(opt.id.to_string());
+                changed |= self.observed.config_current.remove(&key).is_some();
+                continue;
+            }
             if let Some(current) = extract_config_current_value(&opt.kind) {
                 let key = ConfigKey::new(opt.id.to_string());
                 let value = ConfigValue::new(current);
@@ -675,6 +874,7 @@ impl AcpSession {
         if let Some(mode) = &state.current_mode_id {
             self.advertised.modes = Some(SessionModeState::new(mode.as_str().to_owned(), Vec::new()));
             self.observed.mode_id = Some(mode.clone());
+            self.runtime_mode_attested = false;
         }
         if let Some(model) = &state.current_model_id {
             self.advertised.models = Some(SessionModelState::new(model.as_str().to_owned(), Vec::new()));
@@ -689,6 +889,49 @@ impl AcpSession {
     }
 }
 
+// ─── Command EVE permission policy handshake ───────────────────────
+impl AcpSession {
+    /// Bind a user turn to the exact runtime-acknowledged policy revision.
+    pub(crate) fn begin_command_eve_turn(&mut self) -> Result<PolicySnapshot, PolicyGateError> {
+        if self.observed_mode() != Some("default") {
+            self.command_eve_policy.revoke();
+            return Err(PolicyGateError::UnsafeTransportMode);
+        }
+        self.command_eve_policy.begin_turn()
+    }
+
+    /// Policy snapshot that owns a permission created by the active turn.
+    pub(crate) fn command_eve_permission_snapshot(
+        &self,
+        request_session_id: &str,
+    ) -> Result<PolicySnapshot, PolicyGateError> {
+        if self.session_id() != Some(request_session_id) {
+            return Err(PolicyGateError::StaleTurnPolicy);
+        }
+        if self.observed_mode() != Some("default") {
+            return Err(PolicyGateError::UnsafeTransportMode);
+        }
+        self.command_eve_policy.permission_snapshot()
+    }
+
+    pub(crate) fn command_eve_policy_snapshot(&self) -> Option<PolicySnapshot> {
+        self.command_eve_policy.routable_snapshot().cloned()
+    }
+
+    pub(crate) fn command_eve_policy_acknowledged(&self) -> bool {
+        self.command_eve_policy.routable_snapshot().is_some()
+    }
+
+    pub(crate) fn ensure_command_eve_mode_available(&self, mode: &str) -> Result<(), PolicyGateError> {
+        if PermissionMode::parse(mode) == Some(PermissionMode::Guarded)
+            && !self.command_eve_policy.mode_available(PermissionMode::Guarded)
+        {
+            return Err(PolicyGateError::GuardedAutoUnavailable);
+        }
+        Ok(())
+    }
+}
+
 // ─── Reconcile ─────────────────────────────────────────────────────
 impl AcpSession {
     /// Produce a list of actions needed to align CLI state with user intent.
@@ -697,7 +940,12 @@ impl AcpSession {
         let mut actions = Vec::new();
 
         if let Some(desired_mode) = &self.desired.mode_id
+            && !self.command_eve_policy.routable_snapshot().is_some_and(|policy| {
+                policy.mode.as_str() == desired_mode.as_str() && self.observed_mode() == Some("default")
+            })
             && self.observed.mode_id.as_ref() != Some(desired_mode)
+            && PermissionMode::parse(desired_mode.as_str())
+                .is_none_or(|mode| self.command_eve_policy.mode_available(mode))
         {
             actions.push(ReconcileAction::SetMode {
                 mode: desired_mode.clone(),
@@ -751,6 +999,10 @@ impl AcpSession {
                 .any(|m| m.model_id.0.as_ref() == model_id),
         }
     }
+}
+
+fn is_mode_config_option(option: &SessionConfigOption) -> bool {
+    option.id.to_string() == "mode" || option.category == Some(SessionConfigOptionCategory::Mode)
 }
 
 fn extract_config_current_value(kind: &SessionConfigKind) -> Option<String> {

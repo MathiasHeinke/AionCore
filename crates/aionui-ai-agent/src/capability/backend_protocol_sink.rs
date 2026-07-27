@@ -56,6 +56,7 @@ impl BackendProtocolSink {
                     params: None,
                 },
             ],
+            authority: None,
         }
     }
 }

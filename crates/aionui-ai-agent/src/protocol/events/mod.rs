@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 pub use aionui_api_types::AgentStreamErrorData as ErrorEventData;
 
+pub(crate) use permission::attach_confirmation_authority_metadata;
 pub use permission::{
     AcpPermissionEventData, AcpPermissionOptionData, AcpPermissionOptionKind, AcpPermissionRequestData,
     AcpPermissionToolCall,

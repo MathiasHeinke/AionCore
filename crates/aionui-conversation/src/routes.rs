@@ -14,7 +14,7 @@ use aionui_api_types::{
     MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SteerConversationRequest,
     SteerConversationResponse, UpdateConversationArtifactRequest, UpdateConversationRequest, WarmupConversationRequest,
 };
-use aionui_auth::{CurrentUser, extract_project_runtime_attestation_from_headers};
+use aionui_auth::{AuthenticationProvenance, CurrentUser, extract_project_runtime_attestation_from_headers};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
@@ -449,9 +449,24 @@ async fn confirm(
     body: Result<Json<ConfirmRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let principal = match user.auth_provenance {
+        AuthenticationProvenance::LocalCapability => {
+            aionui_ai_agent::agent_task::ConfirmationPrincipalContext::for_local_capability(&user.id)
+        }
+        AuthenticationProvenance::Jwt => {
+            aionui_ai_agent::agent_task::ConfirmationPrincipalContext::for_authenticated_user(&user.id)
+        }
+    };
     state
         .service
-        .confirm(&user.id, &params.id, &params.call_id, req, &state.task_manager)
+        .confirm(
+            &user.id,
+            &params.id,
+            &params.call_id,
+            req,
+            &principal,
+            &state.task_manager,
+        )
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))

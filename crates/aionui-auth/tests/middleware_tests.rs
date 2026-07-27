@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::Extension;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware;
 use axum::routing::{get, post};
@@ -10,9 +11,9 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthState, CookieConfig, CurrentUser, JwtService, RateLimiter, TokenPayload, api_rate_limit_middleware,
-    auth_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware, csrf_middleware,
-    security_headers_middleware,
+    AuthState, AuthenticationProvenance, CookieConfig, CurrentUser, JwtService, RateLimiter, TokenPayload,
+    api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
+    csrf_middleware, security_headers_middleware,
 };
 use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
 
@@ -141,6 +142,39 @@ fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepo
     Router::new()
         .route("/protected", get(|| async { "ok" }))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
+async fn authenticated_provenance(Extension(user): Extension<CurrentUser>) -> String {
+    format!("{:?}", user.auth_provenance)
+}
+
+#[tokio::test]
+async fn remote_jwt_system_default_user_keeps_jwt_provenance() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let token = jwt_service.sign("system_default_user", "system_default_user").unwrap();
+    let db = init_database_memory().await.unwrap();
+    let state = AuthState {
+        jwt_service,
+        user_repo: Arc::new(SqliteUserRepository::new(db.pool().clone())),
+        local: false,
+        local_capability: None,
+    };
+    let app = Router::new()
+        .route("/provenance", get(authenticated_provenance))
+        .route_layer(middleware::from_fn_with_state(state, auth_middleware));
+
+    let response = app
+        .oneshot(
+            Request::get("/provenance")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(std::str::from_utf8(&body).unwrap(), "Jwt");
 }
 
 fn expired_token(jwt_service: &JwtService, secret: &str, user_id: &str, username: &str) -> String {
@@ -411,6 +445,7 @@ async fn authenticated_action_limit_uses_user_id_key() {
                 request.extensions_mut().insert(CurrentUser {
                     id: "user_42".into(),
                     username: "admin".into(),
+                    auth_provenance: AuthenticationProvenance::Jwt,
                 });
                 Ok::<_, std::convert::Infallible>(next.run(request).await)
             },

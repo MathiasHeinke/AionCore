@@ -3,7 +3,9 @@
 //! `#[path = "session_tests.rs"] mod tests;` from `session.rs`, so
 //! `super::*` resolves to the `session` module's private scope.
 
-use agent_client_protocol::schema::{ModelInfo, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode};
+use agent_client_protocol::schema::{
+    ModelInfo, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode, SessionModeState,
+};
 
 use super::*;
 
@@ -1292,4 +1294,181 @@ fn mark_pending_session_new_prelude_is_idempotent() {
     s.mark_pending_session_new_prelude();
     assert!(s.take_pending_session_new_prelude());
     assert!(!s.take_pending_session_new_prelude());
+}
+
+#[test]
+fn command_eve_policy_requires_explicit_post_transport_success_ack() {
+    let mut session = AcpSession::new(Some(ModeId::new("dont_ask")), None, HashMap::new());
+    assert!(session.apply_command_eve_runtime_hello(RuntimeCapabilityReceipt::test_receipt()));
+    session.apply_command_eve_transport_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Ask"), SessionMode::new("dont_ask", "Auto")],
+    ));
+    session.set_session_id(SessionId::new("session-command-eve"));
+
+    assert_eq!(session.observed_mode(), Some("default"));
+    assert!(!session.command_eve_policy_acknowledged());
+    assert_eq!(session.begin_command_eve_turn(), Err(PolicyGateError::PolicyPending));
+
+    let policy = session
+        .acknowledge_command_eve_policy(ModeId::new("dont_ask"))
+        .expect("explicit callback after successful transport-default response");
+    assert_eq!(policy.mode, PermissionMode::DontAsk);
+    assert_eq!(session.observed_mode(), Some("default"));
+    assert_eq!(session.current_mode_id().as_deref(), Some("default"));
+    assert_eq!(
+        session.config_snapshot().option_current("mode").as_deref(),
+        Some("dont_ask")
+    );
+}
+
+#[test]
+fn command_eve_real_mode_config_never_acknowledges_or_changes_hermes_transport() {
+    let mut session = AcpSession::new(Some(ModeId::new("default")), None, HashMap::new());
+    assert!(session.apply_command_eve_runtime_hello(RuntimeCapabilityReceipt::test_receipt()));
+    assert!(session.apply_command_eve_transport_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Ask")],
+    )));
+    session.set_session_id(SessionId::new("real-mode-config"));
+    let policy = session.acknowledge_command_eve_policy(ModeId::new("default")).unwrap();
+
+    session.apply_command_eve_advertised_config_options(vec![
+        agent_client_protocol::schema::SessionConfigOption::select(
+            "permission_profile",
+            "Permission Profile",
+            "dont_ask",
+            vec![
+                SessionConfigSelectOption::new("default", "Ask"),
+                SessionConfigSelectOption::new("dont_ask", "Auto"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Mode),
+    ]);
+
+    assert_eq!(session.observed_mode(), Some("default"));
+    assert_eq!(session.command_eve_policy_snapshot(), Some(policy));
+    assert_eq!(
+        session
+            .config_snapshot()
+            .option_current("permission_profile")
+            .as_deref(),
+        Some("default"),
+        "renderer projection follows AionCore policy, not Hermes config current"
+    );
+    assert!(
+        !session
+            .desired_config_selections()
+            .contains_key(&ConfigKey::new("permission_profile"))
+    );
+}
+
+#[test]
+fn command_eve_persisted_mode_config_migrates_to_set_mode_once_and_never_set_config_option() {
+    let mut session = AcpSession::new(Some(ModeId::new("default")), None, HashMap::new());
+    assert!(session.apply_command_eve_runtime_hello(RuntimeCapabilityReceipt::test_receipt()));
+    assert!(session.apply_command_eve_transport_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Ask")],
+    )));
+    session.set_session_id(SessionId::new("persisted-mode-config"));
+    session.acknowledge_command_eve_policy(ModeId::new("default")).unwrap();
+    session.apply_command_eve_advertised_config_options(vec![
+        agent_client_protocol::schema::SessionConfigOption::select(
+            "permission_profile",
+            "Permission Profile",
+            "default",
+            vec![
+                SessionConfigSelectOption::new("default", "Ask"),
+                SessionConfigSelectOption::new("dont_ask", "Auto"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Mode),
+    ]);
+    session.seed_pending_startup_config(SessionConfigOptionCategory::Mode, ConfigValue::new("dont_ask"));
+    assert_eq!(
+        session.resolve_pending_startup_config_seeds(),
+        vec![PendingStartupConfigSeedResult::Applied {
+            category: SessionConfigOptionCategory::Mode,
+            option_id: ConfigKey::new("permission_profile"),
+        }]
+    );
+
+    assert_eq!(
+        session.migrate_command_eve_mode_config_intent().unwrap(),
+        Some(ModeId::new("dont_ask"))
+    );
+    assert_eq!(
+        session.plan_reconcile(),
+        vec![ReconcileAction::SetMode {
+            mode: ModeId::new("dont_ask"),
+        }]
+    );
+    assert!(
+        !session
+            .desired_config_selections()
+            .contains_key(&ConfigKey::new("permission_profile"))
+    );
+    assert_eq!(session.begin_command_eve_turn(), Err(PolicyGateError::PolicyPending));
+
+    assert!(session.apply_command_eve_transport_mode(ModeId::new("default")));
+    let acknowledged = session.acknowledge_command_eve_policy(ModeId::new("dont_ask")).unwrap();
+    assert_eq!(acknowledged.mode, PermissionMode::DontAsk);
+    assert!(
+        session.plan_reconcile().is_empty(),
+        "acknowledged AionCore policy must not drift against pinned default transport"
+    );
+    assert_eq!(
+        session
+            .config_snapshot()
+            .option_current("permission_profile")
+            .as_deref(),
+        Some("dont_ask")
+    );
+}
+
+#[test]
+fn pending_command_eve_change_cannot_republish_old_policy_on_transport_update() {
+    let mut session = AcpSession::new(Some(ModeId::new("dont_ask")), None, HashMap::new());
+    assert!(session.apply_command_eve_runtime_hello(RuntimeCapabilityReceipt::test_receipt()));
+    assert!(session.apply_command_eve_transport_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Ask")],
+    )));
+    session.set_session_id(SessionId::new("pending-no-restore"));
+    session.acknowledge_command_eve_policy(ModeId::new("dont_ask")).unwrap();
+    session.begin_command_eve_turn().unwrap();
+
+    session.request_command_eve_policy(ModeId::new("default")).unwrap();
+    assert!(session.command_eve_policy_snapshot().is_none());
+    assert!(session.apply_command_eve_transport_mode(ModeId::new("default")));
+    assert!(session.command_eve_policy_snapshot().is_none());
+    assert_eq!(session.begin_command_eve_turn(), Err(PolicyGateError::PolicyPending));
+}
+
+#[test]
+fn same_mode_transport_retry_is_pending_and_invalid_mode_revokes_old_policy() {
+    let mut session = AcpSession::new(Some(ModeId::new("default")), None, HashMap::new());
+    assert!(session.apply_command_eve_runtime_hello(RuntimeCapabilityReceipt::test_receipt()));
+    assert!(session.apply_command_eve_transport_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Ask")],
+    )));
+    session.set_session_id(SessionId::new("same-mode-pending"));
+    session.acknowledge_command_eve_policy(ModeId::new("default")).unwrap();
+    session.begin_command_eve_turn().unwrap();
+
+    session.request_command_eve_policy(ModeId::new("default")).unwrap();
+    assert!(session.command_eve_policy_snapshot().is_none());
+    assert_eq!(session.begin_command_eve_turn(), Err(PolicyGateError::PolicyPending));
+
+    assert_eq!(
+        session.request_command_eve_policy(ModeId::new("backend-yolo")),
+        Err(PolicyGateError::UnsupportedPermissionMode)
+    );
+    assert!(session.command_eve_policy_snapshot().is_none());
+    assert_eq!(
+        session.begin_command_eve_turn(),
+        Err(PolicyGateError::UnacknowledgedPolicy)
+    );
 }

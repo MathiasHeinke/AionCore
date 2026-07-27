@@ -2617,6 +2617,7 @@ impl ConversationService {
         conversation_id: &str,
         call_id: &str,
         req: ConfirmRequest,
+        principal: &aionui_ai_agent::agent_task::ConfirmationPrincipalContext,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
         self.conversation_repo
@@ -2639,7 +2640,7 @@ impl ConversationService {
             .find(|c| c.call_id == call_id)
             .map(|c| c.id.clone());
 
-        agent.confirm(&req.msg_id, call_id, req.data, req.always_allow)?;
+        agent.confirm_as(&req.msg_id, call_id, req.data, req.always_allow, principal)?;
 
         if let Some(conf_id) = conf_id {
             let payload = serde_json::json!({

@@ -1,9 +1,11 @@
 use agent_client_protocol::schema::Meta as SdkMeta;
-use aionui_common::{Confirmation, ConfirmationOption};
+use aionui_common::{Confirmation, ConfirmationAuthorityMetadata, ConfirmationOption};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::tool_call::{AcpToolCallContentItem, AcpToolCallKind, AcpToolCallLocationItem, AcpToolCallStatus};
+
+const COMMAND_EVE_AUTHORITY_META_KEY: &str = "command_eve_authority";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -93,7 +95,13 @@ impl AcpPermissionRequestData {
                     params: None,
                 })
                 .collect(),
+            authority: self.validated_authority_metadata(),
         }
+    }
+
+    fn validated_authority_metadata(&self) -> Option<ConfirmationAuthorityMetadata> {
+        let metadata = serde_json::from_value(self.meta.as_ref()?.get(COMMAND_EVE_AUTHORITY_META_KEY)?.clone()).ok()?;
+        is_valid_authority_metadata(&metadata, &self.tool_call.tool_call_id).then_some(metadata)
     }
 
     /// Build a useful confirmation summary without serializing the complete
@@ -110,6 +118,44 @@ impl AcpPermissionRequestData {
             .unwrap_or("Permission required for an unverified operation")
             .to_owned()
     }
+}
+
+pub(crate) fn attach_confirmation_authority_metadata(
+    event: &mut AcpPermissionEventData,
+    metadata: &ConfirmationAuthorityMetadata,
+) {
+    let AcpPermissionEventData::Request(request) = event else {
+        return;
+    };
+    request
+        .meta
+        .get_or_insert_with(Default::default)
+        .insert(COMMAND_EVE_AUTHORITY_META_KEY.to_owned(), serde_json::json!(metadata));
+}
+
+fn is_valid_authority_metadata(metadata: &ConfirmationAuthorityMetadata, call_id: &str) -> bool {
+    let digest_is_valid = |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let authority_matches_class = matches!(
+        (metadata.classification.as_str(), metadata.required_authority.as_deref()),
+        ("routine_edit" | "routine_terminal" | "hard_blocked" | "unknown", None)
+            | ("sensitive", Some("user"))
+            | ("hg35", Some("proxy"))
+            | ("hg4", Some("founder"))
+    );
+
+    metadata.protocol_version == 1
+        && metadata.operation_id == call_id
+        && digest_is_valid(&metadata.operation_digest)
+        && metadata.confirmation_version > 0
+        && metadata.policy_revision > 0
+        && metadata.session_epoch > 0
+        && metadata.created_at_ms <= metadata.expires_at_ms
+        && matches!(
+            metadata.lifecycle.as_str(),
+            "pending" | "allowed" | "denied" | "expired" | "cancelled" | "superseded"
+        )
+        && authority_matches_class
+        && digest_is_valid(&metadata.runtime_receipt_digest)
 }
 
 #[cfg(test)]
@@ -151,5 +197,91 @@ mod tests {
         assert_eq!(confirmation.description, "write_file");
         assert!(!confirmation.description.contains("sensitive-full-file-body"));
         assert_eq!(confirmation.command_type.as_deref(), Some("edit"));
+        assert!(confirmation.authority.is_none());
+    }
+
+    #[test]
+    fn malformed_or_mismatched_authority_meta_fails_closed() {
+        let mut request = AcpPermissionRequestData {
+            session_id: "session-1".into(),
+            tool_call: AcpPermissionToolCall {
+                tool_call_id: "call-1".into(),
+                status: None,
+                title: Some("Run command".into()),
+                kind: Some(AcpToolCallKind::Execute),
+                raw_input: Some(json!({"command":"pwd"})),
+                raw_output: None,
+                content: None,
+                locations: None,
+                meta: None,
+            },
+            options: vec![],
+            meta: Some(serde_json::Map::from_iter([(
+                COMMAND_EVE_AUTHORITY_META_KEY.to_owned(),
+                json!({"protocol_version":"not-a-number"}),
+            )])),
+        };
+        assert!(request.to_confirmation().authority.is_none());
+
+        request.meta.as_mut().unwrap().insert(
+            COMMAND_EVE_AUTHORITY_META_KEY.to_owned(),
+            json!({
+                "protocol_version": 1,
+                "operation_id": "different-call",
+                "operation_digest": "a".repeat(64),
+                "confirmation_version": 1,
+                "policy_revision": 1,
+                "session_epoch": 1,
+                "created_at_ms": 1,
+                "expires_at_ms": 2,
+                "lifecycle": "pending",
+                "classification": "routine_terminal",
+                "required_authority": null,
+                "runtime_receipt_digest": "b".repeat(64),
+            }),
+        );
+        assert!(request.to_confirmation().authority.is_none());
+    }
+
+    #[test]
+    fn validated_authority_meta_projects_from_existing_request_meta() {
+        let expected = ConfirmationAuthorityMetadata {
+            protocol_version: 1,
+            operation_id: "call-1".into(),
+            operation_digest: "a".repeat(64),
+            confirmation_version: 7,
+            policy_revision: 5,
+            session_epoch: 3,
+            created_at_ms: 100,
+            expires_at_ms: 200,
+            lifecycle: "pending".into(),
+            classification: "hg4".into(),
+            required_authority: Some("founder".into()),
+            runtime_receipt_digest: "b".repeat(64),
+        };
+        let mut event = AcpPermissionEventData::Request(AcpPermissionRequestData {
+            session_id: "session-1".into(),
+            tool_call: AcpPermissionToolCall {
+                tool_call_id: "call-1".into(),
+                status: None,
+                title: Some("Release operation".into()),
+                kind: Some(AcpToolCallKind::Execute),
+                raw_input: Some(json!({"command":"opaque"})),
+                raw_output: None,
+                content: None,
+                locations: None,
+                meta: None,
+            },
+            options: vec![],
+            meta: None,
+        });
+
+        attach_confirmation_authority_metadata(&mut event, &expected);
+        let confirmation = event.as_confirmation().unwrap();
+        assert_eq!(confirmation.authority, Some(expected));
+        let AcpPermissionEventData::Request(request) = event else {
+            panic!("request event expected");
+        };
+        assert_eq!(request.tool_call.raw_input, Some(json!({"command":"opaque"})));
     }
 }

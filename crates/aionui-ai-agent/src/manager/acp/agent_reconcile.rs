@@ -2,6 +2,7 @@ use crate::manager::acp::AcpAgentManager;
 
 use crate::manager::acp::error_mapping::is_acp_session_not_found;
 use crate::manager::acp::mode_normalize::normalize_requested_mode;
+use crate::manager::acp::permission_authority::command_eve_transport_mode;
 use crate::manager::acp::session::PendingStartupConfigSeedResult;
 use crate::protocol::error::AcpError;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId};
@@ -43,14 +44,70 @@ impl AcpAgentManager {
     pub(super) async fn reconcile_session(&self, session_id: &str) -> Result<(), AcpError> {
         use crate::manager::acp::ReconcileAction;
 
-        let (startup_config_seed_results, invalid_mode, invalid_model, actions) = {
+        let (startup_config_seed_results, invalid_mode, invalid_model, mut actions) = {
             let mut session = self.session.write().await;
             let startup_config_seed_results = session.resolve_pending_startup_config_seeds();
-            let invalid_mode = session.clear_invalid_desired_mode();
+            let invalid_mode = if self.backend() == Some("hermes") {
+                match session.migrate_command_eve_mode_config_intent() {
+                    Ok(Some(_)) => self.permission_router.revoke_command_eve_policy(
+                        "persisted Command EVE mode config migrated before Hermes transport acknowledgement",
+                    ),
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.permission_router
+                            .revoke_command_eve_policy("invalid persisted Command EVE mode config was removed");
+                        warn!(
+                            conversation_id = %self.params.conversation_id,
+                            error = %error,
+                            "reconcile_session: invalid Command EVE mode config remains fail-closed"
+                        );
+                    }
+                }
+                session.clear_invalid_command_eve_desired_mode()
+            } else {
+                session.clear_invalid_desired_mode()
+            };
             let invalid_model = session.clear_invalid_desired_model();
             let actions = session.plan_reconcile();
             (startup_config_seed_results, invalid_mode, invalid_model, actions)
         };
+        if self.backend() == Some("hermes")
+            && !self.session.read().await.command_eve_policy_acknowledged()
+            && !actions
+                .iter()
+                .any(|action| matches!(action, ReconcileAction::SetMode { .. }))
+        {
+            // P0 (C7 integrator review): the AionCore policy must NEVER be derived
+            // from what the transport reports. `observed_mode()` holds Hermes' own
+            // `current_mode_id`, which `apply_command_eve_transport_mode` writes
+            // through unvalidated and — when it is not "default" — immediately
+            // revokes as untrustworthy. Feeding it back in here promoted exactly
+            // that revoked state to the authority, so a persisted `dont_ask`
+            // (RoutineEdit + RoutineTerminal without asking) reinstalled itself on
+            // every session start. Only our OWN desired policy may seed this, and
+            // absent one we start fail-closed at "default" (Ask).
+            let mode = {
+                let session = self.session.read().await;
+                session.desired_mode().unwrap_or("default").to_owned()
+            };
+            if self
+                .session
+                .read()
+                .await
+                .ensure_command_eve_mode_available(&mode)
+                .is_ok()
+            {
+                actions.push(ReconcileAction::SetMode {
+                    mode: ModeId::new(mode),
+                });
+            } else {
+                warn!(
+                    conversation_id = %self.params.conversation_id,
+                    mode_id = %mode,
+                    "reconcile_session: unavailable Command EVE mode remains fail-closed"
+                );
+            }
+        }
         self.log_reconcile_session_plan_results(startup_config_seed_results, invalid_mode, invalid_model);
         let mut actions: VecDeque<_> = actions.into();
         let mut executed_actions = 0usize;
@@ -71,11 +128,33 @@ impl AcpAgentManager {
                     if normalized.is_empty() {
                         continue;
                     }
+                    let transport_mode = if self.backend() == Some("hermes") {
+                        command_eve_transport_mode(&normalized)
+                    } else {
+                        normalized.as_str()
+                    };
+                    if self.backend() == Some("hermes")
+                        && let Err(error) = self
+                            .prepare_command_eve_policy_change(
+                                session_id,
+                                &normalized,
+                                "reconcile Command EVE mode change started before Hermes transport acknowledgement",
+                            )
+                            .await
+                    {
+                        error!(
+                            conversation_id = %self.params.conversation_id,
+                            mode_id = %normalized,
+                            error = %error,
+                            "reconcile_session: Command EVE policy preparation failed"
+                        );
+                        continue;
+                    }
                     if let Err(e) = self
                         .protocol
                         .set_mode(SetSessionModeRequest::new(
                             SessionId::new(session_id),
-                            normalized.clone(),
+                            transport_mode.to_owned(),
                         ))
                         .await
                     {
@@ -95,6 +174,29 @@ impl AcpAgentManager {
                             "reconcile_session: set_mode failed"
                         );
                         continue;
+                    }
+                    if self.backend() == Some("hermes") {
+                        let mut session = self.session.write().await;
+                        if !session.apply_command_eve_transport_mode(ModeId::new(transport_mode)) {
+                            self.permission_router
+                                .revoke_command_eve_policy("reconcile transport was not default");
+                            continue;
+                        }
+                        if session
+                            .acknowledge_command_eve_policy(ModeId::new(normalized.clone()))
+                            .is_none()
+                        {
+                            error!(
+                                conversation_id = %self.params.conversation_id,
+                                mode_id = %normalized,
+                                "reconcile_session: Command EVE policy acknowledgement failed"
+                            );
+                            continue;
+                        }
+                        if let Some(snapshot) = session.command_eve_policy_snapshot() {
+                            self.permission_router.apply_policy_snapshot(snapshot);
+                        }
+                        self.commit_session_changes(&mut session).await;
                     }
                 }
 
@@ -153,9 +255,23 @@ impl AcpAgentManager {
                             );
                             let (startup_config_seed_results, invalid_mode, invalid_model, followup_actions) = {
                                 let mut session = self.session.write().await;
-                                session.apply_advertised_config_options(response.config_options);
+                                if self.backend() == Some("hermes") {
+                                    session.apply_command_eve_advertised_config_options(response.config_options);
+                                } else {
+                                    session.apply_advertised_config_options(response.config_options);
+                                }
                                 let startup_config_seed_results = session.resolve_pending_startup_config_seeds();
-                                let invalid_mode = session.clear_invalid_desired_mode();
+                                // Mirror the backend split from the first reconcile pass
+                                // (see the `clear_invalid_command_eve_desired_mode` branch
+                                // above). The plain variant validates the desired mode against
+                                // the Hermes transport catalogue — but a Command EVE policy
+                                // mode deliberately is NOT in that catalogue, so running it
+                                // here silently discarded a valid AionCore preference.
+                                let invalid_mode = if self.backend() == Some("hermes") {
+                                    session.clear_invalid_command_eve_desired_mode()
+                                } else {
+                                    session.clear_invalid_desired_mode()
+                                };
                                 let invalid_model = session.clear_invalid_desired_model();
                                 let followup_actions = session.plan_reconcile();
                                 self.commit_session_changes(&mut session).await;

@@ -28,6 +28,64 @@ use aionui_api_types::{
     SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmationAuthorityLevel {
+    User,
+    Proxy,
+    Founder,
+}
+
+/// Server-authenticated principal context. Renderer JSON cannot construct or
+/// raise this authority level; ConversationService supplies it only after its
+/// ownership/authentication checks pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmationPrincipalContext {
+    principal_id: String,
+    authority: ConfirmationAuthorityLevel,
+}
+
+impl ConfirmationPrincipalContext {
+    /// Normal authenticated principals never acquire high-gate authority from
+    /// their user ID. In particular, a remote JWT whose subject happens to be
+    /// `system_default_user` remains a normal user.
+    pub fn for_authenticated_user(user_id: &str) -> Self {
+        Self {
+            principal_id: user_id.to_owned(),
+            authority: ConfirmationAuthorityLevel::User,
+        }
+    }
+
+    /// Elevation is available only when auth middleware proved the per-launch
+    /// local capability. This constructor is called from the server route,
+    /// never from renderer-provided fields.
+    pub fn for_local_capability(user_id: &str) -> Self {
+        let authority = if user_id == "system_default_user" {
+            ConfirmationAuthorityLevel::Founder
+        } else {
+            ConfirmationAuthorityLevel::User
+        };
+        Self {
+            principal_id: user_id.to_owned(),
+            authority,
+        }
+    }
+
+    pub fn legacy_unprivileged() -> Self {
+        Self {
+            principal_id: "legacy_untrusted".to_owned(),
+            authority: ConfirmationAuthorityLevel::User,
+        }
+    }
+
+    pub fn principal_id(&self) -> &str {
+        &self.principal_id
+    }
+
+    pub fn authority(&self) -> ConfirmationAuthorityLevel {
+        self.authority
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 use aionui_common::Confirmation;
 
@@ -287,8 +345,26 @@ impl AgentInstance {
         data: serde_json::Value,
         always_allow: bool,
     ) -> Result<(), AgentError> {
+        self.confirm_as(
+            msg_id,
+            call_id,
+            data,
+            always_allow,
+            &ConfirmationPrincipalContext::legacy_unprivileged(),
+        )
+    }
+
+    /// Submit a confirmation with server-authenticated principal context.
+    pub fn confirm_as(
+        &self,
+        msg_id: &str,
+        call_id: &str,
+        data: serde_json::Value,
+        always_allow: bool,
+        principal: &ConfirmationPrincipalContext,
+    ) -> Result<(), AgentError> {
         match self {
-            Self::Acp(m) => m.confirm(msg_id, call_id, data, always_allow),
+            Self::Acp(m) => m.confirm_as(msg_id, call_id, data, always_allow, principal),
             Self::Aionrs(m) => m.confirm(msg_id, call_id, data, always_allow),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.confirm(msg_id, call_id, data, always_allow),

@@ -1078,6 +1078,7 @@ fn confirmations_factory(count: usize) -> AgentFactory {
                 description: format!("Confirm tool {idx}"),
                 command_type: None,
                 options: vec![],
+                authority: None,
             })
             .collect::<Vec<_>>();
         async move {

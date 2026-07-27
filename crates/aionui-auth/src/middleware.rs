@@ -23,6 +23,16 @@ pub struct CurrentUser {
     pub id: String,
     /// Username.
     pub username: String,
+    /// Server-authenticated provenance for this principal. Route handlers may
+    /// use this to distinguish a per-launch local capability from a normal
+    /// remote JWT; request JSON cannot set or upgrade it.
+    pub auth_provenance: AuthenticationProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationProvenance {
+    Jwt,
+    LocalCapability,
 }
 
 /// Shared state for the authentication middleware.
@@ -66,6 +76,7 @@ pub async fn auth_middleware(
         request.extensions_mut().insert(CurrentUser {
             id: "system_default_user".to_string(),
             username: "system_default_user".to_string(),
+            auth_provenance: AuthenticationProvenance::LocalCapability,
         });
         return Ok(next.run(request).await);
     }
@@ -91,6 +102,7 @@ pub async fn auth_middleware(
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username,
+        auth_provenance: AuthenticationProvenance::Jwt,
     });
 
     Ok(next.run(request).await)
@@ -107,7 +119,7 @@ mod tests {
 
     async fn echo_user(request: Request<Body>) -> String {
         let user = request.extensions().get::<CurrentUser>().unwrap();
-        format!("{}:{}", user.id, user.username)
+        format!("{}:{}:{:?}", user.id, user.username, user.auth_provenance)
     }
 
     #[tokio::test]
@@ -146,7 +158,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
-            "system_default_user:system_default_user"
+            "system_default_user:system_default_user:LocalCapability"
         );
     }
 }

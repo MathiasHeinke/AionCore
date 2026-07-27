@@ -122,6 +122,7 @@ mod tests {
                 value: json!("allow"),
                 params: None,
             }],
+            authority: None,
         }];
         let json = serde_json::to_value(&list).unwrap();
         let arr = json.as_array().unwrap();

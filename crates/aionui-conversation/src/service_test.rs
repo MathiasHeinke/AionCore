@@ -6,7 +6,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
+use aionui_ai_agent::agent_task::{AgentInstance, ConfirmationPrincipalContext, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
@@ -7312,6 +7312,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
             description: "Edit main.rs".into(),
             command_type: Some("bash".into()),
             options: vec![],
+            authority: None,
         },
         Confirmation {
             id: "c2".into(),
@@ -7321,6 +7322,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
             description: "Read config.toml".into(),
             command_type: None,
             options: vec![],
+            authority: None,
         },
     ]
 }
@@ -7403,6 +7405,7 @@ async fn confirm_removes_confirmation_and_broadcasts() {
         &conv.id,
         "call-1",
         req,
+        &ConfirmationPrincipalContext::for_authenticated_user("user_1"),
         &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
     )
     .await
@@ -7440,9 +7443,16 @@ async fn confirm_with_always_allow_stores_approval() {
         always_allow: true,
     };
     let task_mgr_arc: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
-    svc.confirm("user_1", &conv.id, "call-1", req, &task_mgr_arc)
-        .await
-        .unwrap();
+    svc.confirm(
+        "user_1",
+        &conv.id,
+        "call-1",
+        req,
+        &ConfirmationPrincipalContext::for_authenticated_user("user_1"),
+        &task_mgr_arc,
+    )
+    .await
+    .unwrap();
 
     // check_approval should now return true for edit_file:bash
     let agent = task_mgr.get_task(&conv.id).unwrap();
@@ -7474,6 +7484,7 @@ async fn confirm_nonexistent_call_id_returns_not_found() {
             &conv.id,
             "nonexistent-call",
             req,
+            &ConfirmationPrincipalContext::for_authenticated_user("user_1"),
             &(task_mgr as Arc<dyn IWorkerTaskManager>),
         )
         .await
@@ -7502,6 +7513,7 @@ async fn confirm_without_confirmation_state_still_calls_agent() {
         &conv.id,
         "call-1",
         req,
+        &ConfirmationPrincipalContext::for_authenticated_user("user_1"),
         &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
     )
     .await
@@ -7523,7 +7535,14 @@ async fn confirm_no_agent_returns_not_found() {
         always_allow: false,
     };
     let err = svc
-        .confirm("user_1", &conv.id, "call-1", req, &task_mgr)
+        .confirm(
+            "user_1",
+            &conv.id,
+            "call-1",
+            req,
+            &ConfirmationPrincipalContext::for_authenticated_user("user_1"),
+            &task_mgr,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, ConversationError::ActiveAgentNotFound { .. }));
@@ -7572,9 +7591,16 @@ async fn check_approval_returns_true_after_always_allow() {
         always_allow: true,
     };
     let task_mgr_arc: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
-    svc.confirm("user_1", &conv.id, "call-1", req, &task_mgr_arc)
-        .await
-        .unwrap();
+    svc.confirm(
+        "user_1",
+        &conv.id,
+        "call-1",
+        req,
+        &ConfirmationPrincipalContext::for_authenticated_user("user_1"),
+        &task_mgr_arc,
+    )
+    .await
+    .unwrap();
 
     // Now check_approval should return true
     let result = svc

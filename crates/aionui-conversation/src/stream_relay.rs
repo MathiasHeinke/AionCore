@@ -1939,6 +1939,7 @@ mod tests {
                 description: "echo bounded".into(),
                 command_type: Some("execute".into()),
                 options: Vec::new(),
+                authority: None,
             },
         )))
         .unwrap();

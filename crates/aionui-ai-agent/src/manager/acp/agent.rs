@@ -1,4 +1,5 @@
 use crate::agent_runtime::AgentRuntime;
+use crate::agent_task::ConfirmationPrincipalContext;
 use crate::capability::PromptCtx;
 use crate::capability::cli_process::CliAgentProcess;
 use crate::capability::prompt_pipeline::PromptPipeline;
@@ -57,11 +58,67 @@ pub(super) fn user_facing_message(err: &AgentError) -> String {
 use super::codex_sandbox;
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
 use super::mode_normalize::normalize_requested_mode;
+use super::permission_authority::{RuntimeCapabilityReceipt, command_eve_transport_mode};
 
 /// Grace period before force-killing an ACP process (ms).
 const ACP_KILL_GRACE_MS: u64 = 500;
 const OBSERVED_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
 const ACP_STREAM_EVENT_BUFFER_CAPACITY: usize = 16_384;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigProtocolMethod {
+    ConfigOption,
+    Mode,
+    Model,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedConfigProtocolCall {
+    method: ConfigProtocolMethod,
+    value: String,
+}
+
+fn plan_config_protocol_call(
+    backend: Option<&str>,
+    set_path: &ConfigSetPath,
+    is_mode_option: bool,
+    requested_value: &str,
+) -> PlannedConfigProtocolCall {
+    if backend == Some("hermes") && is_mode_option {
+        return PlannedConfigProtocolCall {
+            method: ConfigProtocolMethod::Mode,
+            value: command_eve_transport_mode(requested_value).to_owned(),
+        };
+    }
+    let method = match set_path {
+        ConfigSetPath::ConfigOption { .. } => ConfigProtocolMethod::ConfigOption,
+        ConfigSetPath::LegacyMode => ConfigProtocolMethod::Mode,
+        ConfigSetPath::LegacyModel => ConfigProtocolMethod::Model,
+    };
+    PlannedConfigProtocolCall {
+        method,
+        value: requested_value.to_owned(),
+    }
+}
+
+pub(super) fn prepare_command_eve_policy_change_state(
+    session: &mut AcpSession,
+    permission_router: &PermissionRouter,
+    session_id: &str,
+    requested_mode: &str,
+    reason: &'static str,
+) -> Result<(), AgentError> {
+    if session.session_id() != Some(session_id) {
+        return Err(AgentError::conflict(
+            "Active ACP session changed while preparing Command EVE policy",
+        ));
+    }
+    let policy_result = permission_router.begin_command_eve_policy_change(
+        || session.request_command_eve_policy(ModeId::new(requested_mode)),
+        reason,
+    );
+    policy_result.map_err(|error| AgentError::conflict(error.to_string()))
+}
 
 /// Decompose a child `ExitStatus` (or its absence) into the
 /// `(exit_code, signal)` pair that `AcpError::StartupCrash` /
@@ -90,6 +147,24 @@ pub(super) fn exit_status_parts(exit: Option<std::process::ExitStatus>) -> (Opti
 }
 
 fn initial_mode_from_params(params: &AcpSessionParams) -> Option<ModeId> {
+    // P0 (C7 integrator review) — INTERIM, fail-closed.
+    //
+    // The Command EVE policy is not persisted for the hermes backend at all:
+    // `merge_from_domain_event` only writes `current_mode_id` on
+    // `ObservedModeSynced`, while the policy path emits `DesiredModeChanged`,
+    // which falls into its `_ => false` arm. The persisted value is therefore
+    // frozen at whatever a pre-1820 build wrote through `confirm_mode`, and
+    // preferring it here reinstated that wider preference on every boot — a
+    // deliberate tightening never survived a restart, a loosening always did.
+    //
+    // Until the policy has its own persisted domain event and column, hermes
+    // boots WITHOUT a seeded mode and reconcile starts it at "default" (Ask).
+    // The operator's in-session choice is unaffected: it travels the policy
+    // path and seeds reconcile through `desired_mode()`.
+    if params.metadata.backend.as_deref() == Some("hermes") {
+        return None;
+    }
+
     // Prefer the last-persisted mode; for brand-new conversations
     // fall back to `AcpBuildExtra::session_mode` so the first turn
     // still honours the caller's choice.
@@ -434,6 +509,27 @@ impl AcpAgentManager {
 
         let startup_config_seed_base = initial_config.clone();
         let mut session = AcpSession::new(initial_mode, initial_model, initial_config);
+        if params.metadata.backend.as_deref() == Some("hermes") {
+            match RuntimeCapabilityReceipt::for_current_process("hermes") {
+                Ok(receipt) => {
+                    let digest = receipt.receipt_digest.clone();
+                    if session.apply_command_eve_runtime_hello(receipt) {
+                        info!(
+                            conversation_id = %params.conversation_id,
+                            runtime_receipt_digest = %digest,
+                            "Command EVE RuntimeHello capability receipt installed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        conversation_id = %params.conversation_id,
+                        error = %error,
+                        "Command EVE RuntimeHello receipt unavailable; permission policy will fail closed"
+                    );
+                }
+            }
+        }
         seed_startup_config_preferences(&mut session, &params, &startup_config_seed_base);
 
         let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
@@ -591,7 +687,7 @@ impl AcpAgentManager {
     ) -> Result<SetConfigOptionResponse, AgentError> {
         self.ensure_protocol_connected_for_operation("set_config_option")?;
 
-        let (session_id, set_path, is_mode_option) = {
+        let (session_id, set_path, is_mode_option, command_eve_mode) = {
             let session = self.session.read().await;
             let snapshot = session.config_snapshot();
             let mut set_path = resolve_set_path(&snapshot, option_id, value).map_err(|err| match err {
@@ -609,6 +705,13 @@ impl AcpAgentManager {
                     _ => set_path,
                 };
             }
+            let is_mode_option = snapshot.is_mode_option(option_id);
+            let command_eve_mode = self.backend() == Some("hermes") && is_mode_option;
+            if command_eve_mode {
+                session.ensure_command_eve_mode_available(value).map_err(|error| {
+                    AgentError::conflict(format!("Command EVE permission mode is unavailable: {error}"))
+                })?;
+            }
             let session_id = session.session_id().map(ToOwned::to_owned).ok_or_else(|| {
                 warn!(
                     conversation_id = %self.params.conversation_id,
@@ -618,7 +721,7 @@ impl AcpAgentManager {
                 );
                 AgentError::bad_request("No active session")
             })?;
-            (session_id, set_path, snapshot.is_mode_option(option_id))
+            (session_id, set_path, is_mode_option, command_eve_mode)
         };
 
         tracing::info!(
@@ -633,14 +736,28 @@ impl AcpAgentManager {
             codex_sandbox::sync_for_agent(&self.params.metadata, Some(value)).await;
         }
 
-        match set_path {
-            ConfigSetPath::ConfigOption { option_id: config_id } => {
+        if command_eve_mode {
+            self.prepare_command_eve_policy_change(
+                &session_id,
+                value,
+                "Command EVE mode change started before Hermes transport acknowledgement",
+            )
+            .await?;
+        }
+
+        let protocol_call = plan_config_protocol_call(self.backend(), &set_path, is_mode_option, value);
+
+        match protocol_call.method {
+            ConfigProtocolMethod::ConfigOption => {
+                let ConfigSetPath::ConfigOption { option_id: config_id } = set_path else {
+                    unreachable!("only real config options use session/set_config_option")
+                };
                 let response = self
                     .protocol
                     .set_config_option(SetSessionConfigOptionRequest::new(
                         SessionId::new(session_id.clone()),
                         config_id.clone(),
-                        value.to_owned(),
+                        protocol_call.value.clone(),
                     ))
                     .await
                     .map_err(|err| {
@@ -671,17 +788,23 @@ impl AcpAgentManager {
                             "Active ACP session changed while applying config option",
                         ));
                     }
-                    session.apply_advertised_config_options(response.config_options);
+                    if self.backend() == Some("hermes") {
+                        session.apply_command_eve_advertised_config_options(response.config_options);
+                    } else {
+                        session.apply_advertised_config_options(response.config_options);
+                    }
                     self.commit_session_changes(&mut session).await;
                 }
                 self.wait_for_observed_config_option(&config_id, value, OBSERVED_CONFIRMATION_TIMEOUT)
                     .await
             }
-            ConfigSetPath::LegacyMode => {
+            ConfigProtocolMethod::Mode => {
+                let command_eve = self.backend() == Some("hermes");
+                let transport_mode = protocol_call.value.as_str();
                 self.protocol
                     .set_mode(SetSessionModeRequest::new(
                         SessionId::new(session_id.clone()),
-                        value.to_owned(),
+                        transport_mode.to_owned(),
                     ))
                     .await
                     .map_err(|err| {
@@ -703,28 +826,48 @@ impl AcpAgentManager {
                     method = "session/set_mode",
                     "acp_config_option_command_ack"
                 );
-                {
+                let command_eve_snapshot = {
                     let mut session = self.session.write().await;
                     if session.session_id() != Some(session_id.as_str()) {
                         return Err(AgentError::conflict("Active ACP session changed while applying mode"));
                     }
-                    // Legacy `session/set_mode` has no payload containing the
-                    // resulting mode. A successful synchronous response is the
-                    // protocol's authoritative acknowledgement, so align both
-                    // desired and observed state here. Without this confirmation
-                    // the config-options route waits ten seconds and then reports
-                    // a false timeout even though Hermes already changed mode.
-                    session.confirm_mode(ModeId::new(value));
+                    // Legacy `session/set_mode` has no response payload. For
+                    // shared ACP backends the successful synchronous response
+                    // confirms their requested transport mode. Hermes is
+                    // different: transport remains `default`, while that same
+                    // success acknowledges the separate AionCore policy.
+                    if command_eve {
+                        if !session.apply_command_eve_transport_mode(ModeId::new(transport_mode)) {
+                            self.permission_router
+                                .revoke_command_eve_policy("post-set transport was not default");
+                            return Err(AgentError::conflict(
+                                "Command EVE Hermes transport is not pinned to default",
+                            ));
+                        }
+                        session
+                            .acknowledge_command_eve_policy(ModeId::new(value))
+                            .ok_or_else(|| AgentError::conflict("Command EVE policy acknowledgement failed"))?;
+                    } else {
+                        session.confirm_mode(ModeId::new(value));
+                    }
+                    if let Some(snapshot) = session.command_eve_policy_snapshot() {
+                        self.permission_router.apply_policy_snapshot(snapshot);
+                    }
                     self.commit_session_changes(&mut session).await;
+                    command_eve.then(|| session.config_snapshot())
+                };
+                if let Some(snapshot) = command_eve_snapshot {
+                    Ok(snapshot)
+                } else {
+                    self.wait_for_observed_config_option("mode", value, OBSERVED_CONFIRMATION_TIMEOUT)
+                        .await
                 }
-                self.wait_for_observed_config_option("mode", value, OBSERVED_CONFIRMATION_TIMEOUT)
-                    .await
             }
-            ConfigSetPath::LegacyModel => {
+            ConfigProtocolMethod::Model => {
                 self.protocol
                     .set_model(SetSessionModelRequest::new(
                         SessionId::new(session_id.clone()),
-                        value.to_owned(),
+                        protocol_call.value,
                     ))
                     .await
                     .map_err(|err| {
@@ -766,6 +909,36 @@ impl AcpAgentManager {
             confirmation: ConfigOptionConfirmation::Observed,
             config_options: Some(snapshot.options),
         })
+    }
+
+    /// Begin SetPolicy and revoke all routable authority before awaiting the
+    /// Hermes transport acknowledgement. Protocol failure intentionally leaves
+    /// the new policy pending and cannot restore the previous snapshot.
+    pub(super) async fn prepare_command_eve_policy_change(
+        &self,
+        session_id: &str,
+        requested_mode: &str,
+        reason: &'static str,
+    ) -> Result<(), AgentError> {
+        let mut session = self.session.write().await;
+        prepare_command_eve_policy_change_state(
+            &mut session,
+            &self.permission_router,
+            session_id,
+            requested_mode,
+            reason,
+        )?;
+        // Commit the pending policy state before the transport await, so a failing
+        // protocol call cannot leave the router holding the old, wider authority.
+        //
+        // NOTE (C7 integrator review): this does NOT survive a process restart. The
+        // policy has no persisted domain event — `merge_from_domain_event` writes
+        // `current_mode_id` only on `ObservedModeSynced`, and this path emits
+        // `DesiredModeChanged`. The previous comment claimed startup reconstructs
+        // this pending request; it does not. Until a real persistence channel
+        // exists, `initial_mode_from_params` boots hermes fail-closed instead.
+        self.commit_session_changes(&mut session).await;
+        Ok(())
     }
 
     async fn wait_for_observed_config_option(
@@ -983,6 +1156,16 @@ impl AcpAgentManager {
     /// flags) and prepends the appropriate block when set.
     async fn ensure_session_and_send(&self, data: &SendMessageData) -> Result<PromptOutcome, AcpSendFailure> {
         let sid = self.ensure_session_opened().await.map_err(AcpSendFailure::from)?;
+        if self.backend() == Some("hermes") {
+            let snapshot = {
+                let mut session = self.session.write().await;
+                session
+                    .begin_command_eve_turn()
+                    .map_err(|error| AgentError::conflict(error.to_string()))
+                    .map_err(AcpSendFailure::from)?
+            };
+            self.permission_router.apply_policy_snapshot(snapshot);
+        }
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
         let raw_user_input = data.content.clone();
         let matched_command = {
@@ -1323,8 +1506,48 @@ impl AcpAgentManager {
         data: serde_json::Value,
         _always_allow: bool,
     ) -> Result<(), AgentError> {
+        self.confirm_as(
+            _msg_id,
+            call_id,
+            data,
+            _always_allow,
+            &ConfirmationPrincipalContext::legacy_unprivileged(),
+        )
+    }
+
+    pub fn confirm_as(
+        &self,
+        _msg_id: &str,
+        call_id: &str,
+        data: serde_json::Value,
+        _always_allow: bool,
+        principal: &ConfirmationPrincipalContext,
+    ) -> Result<(), AgentError> {
         let option_id = confirm_option_id(&data)
             .ok_or_else(|| AgentError::bad_request("ACP confirmation requires an option_id string"))?;
+
+        if option_id == "command_eve_authority_allow" {
+            return match self.permission_router.confirm_authority_as(
+                call_id,
+                &self.params.conversation_id,
+                principal,
+            )? {
+                super::permission_router::ConfirmationResponseResult::Applied
+                | super::permission_router::ConfirmationResponseResult::IdempotentSameDecision => Ok(()),
+                super::permission_router::ConfirmationResponseResult::ConflictDifferentDecision => Err(
+                    AgentError::conflict("Authority decision conflicts with the existing result"),
+                ),
+                super::permission_router::ConfirmationResponseResult::Expired => {
+                    Err(AgentError::bad_request("Authority decision expired"))
+                }
+                super::permission_router::ConfirmationResponseResult::UnknownConfirmation => {
+                    Err(AgentError::bad_request("Authority confirmation not found"))
+                }
+                super::permission_router::ConfirmationResponseResult::WrongSession => Err(AgentError::bad_request(
+                    "Authority confirmation belongs to a different session",
+                )),
+            };
+        }
 
         self.permission_router
             .confirm(call_id, option_id, &self.params.conversation_id)
@@ -1336,9 +1559,13 @@ impl AcpAgentManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_status_parts, normalize_hermes_correction_content, user_facing_message};
+    use super::{
+        ConfigProtocolMethod, PlannedConfigProtocolCall, exit_status_parts, normalize_hermes_correction_content,
+        user_facing_message,
+    };
     use crate::agent_runtime::AgentRuntime;
     use crate::error::AgentError;
+    use crate::manager::acp::config_options::{ConfigSetPath, ConfigSnapshot, resolve_set_path};
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::{AcpError, CloseReason};
     use crate::shared_kernel::{ConfigKey, ConfigValue, SessionId as DomainSessionId};
@@ -1680,6 +1907,62 @@ mod tests {
             &persisted_config,
             &SessionConfigOptionCategory::ThoughtLevel
         ));
+    }
+
+    #[test]
+    fn hermes_real_mode_config_records_only_set_mode_default_while_non_hermes_stays_config_option() {
+        let snapshot = ConfigSnapshot {
+            options: vec![aionui_api_types::AcpConfigOptionDto {
+                id: "permission_profile".to_owned(),
+                name: Some("Permission Profile".to_owned()),
+                label: None,
+                description: None,
+                category: Some("mode".to_owned()),
+                option_type: "select".to_owned(),
+                current_value: Some("default".to_owned()),
+                options: vec![aionui_api_types::AcpConfigSelectOptionDto {
+                    value: "dont_ask".to_owned(),
+                    name: Some("Auto".to_owned()),
+                    label: None,
+                    description: None,
+                }],
+            }],
+        };
+        let path = resolve_set_path(&snapshot, "permission_profile", "dont_ask").unwrap();
+        assert!(matches!(path, ConfigSetPath::ConfigOption { .. }));
+
+        let recorded_hermes_calls = vec![super::plan_config_protocol_call(
+            Some("hermes"),
+            &path,
+            snapshot.is_mode_option("permission_profile"),
+            "dont_ask",
+        )];
+        assert_eq!(
+            recorded_hermes_calls,
+            vec![PlannedConfigProtocolCall {
+                method: ConfigProtocolMethod::Mode,
+                value: "default".to_owned(),
+            }]
+        );
+        assert!(
+            !recorded_hermes_calls
+                .iter()
+                .any(|call| call.method == ConfigProtocolMethod::ConfigOption)
+        );
+
+        assert_eq!(
+            super::plan_config_protocol_call(
+                Some("claude"),
+                &path,
+                snapshot.is_mode_option("permission_profile"),
+                "dont_ask",
+            ),
+            PlannedConfigProtocolCall {
+                method: ConfigProtocolMethod::ConfigOption,
+                value: "dont_ask".to_owned(),
+            },
+            "shared ACP backend behavior must remain unchanged"
+        );
     }
 
     // Close-reason compositional tests live in `agent_close.rs` so that

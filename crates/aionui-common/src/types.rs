@@ -57,6 +57,28 @@ pub struct Confirmation {
     pub description: String,
     pub command_type: Option<String>,
     pub options: Vec<ConfirmationOption>,
+    /// Optional server-authoritative Command-EVE permission metadata. Absent
+    /// for shared ACP/AionRS confirmations, preserving their existing wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<ConfirmationAuthorityMetadata>,
+}
+
+/// Safe permission authority metadata for recovery, revision ordering and TTL
+/// display. It never contains command bodies, prompts or edit content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationAuthorityMetadata {
+    pub protocol_version: u32,
+    pub operation_id: String,
+    pub operation_digest: String,
+    pub confirmation_version: u64,
+    pub policy_revision: u64,
+    pub session_epoch: u64,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub lifecycle: String,
+    pub classification: String,
+    pub required_authority: Option<String>,
+    pub runtime_receipt_digest: String,
 }
 
 /// A single option within a confirmation dialog.
@@ -147,10 +169,27 @@ mod tests {
                 value: serde_json::json!(true),
                 params: None,
             }],
+            authority: Some(ConfirmationAuthorityMetadata {
+                protocol_version: 1,
+                operation_id: "call1".into(),
+                operation_digest: "digest".into(),
+                confirmation_version: 7,
+                policy_revision: 3,
+                session_epoch: 2,
+                created_at_ms: 10,
+                expires_at_ms: 20,
+                lifecycle: "pending".into(),
+                classification: "routine_terminal".into(),
+                required_authority: None,
+                runtime_receipt_digest: "runtime-digest".into(),
+            }),
         };
         let json = serde_json::to_value(&c).unwrap();
         assert_eq!(json["call_id"], "call1");
         assert_eq!(json["command_type"], "bash");
+        assert_eq!(json["authority"]["confirmation_version"], 7);
+        let round_trip: Confirmation = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip.authority.unwrap().expires_at_ms, 20);
     }
 
     #[test]

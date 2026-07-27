@@ -49,10 +49,21 @@ impl AcpAgentManager {
                 session.apply_advertised_models(models);
             }
             if let Some(modes) = session_response.modes {
-                session.apply_advertised_modes(modes);
+                if self.backend() == Some("hermes") {
+                    if !session.apply_command_eve_transport_modes(modes) {
+                        self.permission_router
+                            .revoke_command_eve_policy("session/new Hermes transport was not default");
+                    }
+                } else {
+                    session.apply_advertised_modes(modes);
+                }
             }
             if let Some(config_options) = session_response.config_options {
-                session.apply_advertised_config_options(config_options);
+                if self.backend() == Some("hermes") {
+                    session.apply_command_eve_advertised_config_options(config_options);
+                } else {
+                    session.apply_advertised_config_options(config_options);
+                }
             }
             session.set_session_id(DomainSessionId::new(sid.clone()));
             // Mark that the next prompt should carry the first-prompt prelude
@@ -141,10 +152,21 @@ impl AcpAgentManager {
                     session.apply_advertised_models(models);
                 }
                 if let Some(modes) = new_response.modes {
-                    session.apply_advertised_modes(modes);
+                    if self.backend() == Some("hermes") {
+                        if !session.apply_command_eve_transport_modes(modes) {
+                            self.permission_router
+                                .revoke_command_eve_policy("meta-resume Hermes transport was not default");
+                        }
+                    } else {
+                        session.apply_advertised_modes(modes);
+                    }
                 }
                 if let Some(config_options) = new_response.config_options {
-                    session.apply_advertised_config_options(config_options);
+                    if self.backend() == Some("hermes") {
+                        session.apply_command_eve_advertised_config_options(config_options);
+                    } else {
+                        session.apply_advertised_config_options(config_options);
+                    }
                 }
                 session.set_session_id(DomainSessionId::new(new_sid.clone()));
                 self.commit_session_changes(&mut session).await;
@@ -192,13 +214,30 @@ impl AcpAgentManager {
                     session.apply_advertised_models(models);
                 }
                 if let Some(mut modes) = load_response.modes {
-                    if let Some(db_current) = preloaded_mode {
+                    // Keep the legacy display/reconcile behavior for every
+                    // shared ACP backend. Command EVE/Hermes must instead keep
+                    // the runtime-reported mode distinct from persisted user
+                    // preference until its SetPolicy acknowledgement.
+                    if self.backend() != Some("hermes")
+                        && let Some(db_current) = preloaded_mode
+                    {
                         modes.current_mode_id = db_current.into();
                     }
-                    session.apply_advertised_modes(modes);
+                    if self.backend() == Some("hermes") {
+                        if !session.apply_command_eve_transport_modes(modes) {
+                            self.permission_router
+                                .revoke_command_eve_policy("session/load Hermes transport was not default");
+                        }
+                    } else {
+                        session.apply_advertised_modes(modes);
+                    }
                 }
                 if let Some(config_options) = load_response.config_options {
-                    session.apply_advertised_config_options(config_options);
+                    if self.backend() == Some("hermes") {
+                        session.apply_command_eve_advertised_config_options(config_options);
+                    } else {
+                        session.apply_advertised_config_options(config_options);
+                    }
                 }
                 session.set_session_id(DomainSessionId::new(session_id.to_owned()));
                 self.commit_session_changes(&mut session).await;
