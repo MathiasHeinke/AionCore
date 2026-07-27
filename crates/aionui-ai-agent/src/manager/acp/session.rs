@@ -526,6 +526,12 @@ impl AcpSession {
         // migrated policy and whether it is clamped — the others are dropped unseen. No
         // backend advertises two today, so this is a latent hazard rather than a live bug;
         // resolve it toward the narrower authority instead of an arbitrary winner.
+        //
+        // Stated plainly, because a later reader will meet this case before the code does
+        // (P3, round 3, Grok): this DOES clamp values the operator set deliberately, when
+        // two mode keys disagree. That is the intended trade. An ambiguous authority is
+        // not a weaker signal than a boot-restored one — it is an unresolvable one, and
+        // silently picking whichever key iterated last would be a worse answer than `default`.
         if selected_count > 1 {
             clamped_boot_value = true;
         }

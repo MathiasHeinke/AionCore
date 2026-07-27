@@ -113,6 +113,24 @@ pub(super) enum PolicyChangeOrigin {
     Reconcile,
 }
 
+/// Tail of the staleness conflict message, so the reconcile can tell a ROUTINE stale
+/// plan from a genuine preparation failure and log each at its proper level.
+///
+/// P3 (independent review, Kimi): folding both causes into one `warn!` buried real
+/// contract violations — e.g. "Active ACP session changed" — among routine noise.
+///
+/// This is a string marker rather than an `AgentError` variant on purpose. `AgentError`
+/// is a flat crate-wide enum; adding a variant for a log-level nuance has a far wider
+/// blast radius than the problem. Because the message is BUILT from this same constant,
+/// the marker and the check cannot drift apart.
+pub(super) const STALE_RECONCILE_PLAN_MARKER: &str = "the reconcile plan is stale";
+
+/// Whether a failed `prepare_command_eve_policy_change` was the expected stale-plan
+/// refusal rather than a real failure.
+pub(super) fn is_stale_reconcile_plan(error: &AgentError) -> bool {
+    error.to_string().contains(STALE_RECONCILE_PLAN_MARKER)
+}
+
 pub(super) fn prepare_command_eve_policy_change_state(
     session: &mut AcpSession,
     permission_router: &PermissionRouter,
@@ -139,14 +157,23 @@ pub(super) fn prepare_command_eve_policy_change_state(
     // mutation happen under the same write lock.
     //
     // Compared in `PermissionMode` space, not as strings: that is the space that
-    // actually governs authority, it is alias-tolerant (`auto` == `dont_ask`), and
-    // an unparseable value on either side is a mismatch, so this stays fail-closed.
+    // actually governs authority, and it is alias-tolerant (`auto` == `dont_ask`), so
+    // a plan is not called stale merely for spelling the same authority differently.
+    //
+    // The `match` is deliberate. Round 3 (Kimi and Grok, converging) caught that a bare
+    // `!=` on two `Option`s lets the case where BOTH sides are unparseable through, since
+    // `None == None` — the previous comment claimed that case was rejected and it was not.
+    // Only two values that both parse AND agree may proceed; anything else is refused
+    // here rather than one step later in `request_command_eve_policy`.
     if origin == PolicyChangeOrigin::Reconcile {
         let current = PermissionMode::parse(session.desired_mode().unwrap_or("default"));
-        if current != PermissionMode::parse(requested_mode) {
-            return Err(AgentError::conflict(format!(
-                "Command EVE desired policy is no longer {requested_mode}; the reconcile plan is stale"
-            )));
+        match (current, PermissionMode::parse(requested_mode)) {
+            (Some(current), Some(planned)) if current == planned => {}
+            _ => {
+                return Err(AgentError::conflict(format!(
+                    "Command EVE desired policy is no longer {requested_mode}; {STALE_RECONCILE_PLAN_MARKER}"
+                )));
+            }
         }
     }
     let policy_result = permission_router.begin_command_eve_policy_change(

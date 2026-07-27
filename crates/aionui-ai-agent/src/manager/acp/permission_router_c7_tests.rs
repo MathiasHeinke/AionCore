@@ -1,7 +1,9 @@
 use super::*;
 use crate::agent_task::ConfirmationPrincipalContext;
 use crate::manager::acp::AcpSession;
-use crate::manager::acp::agent::{PolicyChangeOrigin, prepare_command_eve_policy_change_state};
+use crate::manager::acp::agent::{
+    PolicyChangeOrigin, is_stale_reconcile_plan, prepare_command_eve_policy_change_state,
+};
 use crate::manager::acp::permission_authority::{PermissionMode, RuntimeCapabilityReceipt};
 use crate::shared_kernel::{ModeId, SessionId};
 use agent_client_protocol::schema::{
@@ -1027,6 +1029,171 @@ fn mode_change_revokes_old_authority_before_delayed_transport_response() {
     assert_eq!(
         router.current_policy.lock().unwrap().as_ref().map(|policy| policy.mode),
         Some(PermissionMode::Default)
+    );
+}
+
+/// Round-3 regression, scenario A. AUTHORED BY THE INDEPENDENT REVIEW ARM (Kimi),
+/// not by the author of the fix it guards.
+///
+/// An operator policy that is already ACKNOWLEDGED leaves no `pending` behind — the
+/// round-2 staleness guard, which keyed on `pending`, was blind to it. A reconcile
+/// action planned against the older desired policy must be rejected at prepare time
+/// and must leave the operator's acknowledged policy untouched.
+#[test]
+fn stale_reconcile_plan_cannot_overwrite_acknowledged_operator_policy() {
+    let mut session = AcpSession::new(Some(ModeId::new("default")), None, Default::default());
+    assert!(session.apply_command_eve_runtime_hello(RuntimeCapabilityReceipt::test_receipt()));
+    assert!(session.apply_command_eve_transport_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Ask")],
+    )));
+    session.set_session_id(SessionId::new("stale-reconcile-plan"));
+    let (_tx, rx) = mpsc::channel(1);
+    let router = PermissionRouter::new(rx);
+
+    // Plan-time world: the operator's desired policy is `dont_ask`. A reconcile
+    // planning at this moment would emit SetMode("dont_ask").
+    prepare_command_eve_policy_change_state(
+        &mut session,
+        &router,
+        "stale-reconcile-plan",
+        "dont_ask",
+        "operator chose dont_ask",
+        PolicyChangeOrigin::Operator,
+    )
+    .unwrap();
+
+    // Before that choice transports, the operator moves on to `default` — and this
+    // time the acknowledgement completes: `pending` is consumed, the policy is
+    // acknowledged, `desired` is `default`. This is scenario A: nothing is pending
+    // anymore, so only the desired-policy comparison can still see the world moved on.
+    prepare_command_eve_policy_change_state(
+        &mut session,
+        &router,
+        "stale-reconcile-plan",
+        "default",
+        "operator chose default",
+        PolicyChangeOrigin::Operator,
+    )
+    .unwrap();
+    assert!(session.apply_command_eve_transport_mode(ModeId::new("default")));
+    let acknowledged = session
+        .acknowledge_command_eve_policy(ModeId::new("default"))
+        .expect("operator policy must acknowledge");
+    assert_eq!(acknowledged.mode, PermissionMode::Default);
+    router.apply_policy_snapshot(acknowledged);
+
+    // The stale reconcile action arrives: SetMode("dont_ask"), planned against the
+    // old desired. It must be refused with the staleness conflict...
+    let stale = prepare_command_eve_policy_change_state(
+        &mut session,
+        &router,
+        "stale-reconcile-plan",
+        "dont_ask",
+        "stale reconcile SetMode",
+        PolicyChangeOrigin::Reconcile,
+    );
+    let Err(error) = stale else {
+        panic!("a stale reconcile plan must not overwrite the acknowledged operator policy");
+    };
+    assert!(is_stale_reconcile_plan(&error), "unexpected rejection cause: {error}");
+
+    // ...and it must leave no trace: desired policy, acknowledged policy and turn
+    // eligibility all still reflect the operator's choice.
+    assert_eq!(session.desired_mode(), Some("default"));
+    assert_eq!(
+        session.command_eve_policy_snapshot().map(|snapshot| snapshot.mode),
+        Some(PermissionMode::Default)
+    );
+    assert!(
+        session.begin_command_eve_turn().is_ok(),
+        "a rejected stale plan must not leave a pending change behind"
+    );
+
+    // Control: the SAME prepare with a fresh plan (requested == desired) is accepted —
+    // the rejection above is the staleness check, not a blanket refusal of
+    // reconcile-originated changes.
+    prepare_command_eve_policy_change_state(
+        &mut session,
+        &router,
+        "stale-reconcile-plan",
+        "default",
+        "fresh reconcile SetMode",
+        PolicyChangeOrigin::Reconcile,
+    )
+    .unwrap();
+}
+
+/// Round-3 regression, scenario B. AUTHORED BY THE INDEPENDENT REVIEW ARM (Grok),
+/// not by the author of the fix it guards.
+///
+/// The reconcile still holds the older plan `dont_ask`. Before its mutation runs, the
+/// operator has already moved desired to `default`. The prepare must see that under the
+/// write lock and refuse; otherwise `begin_mode_change` widens the operator's narrower
+/// choice back out.
+#[test]
+fn reconcile_prepare_refuses_stale_plan_when_operator_changed_desired_before_mutation() {
+    let mut session = AcpSession::new(Some(ModeId::new("dont_ask")), None, Default::default());
+    assert!(session.apply_command_eve_runtime_hello(RuntimeCapabilityReceipt::test_receipt()));
+    assert!(session.apply_command_eve_transport_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Ask")],
+    )));
+    session.set_session_id(SessionId::new("stale-reconcile-b"));
+    assert_eq!(session.desired_mode(), Some("dont_ask"));
+
+    let (_tx, rx) = mpsc::channel(1);
+    let router = PermissionRouter::new(rx);
+
+    // The operator moves to `default` BETWEEN the plan and the reconcile's mutation.
+    prepare_command_eve_policy_change_state(
+        &mut session,
+        &router,
+        "stale-reconcile-b",
+        "default",
+        "operator tightened policy before stale reconcile mutation",
+        PolicyChangeOrigin::Operator,
+    )
+    .expect("operator prepare must always be allowed");
+    assert_eq!(
+        session.desired_mode(),
+        Some("default"),
+        "operator prepare must record the narrower desired mode"
+    );
+
+    // The stale reconcile plan: still `dont_ask`, from plan time. Without the staleness
+    // check this returns Ok and sets desired back to `dont_ask`.
+    let stale = prepare_command_eve_policy_change_state(
+        &mut session,
+        &router,
+        "stale-reconcile-b",
+        "dont_ask",
+        "reconcile Command EVE mode change started before Hermes transport acknowledgement",
+        PolicyChangeOrigin::Reconcile,
+    );
+    assert!(
+        stale.is_err(),
+        "stale reconcile plan must not mutate after the operator moved desired; got {stale:?}"
+    );
+    assert_eq!(
+        session.desired_mode(),
+        Some("default"),
+        "failed stale reconcile must not widen desired back to dont_ask"
+    );
+
+    // Alias smoke: desired is `default`, the plan spells the same authority as `ask`.
+    // The reconcile must proceed — the check must not fire on spelling.
+    let alias_ok = prepare_command_eve_policy_change_state(
+        &mut session,
+        &router,
+        "stale-reconcile-b",
+        "ask",
+        "reconcile same PermissionMode via alias",
+        PolicyChangeOrigin::Reconcile,
+    );
+    assert!(
+        alias_ok.is_ok(),
+        "PermissionMode aliases (ask == default) must not look stale; got {alias_ok:?}"
     );
 }
 

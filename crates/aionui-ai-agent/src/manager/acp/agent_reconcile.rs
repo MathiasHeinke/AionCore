@@ -1,6 +1,6 @@
 use crate::manager::acp::AcpAgentManager;
 
-use crate::manager::acp::agent::PolicyChangeOrigin;
+use crate::manager::acp::agent::{PolicyChangeOrigin, is_stale_reconcile_plan};
 use crate::manager::acp::error_mapping::is_acp_session_not_found;
 use crate::manager::acp::mode_normalize::normalize_requested_mode;
 use crate::manager::acp::permission_authority::command_eve_transport_mode;
@@ -162,15 +162,27 @@ impl AcpAgentManager {
                             )
                             .await
                     {
-                        // Both causes land here: a genuinely failed preparation, and the
-                        // routine case of an operator having chosen something else since
-                        // this action was planned. `error` distinguishes them.
-                        warn!(
-                            conversation_id = %self.params.conversation_id,
-                            mode_id = %normalized,
-                            error = %error,
-                            "reconcile_session: Command EVE policy change did not proceed"
-                        );
+                        // P3 (independent review, Kimi): two very different causes land
+                        // here and must not share a log level. An operator having chosen
+                        // something else since this action was planned is ROUTINE — the
+                        // asymmetry working as designed. Anything else is a contract
+                        // violation or a failed operation and stays `error!`, per the
+                        // project logging rule.
+                        if is_stale_reconcile_plan(&error) {
+                            info!(
+                                conversation_id = %self.params.conversation_id,
+                                mode_id = %normalized,
+                                "reconcile_session: an operator policy change superseded this \
+                                 planned mode change; stepping aside"
+                            );
+                        } else {
+                            error!(
+                                conversation_id = %self.params.conversation_id,
+                                mode_id = %normalized,
+                                error = %error,
+                                "reconcile_session: Command EVE policy preparation failed"
+                            );
+                        }
                         continue;
                     }
                     if let Err(e) = self
