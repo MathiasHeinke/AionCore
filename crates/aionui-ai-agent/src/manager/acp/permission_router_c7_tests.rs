@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent_task::ConfirmationPrincipalContext;
 use crate::manager::acp::AcpSession;
-use crate::manager::acp::agent::prepare_command_eve_policy_change_state;
+use crate::manager::acp::agent::{PolicyChangeOrigin, prepare_command_eve_policy_change_state};
 use crate::manager::acp::permission_authority::{PermissionMode, RuntimeCapabilityReceipt};
 use crate::shared_kernel::{ModeId, SessionId};
 use agent_client_protocol::schema::{
@@ -962,6 +962,7 @@ fn mode_change_revokes_old_authority_before_delayed_transport_response() {
                 "delayed-policy-session",
                 "default",
                 "test delayed Hermes transport",
+                PolicyChangeOrigin::Operator,
             )
             .unwrap();
         }

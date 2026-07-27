@@ -341,13 +341,6 @@ impl AcpSession {
     /// request is awaited. Unlike generic ACP mode selection, the policy is
     /// validated against AionCore's four-mode contract rather than Hermes'
     /// deliberately pinned transport catalog.
-    /// Mode of an outstanding policy request, if one is waiting for its transport ack.
-    /// Used by the reconcile path to detect that a human asked for something else while
-    /// it was in flight.
-    pub(crate) fn command_eve_pending_mode(&self) -> Option<PermissionMode> {
-        self.command_eve_policy.pending_mode()
-    }
-
     pub(crate) fn request_command_eve_policy(&mut self, mode: ModeId) -> Result<(), PolicyGateError> {
         let Some(permission_mode) = PermissionMode::parse(mode.as_str()) else {
             self.command_eve_policy.revoke();
@@ -513,6 +506,7 @@ impl AcpSession {
         let mut selected = None;
         let mut changed = false;
         let mut clamped_boot_value = false;
+        let mut selected_count = 0usize;
         for key in mode_keys {
             if let Some(value) = self.desired.config_selections.remove(&key) {
                 // Only a value that is STILL the one the boot snapshot carried counts as
@@ -523,8 +517,17 @@ impl AcpSession {
                     .get(&key)
                     .is_some_and(|boot| boot.as_str() == value.as_str());
                 selected = Some(ModeId::new(value.as_str()));
+                selected_count += 1;
                 changed = true;
             }
+        }
+        // P3 (independent review, Kimi and Grok converging): with more than one advertised
+        // mode key carrying a value, the loop silently lets the LAST one decide both the
+        // migrated policy and whether it is clamped — the others are dropped unseen. No
+        // backend advertises two today, so this is a latent hazard rather than a live bug;
+        // resolve it toward the narrower authority instead of an arbitrary winner.
+        if selected_count > 1 {
+            clamped_boot_value = true;
         }
         if changed {
             self.pending_events.push(AcpSessionEvent::DesiredConfigChanged {

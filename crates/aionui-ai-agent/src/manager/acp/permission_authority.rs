@@ -310,15 +310,6 @@ impl CommandEvePolicyState {
     /// Start a real transport-backed SetPolicy transition even when the
     /// requested value equals the last acknowledgement. While the transport
     /// call is outstanding, no prior turn lease or routable snapshot survives.
-    /// The mode of an outstanding, not-yet-acknowledged policy request, if any.
-    ///
-    /// Exists so a MACHINE-initiated caller (reconcile) can see that a human already
-    /// asked for something else and step aside. `begin_mode_change` itself stays
-    /// unconditional: an explicit operator choice must always win over a reconcile.
-    pub fn pending_mode(&self) -> Option<PermissionMode> {
-        self.pending.as_ref().map(|pending| pending.mode)
-    }
-
     pub fn begin_mode_change(&mut self, mode: PermissionMode) -> u64 {
         if self.pending.as_ref().is_some_and(|pending| pending.mode == mode) {
             return self

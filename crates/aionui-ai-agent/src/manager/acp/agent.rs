@@ -58,7 +58,7 @@ pub(super) fn user_facing_message(err: &AgentError) -> String {
 use super::codex_sandbox;
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
 use super::mode_normalize::normalize_requested_mode;
-use super::permission_authority::{RuntimeCapabilityReceipt, command_eve_transport_mode};
+use super::permission_authority::{PermissionMode, RuntimeCapabilityReceipt, command_eve_transport_mode};
 
 /// Grace period before force-killing an ACP process (ms).
 const ACP_KILL_GRACE_MS: u64 = 500;
@@ -101,17 +101,53 @@ fn plan_config_protocol_call(
     }
 }
 
+/// Who is asking for a Command EVE policy change.
+///
+/// An operator request IS the authority — it defines the new desired policy and
+/// has nothing to match against. A reconcile is machine-planned from the desired
+/// policy as it stood at plan time, and must step aside if the operator has moved
+/// on since. Only `Reconcile` is staleness-checked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum PolicyChangeOrigin {
+    Operator,
+    Reconcile,
+}
+
 pub(super) fn prepare_command_eve_policy_change_state(
     session: &mut AcpSession,
     permission_router: &PermissionRouter,
     session_id: &str,
     requested_mode: &str,
     reason: &'static str,
+    origin: PolicyChangeOrigin,
 ) -> Result<(), AgentError> {
     if session.session_id() != Some(session_id) {
         return Err(AgentError::conflict(
             "Active ACP session changed while preparing Command EVE policy",
         ));
+    }
+    // P1 (independent review, Grok, round 2): a machine-planned mode change must
+    // never overwrite an operator policy that landed after the plan was made.
+    //
+    // The reconcile plans `SetMode` from `desired_mode()` (and, on the fail-closed
+    // fallback, from its absence), so a valid plan is exactly one whose planned mode
+    // still equals the current desired policy. Re-deriving that here rather than
+    // carrying the plan-time value across the await boundary closes both holes the
+    // previous read-lock pre-check left open: an operator change that had already
+    // been acknowledged (no `pending` left to detect), and one landing between the
+    // check and this mutation. There is no window now — the comparison and the
+    // mutation happen under the same write lock.
+    //
+    // Compared in `PermissionMode` space, not as strings: that is the space that
+    // actually governs authority, it is alias-tolerant (`auto` == `dont_ask`), and
+    // an unparseable value on either side is a mismatch, so this stays fail-closed.
+    if origin == PolicyChangeOrigin::Reconcile {
+        let current = PermissionMode::parse(session.desired_mode().unwrap_or("default"));
+        if current != PermissionMode::parse(requested_mode) {
+            return Err(AgentError::conflict(format!(
+                "Command EVE desired policy is no longer {requested_mode}; the reconcile plan is stale"
+            )));
+        }
     }
     let policy_result = permission_router.begin_command_eve_policy_change(
         || session.request_command_eve_policy(ModeId::new(requested_mode)),
@@ -758,6 +794,7 @@ impl AcpAgentManager {
                 &session_id,
                 value,
                 "Command EVE mode change started before Hermes transport acknowledgement",
+                PolicyChangeOrigin::Operator,
             )
             .await?;
         }
@@ -936,6 +973,7 @@ impl AcpAgentManager {
         session_id: &str,
         requested_mode: &str,
         reason: &'static str,
+        origin: PolicyChangeOrigin,
     ) -> Result<(), AgentError> {
         let mut session = self.session.write().await;
         prepare_command_eve_policy_change_state(
@@ -944,6 +982,7 @@ impl AcpAgentManager {
             session_id,
             requested_mode,
             reason,
+            origin,
         )?;
         // Commit the pending policy state before the transport await, so a failing
         // protocol call cannot leave the router holding the old, wider authority.

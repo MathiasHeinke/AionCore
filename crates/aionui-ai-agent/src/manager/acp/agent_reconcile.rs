@@ -1,8 +1,9 @@
 use crate::manager::acp::AcpAgentManager;
 
+use crate::manager::acp::agent::PolicyChangeOrigin;
 use crate::manager::acp::error_mapping::is_acp_session_not_found;
 use crate::manager::acp::mode_normalize::normalize_requested_mode;
-use crate::manager::acp::permission_authority::{PermissionMode, command_eve_transport_mode};
+use crate::manager::acp::permission_authority::command_eve_transport_mode;
 use crate::manager::acp::session::PendingStartupConfigSeedResult;
 use crate::protocol::error::AcpError;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId};
@@ -141,46 +142,34 @@ impl AcpAgentManager {
                     // human mode change can land at any point during this loop. If it lands
                     // BETWEEN our prepare and our acknowledge, the stale-ack guard in
                     // `acknowledge_runtime_mode` already rejects us. If it lands BEFORE our
-                    // prepare, `begin_mode_change` used to overwrite the human's pending
-                    // request with the older, machine-planned one — and the acknowledge then
-                    // matched. That is the hole: we step aside instead.
+                    // prepare, `begin_mode_change` used to overwrite the human's request with
+                    // the older, machine-planned one — and the acknowledge then matched.
                     //
-                    // Deliberate asymmetry: the operator overrides the reconcile, never the
-                    // other way round. Taking `session_lock` here would have closed it too,
-                    // but at the price of blocking every mode change for the whole duration of
-                    // a running agent turn.
-                    if self.backend() == Some("hermes") {
-                        let contested = {
-                            let session = self.session.read().await;
-                            session
-                                .command_eve_pending_mode()
-                                .filter(|pending| Some(*pending) != PermissionMode::parse(&normalized))
-                        };
-                        if let Some(pending) = contested {
-                            warn!(
-                                conversation_id = %self.params.conversation_id,
-                                planned_mode = %normalized,
-                                pending_mode = %pending.as_str(),
-                                "reconcile_session: an operator policy request is already pending; \
-                                 skipping the planned mode change instead of overwriting it"
-                            );
-                            continue;
-                        }
-                    }
+                    // `PolicyChangeOrigin::Reconcile` closes that: the staleness check runs
+                    // inside `prepare_command_eve_policy_change`, under the same write lock
+                    // that mutates the policy, so no window remains between checking and
+                    // acting. Deliberate asymmetry: the operator overrides the reconcile,
+                    // never the other way round. Taking `session_lock` here would have closed
+                    // it too, but at the price of blocking every mode change for the whole
+                    // duration of a running agent turn.
                     if self.backend() == Some("hermes")
                         && let Err(error) = self
                             .prepare_command_eve_policy_change(
                                 session_id,
                                 &normalized,
                                 "reconcile Command EVE mode change started before Hermes transport acknowledgement",
+                                PolicyChangeOrigin::Reconcile,
                             )
                             .await
                     {
-                        error!(
+                        // Both causes land here: a genuinely failed preparation, and the
+                        // routine case of an operator having chosen something else since
+                        // this action was planned. `error` distinguishes them.
+                        warn!(
                             conversation_id = %self.params.conversation_id,
                             mode_id = %normalized,
                             error = %error,
-                            "reconcile_session: Command EVE policy preparation failed"
+                            "reconcile_session: Command EVE policy change did not proceed"
                         );
                         continue;
                     }
