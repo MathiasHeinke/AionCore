@@ -135,7 +135,11 @@ impl AcpAgentManager {
     /// Start the permission handler loop. Must be called after the manager
     /// is wrapped in Arc. Delegates to `PermissionRouter::start`.
     pub fn start_permission_handler(self: &Arc<Self>) {
-        self.permission_router.start(self.runtime.clone());
+        self.permission_router.start(
+            self.runtime.clone(),
+            Arc::downgrade(self),
+            self.backend().map(str::to_owned),
+        );
     }
 
     /// Drain pending domain events from the session aggregate and

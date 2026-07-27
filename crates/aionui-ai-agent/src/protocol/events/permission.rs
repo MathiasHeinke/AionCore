@@ -72,24 +72,13 @@ impl AcpPermissionEventData {
 
 impl AcpPermissionRequestData {
     pub fn to_confirmation(&self) -> Confirmation {
+        let description = self.safe_confirmation_description();
         Confirmation {
             id: self.tool_call.tool_call_id.clone(),
             call_id: self.tool_call.tool_call_id.clone(),
             title: self.tool_call.title.clone(),
             action: None,
-            description: self
-                .tool_call
-                .raw_input
-                .as_ref()
-                .and_then(|raw| raw.get("description").and_then(Value::as_str))
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| {
-                    self.tool_call
-                        .raw_input
-                        .as_ref()
-                        .map(Value::to_string)
-                        .unwrap_or_default()
-                }),
+            description,
             command_type: self.tool_call.kind.map(|kind| match kind {
                 AcpToolCallKind::Read => "read".to_owned(),
                 AcpToolCallKind::Edit => "edit".to_owned(),
@@ -105,5 +94,62 @@ impl AcpPermissionRequestData {
                 })
                 .collect(),
         }
+    }
+
+    /// Build a useful confirmation summary without serializing the complete
+    /// raw input. Edit requests may contain whole file bodies under
+    /// `arguments`; echoing that JSON into the card is both noisy and an
+    /// avoidable disclosure surface.
+    fn safe_confirmation_description(&self) -> String {
+        let raw_input = self.tool_call.raw_input.as_ref();
+        raw_input
+            .and_then(|raw| raw.get("description").and_then(Value::as_str))
+            .or_else(|| raw_input.and_then(|raw| raw.get("command").and_then(Value::as_str)))
+            .or_else(|| raw_input.and_then(|raw| raw.get("tool").and_then(Value::as_str)))
+            .or(self.tool_call.title.as_deref())
+            .unwrap_or("Permission required for an unverified operation")
+            .to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn edit_confirmation_projection_does_not_serialize_raw_arguments() {
+        let request = AcpPermissionRequestData {
+            session_id: "session-1".into(),
+            tool_call: AcpPermissionToolCall {
+                tool_call_id: "call-1".into(),
+                status: None,
+                title: Some("Edit file".into()),
+                kind: Some(AcpToolCallKind::Edit),
+                raw_input: Some(json!({
+                    "tool": "write_file",
+                    "arguments": {
+                        "path": "/tmp/example.txt",
+                        "content": "sensitive-full-file-body"
+                    }
+                })),
+                raw_output: None,
+                content: None,
+                locations: None,
+                meta: None,
+            },
+            options: vec![AcpPermissionOptionData {
+                option_id: "allow_once".into(),
+                name: "Allow edit".into(),
+                kind: AcpPermissionOptionKind::AllowOnce,
+                meta: None,
+            }],
+            meta: None,
+        };
+
+        let confirmation = request.to_confirmation();
+        assert_eq!(confirmation.description, "write_file");
+        assert!(!confirmation.description.contains("sensitive-full-file-body"));
+        assert_eq!(confirmation.command_type.as_deref(), Some("edit"));
     }
 }

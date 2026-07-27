@@ -6,13 +6,13 @@ use std::{
 use aionui_ai_agent::protocol::events::tool_call::{
     AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
 };
-use aionui_ai_agent::protocol::events::{ErrorEventData, TipType};
+use aionui_ai_agent::protocol::events::{AcpPermissionEventData, ErrorEventData, TipType};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
 use crate::response_middleware::{ICronService, ISkillLoadService, MessageMiddleware, MiddlewareResult};
 use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
-use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
+use aionui_common::{Confirmation, ErrorChain, normalize_keys_to_snake_case, now_ms};
 
 use crate::project_workspace::{redact_project_runtime_event, redact_project_runtime_json_value};
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
@@ -31,6 +31,13 @@ use tracing::{debug, info, warn};
 const FLUSH_INTERVAL: u32 = 20;
 
 type RelayIngressItem = Result<AgentStreamEvent, broadcast::error::RecvError>;
+
+fn is_confirmation_lifecycle_update(confirmation: &Confirmation) -> bool {
+    matches!(
+        confirmation.action.as_deref(),
+        Some("expired" | "cancelled" | "superseded")
+    )
+}
 
 fn spawn_stream_ingress(
     mut source: broadcast::Receiver<AgentStreamEvent>,
@@ -555,11 +562,24 @@ impl StreamRelay {
                                 self.adapter.persist_tip(data).await;
                             }
                         }
-                        AgentStreamEvent::CronTrigger(_)
-                        | AgentStreamEvent::Permission(_)
-                        | AgentStreamEvent::AcpPermission(_) => {
+                        AgentStreamEvent::CronTrigger(_) | AgentStreamEvent::Permission(_) => {
                             attempt.saw_tool_or_side_effect = true;
                             self.forward_to_websocket(&event);
+                        }
+                        AgentStreamEvent::AcpPermission(data) => {
+                            attempt.saw_tool_or_side_effect = true;
+                            if let AcpPermissionEventData::Confirmation(confirmation) = data
+                                && is_confirmation_lifecycle_update(confirmation)
+                            {
+                                self.broadcast_confirmation_updated(confirmation);
+                            } else {
+                                // Preserve message.stream first so an ACP-aware renderer can
+                                // materialize the rich request. The confirmation event then
+                                // upserts the same call_id and is the independent same-chat
+                                // liveness path when that stream frame is missed.
+                                self.forward_to_websocket(&event);
+                                self.broadcast_confirmation_added(data);
+                            }
                         }
                         _ => {
                             self.forward_to_websocket(&event);
@@ -689,6 +709,52 @@ impl StreamRelay {
     #[tracing::instrument(skip_all)]
     fn forward_to_websocket(&self, event: &AgentStreamEvent) {
         self.forward_to_websocket_with_msg_id(&self.msg_id, event);
+    }
+
+    fn broadcast_confirmation_added(&self, permission: &aionui_ai_agent::protocol::events::AcpPermissionEventData) {
+        let Some(confirmation) = permission.as_confirmation() else {
+            warn!(
+                conversation_id = %self.conversation_id,
+                "ACP permission could not be projected as confirmation.add"
+            );
+            return;
+        };
+
+        self.broadcast_confirmation("confirmation.add", &confirmation);
+    }
+
+    fn broadcast_confirmation_updated(&self, confirmation: &Confirmation) {
+        self.broadcast_confirmation("confirmation.update", confirmation);
+    }
+
+    fn broadcast_confirmation(&self, event_name: &'static str, confirmation: &Confirmation) {
+        let mut payload = match serde_json::to_value(confirmation) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    conversation_id = %self.conversation_id,
+                    error = %ErrorChain(&error),
+                    event_name,
+                    "Failed to serialize ACP confirmation payload"
+                );
+                return;
+            }
+        };
+        if let Some(path) = self.project_runtime_workspace_path.as_ref() {
+            redact_project_runtime_json_value(&mut payload, std::slice::from_ref(path));
+        }
+        normalize_keys_to_snake_case(&mut payload);
+        let Some(object) = payload.as_object_mut() else {
+            warn!(
+                conversation_id = %self.conversation_id,
+                event_name,
+                "ACP confirmation payload was not an object"
+            );
+            return;
+        };
+        object.insert("conversation_id".to_owned(), json!(self.conversation_id));
+
+        self.broadcaster.broadcast(WebSocketMessage::new(event_name, payload));
     }
 
     #[tracing::instrument(skip_all)]
@@ -908,8 +974,11 @@ mod tests {
     use crate::stream_persistence::StreamPersistenceAdapter;
     use aionui_ai_agent::AgentError;
     use aionui_ai_agent::protocol::events::{
-        CorrectionBoundaryEventData, ErrorEventData, FinishEventData, TextEventData, ThinkingEventData,
+        AcpPermissionEventData, AcpPermissionOptionData, AcpPermissionOptionKind, AcpPermissionRequestData,
+        AcpPermissionToolCall, AcpToolCallKind, CorrectionBoundaryEventData, ErrorEventData, FinishEventData,
+        TextEventData, ThinkingEventData,
     };
+    use aionui_common::Confirmation;
     use aionui_db::DbError;
     use aionui_db::models::MessageRow;
     use std::sync::Mutex;
@@ -1773,6 +1842,128 @@ mod tests {
             .find(|e| e.name == "message.stream")
             .expect("finish should be forwarded as message.stream");
         assert_eq!(stream_event.data["turn_id"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn acp_permission_broadcasts_stream_then_confirmation_add() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-permission".into(),
+            "asst-permission".into(),
+            "turn-permission".into(),
+            "user-1".into(),
+            repo,
+            bus.clone(),
+            None,
+        );
+
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpPermission(AcpPermissionEventData::Request(
+            AcpPermissionRequestData {
+                session_id: "session-1".into(),
+                tool_call: AcpPermissionToolCall {
+                    tool_call_id: "call-1".into(),
+                    status: None,
+                    title: Some("Run tool".into()),
+                    kind: Some(AcpToolCallKind::Execute),
+                    raw_input: Some(json!({ "command": "echo bounded" })),
+                    raw_output: None,
+                    content: None,
+                    locations: None,
+                    meta: None,
+                },
+                options: vec![AcpPermissionOptionData {
+                    option_id: "allow_once".into(),
+                    name: "Allow once".into(),
+                    kind: AcpPermissionOptionKind::AllowOnce,
+                    meta: None,
+                }],
+                meta: None,
+            },
+        )))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+
+        let mut ws_events = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            ws_events.push(event);
+        }
+        let permission_stream_index = ws_events
+            .iter()
+            .position(|event| event.name == "message.stream" && event.data["type"] == "acp_permission")
+            .expect("ACP permission must remain available on message.stream");
+        let confirmation_add_index = ws_events
+            .iter()
+            .position(|event| event.name == "confirmation.add")
+            .expect("ACP permission must emit the same-chat confirmation event");
+        assert!(permission_stream_index < confirmation_add_index);
+
+        let added = &ws_events[confirmation_add_index].data;
+        assert_eq!(added["conversation_id"], "conv-permission");
+        assert_eq!(added["id"], "call-1");
+        assert_eq!(added["call_id"], "call-1");
+        assert_eq!(added["command_type"], "execute");
+        assert_eq!(added["description"], "echo bounded");
+        assert_eq!(added["options"][0]["value"], "allow_once");
+    }
+
+    #[tokio::test]
+    async fn expired_acp_permission_broadcasts_update_without_a_second_stream_card() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-permission".into(),
+            "asst-permission".into(),
+            "turn-permission".into(),
+            "user-1".into(),
+            repo,
+            bus.clone(),
+            None,
+        );
+
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpPermission(AcpPermissionEventData::Confirmation(
+            Confirmation {
+                id: "call-1".into(),
+                call_id: "call-1".into(),
+                title: Some("Run tool".into()),
+                action: Some("expired".into()),
+                description: "echo bounded".into(),
+                command_type: Some("execute".into()),
+                options: Vec::new(),
+            },
+        )))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+
+        let mut ws_events = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            ws_events.push(event);
+        }
+        let updates = ws_events
+            .iter()
+            .filter(|event| event.name == "confirmation.update")
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].data["conversation_id"], "conv-permission");
+        assert_eq!(updates[0].data["action"], "expired");
+        assert!(
+            !ws_events
+                .iter()
+                .any(|event| event.name == "message.stream" && event.data["type"] == "acp_permission"),
+            "lifecycle updates must not materialize a second rich permission card"
+        );
     }
 
     #[tokio::test]
