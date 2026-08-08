@@ -229,6 +229,54 @@ async fn office_watch_ignores_non_office_files() {
 }
 
 #[tokio::test]
+async fn office_watch_detects_onboarding_step_screen_html() {
+    // CEVE-1822 Paragraph 10 — the frontend has accepted `html` behind its
+    // onboarding NAME pattern all along; the emitter never sent it. This pins
+    // the emitter's half of the contract: a generated step-screen emits.
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, recorder) = make_service();
+    svc.start_office_watch(dir.path().to_str().unwrap()).await.unwrap();
+    settle().await;
+
+    std::fs::write(dir.path().join("onboarding-ollama.html"), "<!-- eve-onboarding-step -->").unwrap();
+    settle().await;
+
+    let events = recorder.take_events();
+    assert!(
+        events.iter().any(|e| e.name == "workspaceOfficeWatch.fileAdded"
+            && e.data["file_path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("onboarding-ollama.html"))),
+        "expected fileAdded for onboarding-ollama.html, got: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn office_watch_still_ignores_arbitrary_html() {
+    // The other half of the same contract: the NAME pattern, not the `.html`
+    // extension, is the gate. Arbitrary agent/user HTML must never emit.
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, recorder) = make_service();
+    svc.start_office_watch(dir.path().to_str().unwrap()).await.unwrap();
+    settle().await;
+    recorder.take_events();
+
+    std::fs::write(dir.path().join("report.html"), "<html></html>").unwrap();
+    std::fs::write(dir.path().join("mein-onboarding.html"), "<html></html>").unwrap();
+    settle().await;
+
+    let events = recorder.take_events();
+    let office_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.name == "workspaceOfficeWatch.fileAdded")
+        .collect();
+    assert!(
+        office_events.is_empty(),
+        "expected no office events for non-onboarding html, got: {office_events:?}"
+    );
+}
+
+#[tokio::test]
 async fn stop_office_watch_stops_events() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, recorder) = make_service();
