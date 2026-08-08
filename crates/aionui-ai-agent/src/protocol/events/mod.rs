@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn session_info_update_preserves_command_eve_desktop_meta() {
+    fn session_info_update_projects_outer_session_id_when_desktop_meta_matches() {
         let desktop_envelope = json!({
             "version": "command-eve-desktop-event/v1",
             "sessionId": "hermes-session-real",
@@ -362,10 +362,91 @@ mod tests {
             panic!("expected exactly one AcpSessionInfo event");
         };
 
+        assert_eq!(data["sessionId"], "hermes-session-real");
         assert_eq!(data["updatedAt"], "2026-08-08T06:45:00Z");
         assert!(data.get("sessionUpdate").is_none());
         assert!(data.get("session_update").is_none());
         assert_eq!(data["_meta"]["commandEveDesktop"], desktop_envelope);
+    }
+
+    #[test]
+    fn session_info_update_projects_outer_session_id_without_nested_session_id() {
+        let notif: SessionNotification = serde_json::from_value(json!({
+            "sessionId": "hermes-session-outer",
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "title": "Fresh title",
+                "_meta": {
+                    "commandEveDesktop": {
+                        "version": "command-eve-desktop-event/v1",
+                        "event": "pane.reveal",
+                        "payload": { "pane": "files" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let events = session_notification_to_events(&notif);
+        let [AgentStreamEvent::AcpSessionInfo(data)] = events.as_slice() else {
+            panic!("expected exactly one AcpSessionInfo event");
+        };
+
+        assert_eq!(data["sessionId"], "hermes-session-outer");
+        assert_eq!(data["title"], "Fresh title");
+        assert_eq!(data["_meta"]["commandEveDesktop"]["event"], "pane.reveal");
+        assert!(data["_meta"]["commandEveDesktop"].get("sessionId").is_none());
+    }
+
+    #[test]
+    fn session_info_update_drops_mismatched_command_eve_desktop_session_id() {
+        let notif: SessionNotification = serde_json::from_value(json!({
+            "sessionId": "hermes-session-canonical",
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": {
+                    "commandEveDesktop": {
+                        "version": "command-eve-desktop-event/v1",
+                        "sessionId": "hermes-session-stale",
+                        "event": "pane.reveal",
+                        "payload": { "pane": "files" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(session_notification_to_events(&notif).is_empty());
+    }
+
+    #[test]
+    fn session_info_update_preserves_real_null_optionals_with_outer_session_id() {
+        let notif: SessionNotification = serde_json::from_value(json!({
+            "sessionId": "hermes-session-null-optionals",
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "title": null,
+                "updatedAt": null,
+                "_meta": {
+                    "commandEveDesktop": {
+                        "version": "command-eve-desktop-event/v1",
+                        "sessionId": "hermes-session-null-optionals",
+                        "event": "preview.open",
+                        "payload": { "url": "https://example.com" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let events = session_notification_to_events(&notif);
+        let [AgentStreamEvent::AcpSessionInfo(data)] = events.as_slice() else {
+            panic!("expected exactly one AcpSessionInfo event");
+        };
+
+        assert_eq!(data["sessionId"], "hermes-session-null-optionals");
+        assert_eq!(data["title"], serde_json::Value::Null);
+        assert_eq!(data["updatedAt"], serde_json::Value::Null);
     }
 
     #[test]

@@ -3,7 +3,7 @@ use agent_client_protocol::schema::{
     SessionNotification, SessionUpdate, ToolCallContent as SdkToolCallContent, ToolCallLocation as SdkToolCallLocation,
     ToolCallStatus as SdkToolCallStatus, ToolCallUpdate as SdkToolCallUpdate, ToolKind as SdkToolKind,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::permission::{
     AcpPermissionEventData, AcpPermissionOptionData, AcpPermissionOptionKind, AcpPermissionRequestData,
@@ -161,9 +161,35 @@ pub(crate) fn session_notification_to_events(notif: &SessionNotification) -> Vec
         }
 
         SessionUpdate::SessionInfoUpdate(update) => {
-            events.push(AgentStreamEvent::AcpSessionInfo(
-                serde_json::to_value(update).unwrap_or_default(),
-            ));
+            let Ok(mut data) = serde_json::to_value(update) else {
+                warn!("Dropping ACP session info update that could not be serialized");
+                return events;
+            };
+            let Some(info) = data.as_object_mut() else {
+                warn!("Dropping ACP session info update that did not serialize to an object");
+                return events;
+            };
+
+            // `SessionNotification.session_id` is the canonical routing identity.
+            // Command EVE desktop metadata also carries a session binding so the
+            // renderer can reject stale/replayed UI commands. Never let a nested
+            // identity override or contradict the outer ACP envelope.
+            if let Some(nested_session_id) = info
+                .get("_meta")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|meta| meta.get("commandEveDesktop"))
+                .and_then(serde_json::Value::as_object)
+                .and_then(|desktop| desktop.get("sessionId"))
+                && nested_session_id.as_str() != Some(session_id.as_str())
+            {
+                warn!(
+                    "Dropping ACP session info update whose Command EVE desktop session binding mismatched the notification envelope"
+                );
+                return events;
+            }
+
+            info.insert("sessionId".into(), serde_json::Value::String(session_id));
+            events.push(AgentStreamEvent::AcpSessionInfo(data));
         }
 
         SessionUpdate::UsageUpdate(update) => {

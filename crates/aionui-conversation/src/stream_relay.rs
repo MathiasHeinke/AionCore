@@ -1870,16 +1870,20 @@ mod tests {
 
         let mut ws_rx = bus.subscribe();
         let rx = tx.subscribe();
-        tx.send(AgentStreamEvent::Start(StartEventData {
-            session_id: Some("hermes-session-real".into()),
-        }))
-        .unwrap();
+        // Deliberately project session info before Start. A reconnecting or
+        // late-mounted renderer must be able to bind this event from its own
+        // canonical session_id instead of depending on transient Start state.
         tx.send(AgentStreamEvent::AcpSessionInfo(json!({
+            "sessionId": "hermes-session-real",
             "updatedAt": "2026-08-08T06:45:00Z",
             "_meta": {
                 "commandEveDesktop": desktop_envelope.clone()
             }
         })))
+        .unwrap();
+        tx.send(AgentStreamEvent::Start(StartEventData {
+            session_id: Some("hermes-session-real".into()),
+        }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
 
@@ -1905,6 +1909,7 @@ mod tests {
         assert_eq!(desktop.data["conversation_id"], "conv-desktop-real");
         assert_eq!(desktop.data["msg_id"], "asst-desktop-real");
         assert_eq!(desktop.data["turn_id"], "turn-desktop-real");
+        assert_eq!(desktop.data["data"]["session_id"], "hermes-session-real");
         assert_eq!(desktop.data["data"]["updated_at"], "2026-08-08T06:45:00Z");
         assert!(desktop.data["data"].get("sessionUpdate").is_none());
         assert!(desktop.data["data"].get("session_update").is_none());
