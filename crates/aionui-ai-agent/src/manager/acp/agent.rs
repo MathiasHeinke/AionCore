@@ -21,8 +21,9 @@ use agent_client_protocol::schema::{
     SetSessionModelRequest, StopReason, UsageUpdate,
 };
 use aionui_api_types::{
-    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AgentHandshake, ConfigOptionConfirmation,
-    GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandCompletionBehavior, SlashCommandItem,
+    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadTerminalResponse, AcpReadTerminalResponseRequest,
+    AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse,
+    SlashCommandCompletionBehavior, SlashCommandItem,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case, now_ms,
@@ -573,6 +574,7 @@ impl AcpAgentManager {
         };
         if params.metadata.backend.as_deref() == Some("hermes") {
             protocol.enable_read_preview().map_err(AgentError::from)?;
+            protocol.enable_read_terminal().map_err(AgentError::from)?;
         }
         let permission_router = Arc::new(PermissionRouter::new(permission_rx));
 
@@ -1095,6 +1097,20 @@ impl AcpAgentManager {
             ));
         }
         self.protocol.respond_read_preview(response)
+    }
+
+    /// Complete one pending Hermes `read_terminal` request through the bounded
+    /// ACP agent-to-client extension seam.
+    pub(crate) fn respond_read_terminal(
+        &self,
+        response: AcpReadTerminalResponseRequest,
+    ) -> Result<AcpReadTerminalResponse, AgentError> {
+        if self.backend() != Some("hermes") {
+            return Err(AgentError::bad_request(
+                "ACP read_terminal responses require a Hermes backend",
+            ));
+        }
+        self.protocol.respond_read_terminal(response)
     }
 
     /// Restore a previously persisted session_id (e.g. from DB on task rebuild).

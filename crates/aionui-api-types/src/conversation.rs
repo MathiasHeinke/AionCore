@@ -236,6 +236,61 @@ pub struct AcpReadPreviewResponse {
     pub accepted: bool,
 }
 
+/// Version marker for the bounded Hermes `read_terminal` ACP extension.
+pub const COMMAND_EVE_READ_TERMINAL_VERSION: &str = "command-eve-read-terminal/v1";
+
+/// Typed renderer event emitted for an accepted agent-to-client
+/// `_command_eve/read_terminal` request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpReadTerminalRequestEventData {
+    pub version: String,
+    pub request_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+}
+
+/// Bounded, plain-text snapshot of the active in-app terminal buffer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpReadTerminalResult {
+    pub total_lines: u32,
+    pub start: u32,
+    pub end: u32,
+    pub viewport_rows: u32,
+    pub cursor_row: u32,
+    pub text: String,
+}
+
+/// Body for `POST /api/conversations/:id/acp/read-terminal/respond`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpReadTerminalResponseRequest {
+    pub version: String,
+    pub request_id: String,
+    pub session_id: String,
+    /// Required on the wire, but explicitly nullable when no terminal exists.
+    #[serde(deserialize_with = "deserialize_required_read_terminal_result")]
+    pub result: Option<AcpReadTerminalResult>,
+}
+
+fn deserialize_required_read_terminal_result<'de, D>(deserializer: D) -> Result<Option<AcpReadTerminalResult>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<AcpReadTerminalResult>::deserialize(deserializer)
+}
+
+/// Acknowledgement returned after the terminal response was correlated and consumed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpReadTerminalResponse {
+    pub accepted: bool,
+}
+
 /// Body for `POST /api/conversations/:id/cancel`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CancelConversationRequest {
@@ -1169,5 +1224,47 @@ mod tests {
             "total_chars": 0
         });
         assert!(serde_json::from_value::<AcpReadPreviewResult>(unknown).is_err());
+    }
+
+    #[test]
+    fn read_terminal_response_requires_nullable_result_and_rejects_unknown_fields() {
+        let valid = json!({
+            "version": COMMAND_EVE_READ_TERMINAL_VERSION,
+            "request_id": "request-1",
+            "session_id": "session-1",
+            "result": null
+        });
+        let parsed: AcpReadTerminalResponseRequest = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(parsed.result, None);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), valid);
+
+        let mut missing_result = valid.clone();
+        missing_result.as_object_mut().unwrap().remove("result");
+        assert!(serde_json::from_value::<AcpReadTerminalResponseRequest>(missing_result).is_err());
+
+        let mut unknown = valid;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("method".into(), json!("generic_rpc"));
+        assert!(serde_json::from_value::<AcpReadTerminalResponseRequest>(unknown).is_err());
+    }
+
+    #[test]
+    fn read_terminal_result_is_strictly_typed() {
+        let valid = json!({
+            "total_lines": 42,
+            "start": 20,
+            "end": 30,
+            "viewport_rows": 10,
+            "cursor_row": 29,
+            "text": "bounded terminal text"
+        });
+        let parsed: AcpReadTerminalResult = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), valid);
+
+        let mut unknown = valid;
+        unknown.as_object_mut().unwrap().insert("ansi".into(), json!(true));
+        assert!(serde_json::from_value::<AcpReadTerminalResult>(unknown).is_err());
     }
 }

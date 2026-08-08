@@ -41,7 +41,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{debug, info, warn};
 
-use aionui_api_types::{AcpReadPreviewResponse, AcpReadPreviewResponseRequest};
+use aionui_api_types::{
+    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadTerminalResponse, AcpReadTerminalResponseRequest,
+};
 
 use crate::error::AgentError;
 use crate::protocol::client_extensions::AcpClientExtensionRouter;
@@ -127,7 +129,7 @@ pub struct AcpProtocol {
     /// background task's `on_receive_notification` closure.
     replay_suppression: Arc<AtomicBool>,
     /// Positive-allowlist agent-to-client extension router. It owns the
-    /// canonical session binding and pending `read_preview` responders.
+    /// canonical session binding and pending bounded renderer-read responders.
     client_extensions: AcpClientExtensionRouter,
 }
 
@@ -273,6 +275,21 @@ impl AcpProtocol {
     /// manager instances. Other ACP backends remain method-not-found.
     pub(crate) fn enable_read_preview(&self) -> Result<(), AcpError> {
         self.client_extensions.enable_read_preview()
+    }
+
+    /// Deliver the renderer's bounded response to the one matching
+    /// agent-to-client `read_terminal` request.
+    pub fn respond_read_terminal(
+        &self,
+        response: AcpReadTerminalResponseRequest,
+    ) -> Result<AcpReadTerminalResponse, AgentError> {
+        self.client_extensions.respond_read_terminal(response)
+    }
+
+    /// Enable the bounded terminal readback extension for verified Hermes
+    /// manager instances. Other ACP backends remain method-not-found.
+    pub(crate) fn enable_read_terminal(&self) -> Result<(), AcpError> {
+        self.client_extensions.enable_read_terminal()
     }
 
     /// Send a prompt to the agent in an active session.

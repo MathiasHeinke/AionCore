@@ -231,6 +231,7 @@ impl ChannelMessageService {
             | AgentStreamEvent::AcpContextUsage(_)
             | AgentStreamEvent::AcpPromptHookWarning(_)
             | AgentStreamEvent::AcpReadPreviewRequest(_)
+            | AgentStreamEvent::AcpReadTerminalRequest(_)
             | AgentStreamEvent::System(_)
             | AgentStreamEvent::RequestTrace(_)
             | AgentStreamEvent::SlashCommandsUpdated(_)
@@ -428,8 +429,8 @@ fn channel_conversation_name(
 mod tests {
     use super::*;
     use aionui_ai_agent::protocol::events::{
-        CorrectionBoundaryEventData, ErrorEventData, FinishEventData, StartEventData, TextEventData, ThinkingEventData,
-        ToolCallEventData, ToolCallStatus,
+        AcpReadTerminalRequestEventData, CorrectionBoundaryEventData, ErrorEventData, FinishEventData, StartEventData,
+        TextEventData, ThinkingEventData, ToolCallEventData, ToolCallStatus,
     };
     use aionui_common::ProviderWithModel;
 
@@ -559,6 +560,18 @@ mod tests {
     #[test]
     fn correction_boundary_stays_internal() {
         let event = AgentStreamEvent::CorrectionBoundary(CorrectionBoundaryEventData::default());
+        assert!(ChannelMessageService::process_stream_event(&event).is_none());
+    }
+
+    #[test]
+    fn terminal_read_request_stays_inside_the_desktop_session() {
+        let event = AgentStreamEvent::AcpReadTerminalRequest(AcpReadTerminalRequestEventData {
+            version: aionui_api_types::COMMAND_EVE_READ_TERMINAL_VERSION.to_owned(),
+            request_id: "request-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            start: None,
+            count: None,
+        });
         assert!(ChannelMessageService::process_stream_event(&event).is_none());
     }
 

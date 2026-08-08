@@ -24,9 +24,9 @@ use crate::protocol::send_error::AgentSendError;
 use crate::types::SendMessageData;
 
 use aionui_api_types::{
-    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, GetConfigOptionsResponse, GetModelInfoResponse,
-    ModelInfoEntry, ModelInfoPayload, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
-    SlashCommandItem,
+    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadTerminalResponse, AcpReadTerminalResponseRequest,
+    GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionResponse,
+    SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,6 +309,23 @@ impl AgentInstance {
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(_) => Err(AgentError::bad_request(
                 "ACP read_preview responses are not supported by this mock agent",
+            )),
+        }
+    }
+
+    /// Complete the one matching Hermes `read_terminal` extension request.
+    pub fn respond_read_terminal(
+        &self,
+        response: AcpReadTerminalResponseRequest,
+    ) -> Result<AcpReadTerminalResponse, AgentError> {
+        match self {
+            Self::Acp(manager) => manager.respond_read_terminal(response),
+            Self::Aionrs(_) => Err(AgentError::bad_request(
+                "ACP read_terminal responses require a Hermes ACP agent",
+            )),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(_) => Err(AgentError::bad_request(
+                "ACP read_terminal responses are not supported by this mock agent",
             )),
         }
     }

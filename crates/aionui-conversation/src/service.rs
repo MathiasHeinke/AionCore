@@ -20,15 +20,15 @@ use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::{ConversationRuntimeStateService, SteerRequestRegistration};
 use aionui_api_types::{
-    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, ApprovalCheckResponse,
-    AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
-    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, ProjectRuntimeWorkspaceRequest,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
-    SteerConversationRequest, SteerConversationResponse, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage,
+    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadTerminalResponse, AcpReadTerminalResponseRequest,
+    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
+    ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
+    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
+    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
+    SessionMcpTransport, SteerConversationRequest, SteerConversationResponse, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -2705,6 +2705,30 @@ impl ConversationService {
                 conversation_id: conversation_id.to_owned(),
             })?;
         agent.respond_read_preview(response).map_err(ConversationError::from)
+    }
+
+    /// Deliver one terminal readback to the exact pending Hermes ACP request.
+    pub async fn respond_read_terminal(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        response: AcpReadTerminalResponseRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<AcpReadTerminalResponse, ConversationError> {
+        self.conversation_repo
+            .get(conversation_id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let agent = task_manager
+            .get_task(conversation_id)
+            .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                conversation_id: conversation_id.to_owned(),
+            })?;
+        agent.respond_read_terminal(response).map_err(ConversationError::from)
     }
 
     /// Send a user message to the conversation.

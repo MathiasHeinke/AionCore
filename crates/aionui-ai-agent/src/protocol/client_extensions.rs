@@ -1,8 +1,10 @@
 //! Fail-closed agent-to-client ACP extension handling.
 //!
 //! This is intentionally not a generic renderer RPC. The only accepted
-//! method is Hermes' bounded `read_preview` request, and the only public
-//! response path consumes a matching request exactly once.
+//! methods are Hermes' bounded `read_preview` and `read_terminal` requests,
+//! and each public response path consumes one matching request exactly once.
+
+mod read_terminal;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -22,10 +24,12 @@ use crate::error::AgentError;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::AgentStreamEvent;
 
+use read_terminal::{COMMAND_EVE_READ_TERMINAL_EXT_METHOD, PendingReadTerminal, cancel_pending_terminal};
+
 pub(crate) const COMMAND_EVE_READ_PREVIEW_EXT_METHOD: &str = "command_eve/read_preview";
 pub(crate) const COMMAND_EVE_READ_PREVIEW_WIRE_METHOD: &str = "_command_eve/read_preview";
 
-const READ_PREVIEW_TIMEOUT: Duration = Duration::from_secs(45);
+const CLIENT_EXTENSION_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_REQUEST_PAYLOAD_BYTES: usize = 4 * 1024;
 const MAX_RESPONSE_PAYLOAD_BYTES: usize = 32 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 256;
@@ -51,8 +55,10 @@ struct PendingReadPreview {
 #[derive(Default)]
 struct ExtensionState {
     read_preview_enabled: bool,
+    read_terminal_enabled: bool,
     bound_session_id: Option<String>,
     pending: HashMap<String, PendingReadPreview>,
+    pending_terminal: HashMap<String, PendingReadTerminal>,
 }
 
 #[derive(Clone)]
@@ -64,7 +70,7 @@ pub(crate) struct AcpClientExtensionRouter {
 
 impl AcpClientExtensionRouter {
     pub(crate) fn new(event_tx: broadcast::Sender<AgentStreamEvent>) -> Self {
-        Self::with_timeout(event_tx, READ_PREVIEW_TIMEOUT)
+        Self::with_timeout(event_tx, CLIENT_EXTENSION_TIMEOUT)
     }
 
     fn with_timeout(event_tx: broadcast::Sender<AgentStreamEvent>, timeout: Duration) -> Self {
@@ -86,46 +92,71 @@ impl AcpClientExtensionRouter {
     /// Rebinding cancels every request from the previous session.
     pub(crate) fn bind_session(&self, session_id: &str) -> Result<(), AcpError> {
         validate_identifier(session_id).map_err(|_| local_binding_error())?;
-        let cancelled = {
+        let (cancelled, cancelled_terminal) = {
             let mut state = self.state.lock().map_err(|_| local_binding_error())?;
             if state.bound_session_id.as_deref() == Some(session_id) {
                 return Ok(());
             }
             state.bound_session_id = Some(session_id.to_owned());
-            state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>()
+            (
+                state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
+                state
+                    .pending_terminal
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>(),
+            )
         };
         cancel_pending(cancelled, "session_rebound");
+        cancel_pending_terminal(cancelled_terminal, "session_rebound");
         Ok(())
     }
 
     /// Unbind a successfully closed session and cancel its outstanding reads.
     pub(crate) fn unbind_session(&self, session_id: &str) {
-        let cancelled = {
+        let (cancelled, cancelled_terminal) = {
             let Ok(mut state) = self.state.lock() else {
-                warn!("ACP read_preview state unavailable while closing session");
+                warn!("ACP client extension state unavailable while closing session");
                 return;
             };
             if state.bound_session_id.as_deref() != Some(session_id) {
                 return;
             }
             state.bound_session_id = None;
-            state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>()
+            (
+                state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
+                state
+                    .pending_terminal
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>(),
+            )
         };
         cancel_pending(cancelled, "session_closed");
+        cancel_pending_terminal(cancelled_terminal, "session_closed");
     }
 
     /// Cancel all pending requests before transport shutdown/disconnect.
     pub(crate) fn cancel_all(&self, reason: &'static str) {
-        let cancelled = {
+        let (cancelled, cancelled_terminal) = {
             let Ok(mut state) = self.state.lock() else {
-                warn!("ACP read_preview state unavailable during cancellation");
+                warn!("ACP client extension state unavailable during cancellation");
                 return;
             };
             state.read_preview_enabled = false;
+            state.read_terminal_enabled = false;
             state.bound_session_id = None;
-            state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>()
+            (
+                state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
+                state
+                    .pending_terminal
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>(),
+            )
         };
         cancel_pending(cancelled, reason);
+        cancel_pending_terminal(cancelled_terminal, reason);
     }
 
     /// Handle one SDK extension request. Unknown methods fail closed.
@@ -207,6 +238,10 @@ impl AcpClientExtensionRouter {
     }
 
     fn handle_raw_request(&self, method: &str, raw_params: &str, respond: ResponseSender) {
+        if method == COMMAND_EVE_READ_TERMINAL_EXT_METHOD {
+            self.handle_read_terminal_request(raw_params, respond);
+            return;
+        }
         if method != COMMAND_EVE_READ_PREVIEW_EXT_METHOD {
             warn!("Rejected non-allowlisted ACP extension request");
             respond_ignoring_transport(respond, Err(JsonRpcError::method_not_found()));
@@ -245,7 +280,9 @@ impl AcpClientExtensionRouter {
                 reject_request(respond, "session_mismatch");
                 return;
             }
-            if state.pending.contains_key(&request.request_id) {
+            if state.pending.contains_key(&request.request_id)
+                || state.pending_terminal.contains_key(&request.request_id)
+            {
                 reject_request(respond, "duplicate_request_id");
                 return;
             }
@@ -302,6 +339,14 @@ impl AcpClientExtensionRouter {
     #[cfg(test)]
     pub(crate) fn pending_count(&self) -> usize {
         self.state.lock().map(|state| state.pending.len()).unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_terminal_count(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.pending_terminal.len())
+            .unwrap_or_default()
     }
 }
 
