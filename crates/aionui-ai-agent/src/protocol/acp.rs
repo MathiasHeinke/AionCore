@@ -33,7 +33,7 @@ use agent_client_protocol::schema::{
     SetSessionModelResponse,
 };
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
+    Agent, AgentRequest, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
 };
 use aionui_common::ErrorChain;
 use tokio::process::{ChildStdin, ChildStdout};
@@ -41,6 +41,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{debug, info, warn};
 
+use aionui_api_types::{AcpReadPreviewResponse, AcpReadPreviewResponseRequest};
+
+use crate::error::AgentError;
+use crate::protocol::client_extensions::AcpClientExtensionRouter;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{self as stream_event, AgentStreamEvent};
 
@@ -122,6 +126,9 @@ pub struct AcpProtocol {
     /// Owned by the outer struct; an `Arc` clone is captured by the SDK
     /// background task's `on_receive_notification` closure.
     replay_suppression: Arc<AtomicBool>,
+    /// Positive-allowlist agent-to-client extension router. It owns the
+    /// canonical session binding and pending `read_preview` responders.
+    client_extensions: AcpClientExtensionRouter,
 }
 
 #[allow(dead_code)] // Full ACP method set; some methods await wiring (fork, close, list, auth, ext).
@@ -140,6 +147,7 @@ impl AcpProtocol {
     ) -> Result<Self, AcpError> {
         let alive = Arc::new(AtomicBool::new(true));
         let replay_suppression = Arc::new(AtomicBool::new(false));
+        let client_extensions = AcpClientExtensionRouter::new(event_tx.clone());
 
         // Signals from the background task:
         // - `init_tx`: initialize handshake result (with possible SDK error)
@@ -163,6 +171,7 @@ impl AcpProtocol {
             shutdown_rx,
             Arc::clone(&alive),
             Arc::clone(&replay_suppression),
+            client_extensions.clone(),
         ));
 
         // Wait for init to complete with timeout.
@@ -186,6 +195,7 @@ impl AcpProtocol {
             alive,
             initialize_response: Arc::new(RwLock::new(Some(init_response))),
             replay_suppression,
+            client_extensions,
         })
     }
 
@@ -203,7 +213,9 @@ impl AcpProtocol {
 
     /// Create a new ACP session.
     pub async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_new).await
+        let response = self.send_request(req, AGENT_METHOD_NAMES.session_new).await?;
+        self.client_extensions.bind_session(response.session_id.0.as_ref())?;
+        Ok(response)
     }
 
     /// Load (resume) an existing ACP session.
@@ -220,8 +232,11 @@ impl AcpProtocol {
     /// Note: Claude resumes via `session/new` with `_meta.claudeCode.options.resume`
     /// and never calls this method, so it is unaffected by the guard.
     pub async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, AcpError> {
+        let session_id = req.session_id.0.clone();
         let _guard = ReplaySuppressionGuard::new(&self.replay_suppression);
-        self.send_request(req, AGENT_METHOD_NAMES.session_load).await
+        let response = self.send_request(req, AGENT_METHOD_NAMES.session_load).await?;
+        self.client_extensions.bind_session(session_id.as_ref())?;
+        Ok(response)
     }
 
     /// Fork an existing ACP session into a new session.
@@ -231,12 +246,33 @@ impl AcpProtocol {
 
     /// Resume an existing ACP session.
     pub async fn resume_session(&self, req: ResumeSessionRequest) -> Result<ResumeSessionResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_resume).await
+        let session_id = req.session_id.0.clone();
+        let response = self.send_request(req, AGENT_METHOD_NAMES.session_resume).await?;
+        self.client_extensions.bind_session(session_id.as_ref())?;
+        Ok(response)
     }
 
     /// Close an ACP session.
     pub async fn close_session(&self, req: CloseSessionRequest) -> Result<CloseSessionResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_close).await
+        let session_id = req.session_id.0.clone();
+        let response = self.send_request(req, AGENT_METHOD_NAMES.session_close).await?;
+        self.client_extensions.unbind_session(session_id.as_ref());
+        Ok(response)
+    }
+
+    /// Deliver the renderer's bounded response to the one matching
+    /// agent-to-client `read_preview` request.
+    pub fn respond_read_preview(
+        &self,
+        response: AcpReadPreviewResponseRequest,
+    ) -> Result<AcpReadPreviewResponse, AgentError> {
+        self.client_extensions.respond_read_preview(response)
+    }
+
+    /// Enable the bounded renderer readback extension for verified Hermes
+    /// manager instances. Other ACP backends remain method-not-found.
+    pub(crate) fn enable_read_preview(&self) -> Result<(), AcpError> {
+        self.client_extensions.enable_read_preview()
     }
 
     /// Send a prompt to the agent in an active session.
@@ -344,6 +380,7 @@ impl AcpProtocol {
 
 impl Drop for AcpProtocol {
     fn drop(&mut self) {
+        self.client_extensions.cancel_all("protocol_dropped");
         // Releasing the oneshot wakes `main_fn` in the background task, which
         // returns, which drives SDK shutdown. The bg_task joins naturally
         // (we don't await it here — Drop can't be async; the task is
@@ -394,6 +431,7 @@ async fn run_sdk_background(
     shutdown_rx: oneshot::Receiver<()>,
     alive: Arc<AtomicBool>,
     replay_suppression: Arc<AtomicBool>,
+    client_extensions: AcpClientExtensionRouter,
 ) {
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
@@ -438,6 +476,16 @@ async fn run_sdk_background(
             {
                 async move |request: RequestPermissionRequest, responder, _cx| {
                     handle_permission_request(request, responder, &permission_tx).await;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let client_extensions = client_extensions.clone();
+                async move |request: AgentRequest, responder, _cx| {
+                    client_extensions.handle_agent_request(request, responder);
                     Ok(())
                 }
             },
@@ -490,6 +538,7 @@ async fn run_sdk_background(
         .await;
 
     alive.store(false, Ordering::Release);
+    client_extensions.cancel_all("connection_closed");
 
     let close_phase = *phase.lock().unwrap();
     match result {
@@ -747,6 +796,91 @@ impl std::fmt::Debug for AcpProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    const MOCK_ACP_AGENT: &str = r#"
+import json
+import pathlib
+import sys
+import time
+
+marker = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] else None
+preview_sent = False
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method is None:
+        if message.get("id") == "preview-rpc" and marker is not None:
+            marker.write_text(json.dumps(message))
+        continue
+
+    request_id = message.get("id")
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}
+    elif method == "session/new":
+        result = {"sessionId": "new-session"}
+    elif method in ("session/load", "session/resume", "session/close"):
+        result = {}
+    else:
+        result = None
+
+    if request_id is not None:
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+
+    if method == "session/new" and not preview_sent:
+        preview_sent = True
+        time.sleep(0.05)
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "preview-rpc",
+            "method": "_command_eve/read_preview",
+            "params": {
+                "version": "command-eve-read-preview/v1",
+                "request_id": "preview-request",
+                "session_id": "new-session",
+                "start": 0,
+                "count": 10
+            }
+        }), flush=True)
+"#;
+
+    #[cfg(unix)]
+    async fn connect_mock_agent(
+        marker: Option<&std::path::Path>,
+    ) -> (
+        AcpProtocol,
+        broadcast::Receiver<AgentStreamEvent>,
+        tokio::process::Child,
+    ) {
+        use std::process::Stdio;
+
+        let python = which::which("python3").expect("python3 is required for ACP lifecycle regression tests");
+        let mut child = tokio::process::Command::new(python)
+            .arg("-u")
+            .arg("-c")
+            .arg(MOCK_ACP_AGENT)
+            .arg(
+                marker
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mock ACP agent");
+        let stdin = child.stdin.take().expect("mock stdin");
+        let stdout = child.stdout.take().expect("mock stdout");
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let (permission_tx, _permission_rx) = mpsc::channel(4);
+        let (notification_tx, _notification_rx) = mpsc::channel(4);
+        let protocol = AcpProtocol::connect(stdin, stdout, event_tx, permission_tx, notification_tx)
+            .await
+            .expect("connect mock ACP agent");
+        (protocol, event_rx, child)
+    }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
         use std::io::Write;
@@ -780,6 +914,116 @@ mod tests {
         tracing::subscriber::with_default(subscriber, f);
 
         String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_new_load_resume_close_bind_the_canonical_extension_session() {
+        let (protocol, mut event_rx, mut child) = connect_mock_agent(None).await;
+        protocol.enable_read_preview().unwrap();
+        assert_eq!(protocol.client_extensions.bound_session_id(), None);
+
+        let temp = tempfile::tempdir().unwrap();
+        let created = protocol
+            .new_session(NewSessionRequest::new(temp.path()))
+            .await
+            .expect("session/new");
+        assert_eq!(created.session_id.0.as_ref(), "new-session");
+        assert_eq!(
+            protocol.client_extensions.bound_session_id().as_deref(),
+            Some("new-session")
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("read_preview event timeout")
+            .expect("read_preview event");
+        assert!(matches!(
+            event,
+            AgentStreamEvent::AcpReadPreviewRequest(data)
+                if data.request_id == "preview-request" && data.session_id == "new-session"
+        ));
+        assert_eq!(protocol.client_extensions.pending_count(), 1);
+        protocol
+            .respond_read_preview(AcpReadPreviewResponseRequest {
+                version: aionui_api_types::COMMAND_EVE_READ_PREVIEW_VERSION.to_owned(),
+                request_id: "preview-request".to_owned(),
+                session_id: "new-session".to_owned(),
+                result: None,
+            })
+            .expect("correlated read_preview response");
+        assert_eq!(protocol.client_extensions.pending_count(), 0);
+
+        protocol
+            .load_session(LoadSessionRequest::new("loaded-session", temp.path()))
+            .await
+            .expect("session/load");
+        assert_eq!(
+            protocol.client_extensions.bound_session_id().as_deref(),
+            Some("loaded-session")
+        );
+
+        protocol
+            .resume_session(ResumeSessionRequest::new("resumed-session", temp.path()))
+            .await
+            .expect("session/resume");
+        assert_eq!(
+            protocol.client_extensions.bound_session_id().as_deref(),
+            Some("resumed-session")
+        );
+
+        protocol
+            .close_session(CloseSessionRequest::new("resumed-session"))
+            .await
+            .expect("session/close");
+        assert_eq!(protocol.client_extensions.bound_session_id(), None);
+
+        drop(protocol);
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protocol_drop_rejects_pending_read_preview_exactly_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("drop-response.json");
+        let (protocol, mut event_rx, mut child) = connect_mock_agent(Some(&marker)).await;
+        protocol.enable_read_preview().unwrap();
+        protocol
+            .new_session(NewSessionRequest::new(temp.path()))
+            .await
+            .expect("session/new");
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("read_preview event timeout")
+            .expect("read_preview event");
+        assert!(matches!(event, AgentStreamEvent::AcpReadPreviewRequest(_)));
+        assert_eq!(protocol.client_extensions.pending_count(), 1);
+
+        drop(protocol);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("drop response marker");
+        let response: serde_json::Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(response["id"], "preview-rpc");
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(response["error"]["data"]["reason"], "protocol_dropped");
+
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+        }
     }
 
     #[test]

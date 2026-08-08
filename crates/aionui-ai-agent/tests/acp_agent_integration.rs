@@ -187,6 +187,7 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::AcpSessionInfo(_) => "AcpSessionInfo",
         AgentStreamEvent::AcpContextUsage(_) => "AcpContextUsage",
         AgentStreamEvent::AcpPromptHookWarning(_) => "AcpPromptHookWarning",
+        AgentStreamEvent::AcpReadPreviewRequest(_) => "AcpReadPreviewRequest",
         AgentStreamEvent::Finish(_) => "Finish",
         AgentStreamEvent::Error(_) => "Error",
         AgentStreamEvent::System(_) => "System",

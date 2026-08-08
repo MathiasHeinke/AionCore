@@ -74,14 +74,15 @@ pub use channel::{
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
-    ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
-    CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
-    ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, ProjectBindingExpectation, ProjectRuntimeWorkspaceRequest, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, SteerConversationRequest, SteerConversationResponse,
+    AcpReadPreviewRequestEventData, AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadPreviewResult,
+    AcpReadPreviewResultKind, ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
+    COMMAND_EVE_READ_PREVIEW_VERSION, CancelConversationRequest, CancelConversationResponse, CloneConversationRequest,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus,
+    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
+    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchItem, MessageSearchResponse, ProjectBindingExpectation, ProjectRuntimeWorkspaceRequest,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SteerConversationRequest, SteerConversationResponse,
     UpdateConversationArtifactRequest, UpdateConversationRequest, WarmupConversationRequest,
 };
 pub use cron::{

@@ -674,6 +674,7 @@ impl StreamRelay {
             AgentStreamEvent::AcpSessionInfo(_) => "AcpSessionInfo",
             AgentStreamEvent::AcpContextUsage(_) => "AcpContextUsage",
             AgentStreamEvent::AcpPromptHookWarning(_) => "AcpPromptHookWarning",
+            AgentStreamEvent::AcpReadPreviewRequest(_) => "AcpReadPreviewRequest",
             AgentStreamEvent::CorrectionBoundary(_) => "CorrectionBoundary",
             AgentStreamEvent::SlashCommandsUpdated(_) => "SlashCommandsUpdated",
             AgentStreamEvent::AvailableCommands(_) => "AvailableCommands",

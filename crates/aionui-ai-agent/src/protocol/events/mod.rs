@@ -5,7 +5,7 @@ pub mod translate;
 
 use serde::{Deserialize, Serialize};
 
-pub use aionui_api_types::AgentStreamErrorData as ErrorEventData;
+pub use aionui_api_types::{AcpReadPreviewRequestEventData, AgentStreamErrorData as ErrorEventData};
 
 pub(crate) use permission::attach_confirmation_authority_metadata;
 pub use permission::{
@@ -47,6 +47,7 @@ pub enum AgentStreamEvent {
     AcpSessionInfo(serde_json::Value),
     AcpContextUsage(serde_json::Value),
     AcpPromptHookWarning(serde_json::Value),
+    AcpReadPreviewRequest(AcpReadPreviewRequestEventData),
     /// Internal boundary emitted when Hermes starts an accepted correction turn.
     /// Conversation persistence consumes this event; it is not user-visible.
     CorrectionBoundary(CorrectionBoundaryEventData),
@@ -137,6 +138,30 @@ mod tests {
         } else {
             panic!("Expected Text event");
         }
+    }
+
+    #[test]
+    fn read_preview_request_event_has_the_exact_renderer_shape() {
+        let event = AgentStreamEvent::AcpReadPreviewRequest(AcpReadPreviewRequestEventData {
+            version: aionui_api_types::COMMAND_EVE_READ_PREVIEW_VERSION.to_owned(),
+            request_id: "request-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            start: Some(8),
+            count: Some(24_000),
+        });
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "type": "acp_read_preview_request",
+                "data": {
+                    "version": "command-eve-read-preview/v1",
+                    "request_id": "request-1",
+                    "session_id": "session-1",
+                    "start": 8,
+                    "count": 24_000
+                }
+            })
+        );
     }
 
     #[test]

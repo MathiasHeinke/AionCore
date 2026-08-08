@@ -24,8 +24,9 @@ use crate::protocol::send_error::AgentSendError;
 use crate::types::SendMessageData;
 
 use aionui_api_types::{
-    GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionResponse,
-    SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
+    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, GetConfigOptionsResponse, GetModelInfoResponse,
+    ModelInfoEntry, ModelInfoPayload, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
+    SlashCommandItem,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +293,23 @@ impl AgentInstance {
             )),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.steer_active_turn(content).await,
+        }
+    }
+
+    /// Complete the one matching Hermes `read_preview` extension request.
+    pub fn respond_read_preview(
+        &self,
+        response: AcpReadPreviewResponseRequest,
+    ) -> Result<AcpReadPreviewResponse, AgentError> {
+        match self {
+            Self::Acp(manager) => manager.respond_read_preview(response),
+            Self::Aionrs(_) => Err(AgentError::bad_request(
+                "ACP read_preview responses require a Hermes ACP agent",
+            )),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(_) => Err(AgentError::bad_request(
+                "ACP read_preview responses are not supported by this mock agent",
+            )),
         }
     }
 

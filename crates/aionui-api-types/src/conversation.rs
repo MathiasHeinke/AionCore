@@ -167,6 +167,75 @@ pub struct SteerConversationResponse {
     pub runtime: ConversationRuntimeSummary,
 }
 
+/// Version marker for the bounded Hermes `read_preview` ACP extension.
+pub const COMMAND_EVE_READ_PREVIEW_VERSION: &str = "command-eve-read-preview/v1";
+
+/// Typed renderer event emitted for an accepted agent-to-client
+/// `_command_eve/read_preview` request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpReadPreviewRequestEventData {
+    pub version: String,
+    pub request_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+}
+
+/// Preview surface selected by the renderer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpReadPreviewResultKind {
+    Url,
+    File,
+    Artifact,
+}
+
+/// Bounded renderer readback for the active preview surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpReadPreviewResult {
+    pub kind: AcpReadPreviewResultKind,
+    pub url: String,
+    pub title: String,
+    pub text: String,
+    pub start: u32,
+    pub end: u32,
+    pub total_chars: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// Body for `POST /api/conversations/:id/acp/read-preview/respond`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpReadPreviewResponseRequest {
+    pub version: String,
+    pub request_id: String,
+    pub session_id: String,
+    /// Required on the wire, but explicitly nullable when no preview exists.
+    #[serde(deserialize_with = "deserialize_required_read_preview_result")]
+    pub result: Option<AcpReadPreviewResult>,
+}
+
+fn deserialize_required_read_preview_result<'de, D>(deserializer: D) -> Result<Option<AcpReadPreviewResult>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<AcpReadPreviewResult>::deserialize(deserializer)
+}
+
+/// Acknowledgement returned after the response was correlated and consumed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpReadPreviewResponse {
+    pub accepted: bool,
+}
+
 /// Body for `POST /api/conversations/:id/cancel`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CancelConversationRequest {
@@ -1048,5 +1117,57 @@ mod tests {
         assert_eq!(raw["kind"], "skill_suggest");
         assert_eq!(raw["status"], "active");
         assert_eq!(raw["payload"]["name"], "daily-report");
+    }
+
+    #[test]
+    fn read_preview_response_requires_nullable_result_and_rejects_unknown_fields() {
+        let valid = json!({
+            "version": COMMAND_EVE_READ_PREVIEW_VERSION,
+            "request_id": "request-1",
+            "session_id": "session-1",
+            "result": null
+        });
+        let parsed: AcpReadPreviewResponseRequest = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(parsed.result, None);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), valid);
+
+        let mut missing_result = valid.clone();
+        missing_result.as_object_mut().unwrap().remove("result");
+        assert!(serde_json::from_value::<AcpReadPreviewResponseRequest>(missing_result).is_err());
+
+        let mut unknown = valid;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("method".into(), json!("generic_rpc"));
+        assert!(serde_json::from_value::<AcpReadPreviewResponseRequest>(unknown).is_err());
+    }
+
+    #[test]
+    fn read_preview_result_kind_is_strictly_allowlisted() {
+        for kind in ["url", "file", "artifact"] {
+            let raw = json!({
+                "kind": kind,
+                "url": "https://example.test",
+                "title": "Preview",
+                "text": "visible",
+                "start": 0,
+                "end": 7,
+                "total_chars": 7
+            });
+            let parsed: AcpReadPreviewResult = serde_json::from_value(raw).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap()["kind"], kind);
+        }
+
+        let unknown = json!({
+            "kind": "terminal",
+            "url": "",
+            "title": "",
+            "text": "",
+            "start": 0,
+            "end": 0,
+            "total_chars": 0
+        });
+        assert!(serde_json::from_value::<AcpReadPreviewResult>(unknown).is_err());
     }
 }

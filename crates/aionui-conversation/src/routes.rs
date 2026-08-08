@@ -7,12 +7,13 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
-    ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
-    CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SteerConversationRequest,
-    SteerConversationResponse, UpdateConversationArtifactRequest, UpdateConversationRequest, WarmupConversationRequest,
+    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, ActiveCountResponse, ApiResponse, ApprovalCheckQuery,
+    ApprovalCheckResponse, CancelConversationRequest, CancelConversationResponse, CloneConversationRequest,
+    ConfirmRequest, ConfirmationListResponse, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationListResponse, ConversationResponse, CreateConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, SteerConversationRequest, SteerConversationResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WarmupConversationRequest,
 };
 use aionui_auth::{AuthenticationProvenance, CurrentUser, extract_project_runtime_attestation_from_headers};
 use aionui_common::ApiError;
@@ -143,6 +144,10 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/steer", post(steer))
+        .route(
+            "/api/conversations/{id}/acp/read-preview/respond",
+            post(respond_read_preview),
+        )
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
@@ -313,6 +318,21 @@ async fn steer(
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+}
+
+async fn respond_read_preview(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<AcpReadPreviewResponseRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<AcpReadPreviewResponse>>, ApiError> {
+    let Json(response) = body.map_err(ApiError::from)?;
+    let result = state
+        .service
+        .respond_read_preview(&user.id, &id, response, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
 }
 
 async fn list_artifacts(
