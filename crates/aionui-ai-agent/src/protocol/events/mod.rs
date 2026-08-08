@@ -335,6 +335,40 @@ mod tests {
     }
 
     #[test]
+    fn session_info_update_preserves_command_eve_desktop_meta() {
+        let desktop_envelope = json!({
+            "version": "command-eve-desktop-event/v1",
+            "sessionId": "hermes-session-real",
+            "event": "preview.open",
+            "payload": {
+                "url": "https://example.com",
+                "label": "Example"
+            }
+        });
+        let notif: SessionNotification = serde_json::from_value(json!({
+            "sessionId": "hermes-session-real",
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "updatedAt": "2026-08-08T06:45:00Z",
+                "_meta": {
+                    "commandEveDesktop": desktop_envelope.clone()
+                }
+            }
+        }))
+        .unwrap();
+
+        let events = session_notification_to_events(&notif);
+        let [AgentStreamEvent::AcpSessionInfo(data)] = events.as_slice() else {
+            panic!("expected exactly one AcpSessionInfo event");
+        };
+
+        assert_eq!(data["updatedAt"], "2026-08-08T06:45:00Z");
+        assert!(data.get("sessionUpdate").is_none());
+        assert!(data.get("session_update").is_none());
+        assert_eq!(data["_meta"]["commandEveDesktop"], desktop_envelope);
+    }
+
+    #[test]
     fn ordinary_agent_message_that_mentions_steering_still_streams() {
         let notif: SessionNotification = serde_json::from_value(json!({
             "sessionId": "sess-1",

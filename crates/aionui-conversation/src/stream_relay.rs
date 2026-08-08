@@ -976,7 +976,7 @@ mod tests {
     use aionui_ai_agent::protocol::events::{
         AcpPermissionEventData, AcpPermissionOptionData, AcpPermissionOptionKind, AcpPermissionRequestData,
         AcpPermissionToolCall, AcpToolCallKind, CorrectionBoundaryEventData, ErrorEventData, FinishEventData,
-        TextEventData, ThinkingEventData,
+        StartEventData, TextEventData, ThinkingEventData,
     };
     use aionui_common::Confirmation;
     use aionui_db::DbError;
@@ -1842,6 +1842,73 @@ mod tests {
             .find(|e| e.name == "message.stream")
             .expect("finish should be forwarded as message.stream");
         assert_eq!(stream_event.data["turn_id"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn acp_session_info_websocket_projection_preserves_meta_namespace_and_real_ids() {
+        let desktop_envelope = json!({
+            "version": "command-eve-desktop-event/v1",
+            "sessionId": "hermes-session-real",
+            "event": "preview.open",
+            "payload": {
+                "url": "https://example.com",
+                "label": "Example"
+            }
+        });
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-desktop-real".into(),
+            "asst-desktop-real".into(),
+            "turn-desktop-real".into(),
+            "user-1".into(),
+            repo,
+            bus.clone(),
+            None,
+        );
+
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Start(StartEventData {
+            session_id: Some("hermes-session-real".into()),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::AcpSessionInfo(json!({
+            "updatedAt": "2026-08-08T06:45:00Z",
+            "_meta": {
+                "commandEveDesktop": desktop_envelope.clone()
+            }
+        })))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+
+        let mut ws_events = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            ws_events.push(event);
+        }
+
+        let start = ws_events
+            .iter()
+            .find(|event| event.name == "message.stream" && event.data["type"] == "start")
+            .expect("Start must be projected to message.stream");
+        assert_eq!(start.data["conversation_id"], "conv-desktop-real");
+        assert_eq!(start.data["data"]["session_id"], "hermes-session-real");
+
+        let desktop = ws_events
+            .iter()
+            .find(|event| event.name == "message.stream" && event.data["type"] == "acp_session_info")
+            .expect("AcpSessionInfo must be projected to message.stream");
+        assert_eq!(desktop.data["conversation_id"], "conv-desktop-real");
+        assert_eq!(desktop.data["msg_id"], "asst-desktop-real");
+        assert_eq!(desktop.data["turn_id"], "turn-desktop-real");
+        assert_eq!(desktop.data["data"]["updated_at"], "2026-08-08T06:45:00Z");
+        assert!(desktop.data["data"].get("sessionUpdate").is_none());
+        assert!(desktop.data["data"].get("session_update").is_none());
+        assert_eq!(desktop.data["data"]["_meta"]["commandEveDesktop"], desktop_envelope);
     }
 
     #[tokio::test]
