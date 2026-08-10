@@ -9,10 +9,15 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
-use agent_client_protocol::schema::{ContentBlock, LoadSessionRequest, PromptRequest, SessionId, StopReason};
+use agent_client_protocol::schema::{
+    ContentBlock, LoadSessionRequest, PromptRequest, ResourceLink, SessionId, StopReason,
+};
 use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
+use std::fs;
+use std::path::Path;
 use tokio::sync::broadcast::error::TryRecvError;
+use url::Url;
 
 use super::agent::sdk_to_snake_value;
 use super::agent_close::STDERR_PEEK_LINES;
@@ -21,6 +26,34 @@ use tracing::warn;
 
 const UNRENDERED_STDERR_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 const UNRENDERED_STDERR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+fn build_prompt_content_blocks(data: &SendMessageData) -> Result<Vec<ContentBlock>, AgentError> {
+    let mut blocks = Vec::with_capacity(data.files.len() + 1);
+    blocks.push(ContentBlock::from(data.content.clone()));
+
+    for file in &data.files {
+        let path = Path::new(file);
+        if !path.is_absolute() {
+            return Err(AgentError::bad_request(
+                "ATTACHMENT_CONTEXT_UNAVAILABLE: attached file paths must be absolute",
+            ));
+        }
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| AgentError::bad_request("ATTACHMENT_CONTEXT_UNAVAILABLE: an attached file is missing"))?;
+        if !metadata.is_file() {
+            return Err(AgentError::bad_request(
+                "ATTACHMENT_CONTEXT_UNAVAILABLE: attachments must be regular files",
+            ));
+        }
+        let name = path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+            AgentError::bad_request("ATTACHMENT_CONTEXT_UNAVAILABLE: an attached filename is invalid")
+        })?;
+        let uri = Url::from_file_path(path)
+            .map_err(|_| AgentError::bad_request("ATTACHMENT_CONTEXT_UNAVAILABLE: an attached file URI is invalid"))?;
+        blocks.push(ContentBlock::ResourceLink(ResourceLink::new(name, uri.to_string())));
+    }
+    Ok(blocks)
+}
 
 #[derive(Debug)]
 pub(super) enum PromptOutcome {
@@ -278,7 +311,7 @@ impl AcpAgentManager {
             .ok_or_else(|| AgentError::internal("Cannot prompt: no session ID available"))
             .map_err(AcpSendFailure::from)?;
 
-        let content = data.content.clone();
+        let prompt = build_prompt_content_blocks(data).map_err(AcpSendFailure::from)?;
 
         // Subscribe BEFORE emitting Start so we can observe every event
         // produced during this turn. Used after `prompt()` returns to detect
@@ -297,10 +330,7 @@ impl AcpAgentManager {
 
         let prompt_response = self
             .protocol
-            .prompt(PromptRequest::new(
-                SessionId::new(sid),
-                vec![ContentBlock::from(content)],
-            ))
+            .prompt(PromptRequest::new(SessionId::new(sid), prompt))
             .await
             .map_err(AcpSendFailure::from)?;
 
@@ -539,9 +569,62 @@ mod tests {
     use crate::manager::acp::{AcpSession, AcpSessionEvent};
     use crate::protocol::error::AcpError;
     use crate::shared_kernel::SessionId as DomainSessionId;
-    use agent_client_protocol::schema::AgentCapabilities;
+    use crate::types::SendMessageData;
+    use agent_client_protocol::schema::{AgentCapabilities, ContentBlock};
+    use std::fs;
+    use tempfile::tempdir;
+    use url::Url;
+
+    use super::build_prompt_content_blocks;
+
     fn make_session() -> AcpSession {
         AcpSession::new(None, None, Default::default())
+    }
+
+    #[test]
+    fn prompt_blocks_forward_files_as_ordered_resource_links() {
+        let directory = tempdir().unwrap();
+        let first_path = directory.path().join("first.txt");
+        let second_path = directory.path().join("second.pdf");
+        fs::write(&first_path, "first").unwrap();
+        fs::write(&second_path, "%PDF-1.4\n%%EOF\n").unwrap();
+        let data = SendMessageData {
+            content: "Read both attachments.".into(),
+            msg_id: "msg-files".into(),
+            turn_id: Some("turn-files".into()),
+            files: vec![
+                first_path.to_string_lossy().into_owned(),
+                second_path.to_string_lossy().into_owned(),
+            ],
+            inject_skills: Vec::new(),
+        };
+
+        let blocks = build_prompt_content_blocks(&data).unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], ContentBlock::Text(text) if text.text == data.content));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::ResourceLink(link)
+                if link.name == "first.txt" && link.uri == Url::from_file_path(&first_path).unwrap().to_string()
+        ));
+        assert!(matches!(
+            &blocks[2],
+            ContentBlock::ResourceLink(link)
+                if link.name == "second.pdf" && link.uri == Url::from_file_path(&second_path).unwrap().to_string()
+        ));
+    }
+
+    #[test]
+    fn prompt_blocks_preserve_text_only_legacy_shape() {
+        let data = SendMessageData {
+            content: "Hello".into(),
+            msg_id: "msg-text".into(),
+            turn_id: None,
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+        };
+        let blocks = build_prompt_content_blocks(&data).unwrap();
+        assert!(matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text.text == "Hello"));
     }
 
     /// `open_session_resume` reads `session.agent_capabilities().load_session`
