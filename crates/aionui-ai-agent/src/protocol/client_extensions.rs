@@ -364,6 +364,10 @@ impl AcpClientExtensionRouter {
     fn handle_async_completion_request(&self, raw_params: &str, respond: ResponseSender) {
         let enabled = self.state.lock().is_ok_and(|state| state.async_completion_enabled);
         if !enabled {
+            if self.async_completion_route.is_some() {
+                respond_async_completion_retryable(respond, "session_not_bound");
+                return;
+            }
             warn!(
                 method = COMMAND_EVE_ASYNC_COMPLETION_WIRE_METHOD,
                 "Rejected disabled ACP async completion"
@@ -398,13 +402,16 @@ impl AcpClientExtensionRouter {
             respond_async_completion_rejected(respond, "invalid_content");
             return;
         }
-        if !self
-            .state
-            .lock()
-            .is_ok_and(|state| state.bound_session_id.as_deref() == Some(request.session_id.as_str()))
-        {
-            respond_async_completion_rejected(respond, "session_mismatch");
-            return;
+        match self.state.lock().ok().and_then(|state| state.bound_session_id.clone()) {
+            None => {
+                respond_async_completion_retryable(respond, "session_not_bound");
+                return;
+            }
+            Some(bound_session_id) if bound_session_id != request.session_id => {
+                respond_async_completion_rejected(respond, "session_mismatch");
+                return;
+            }
+            Some(_) => {}
         }
 
         let Some(route) = self.async_completion_route.clone() else {
@@ -832,6 +839,44 @@ mod tests {
         let response: AcpAsyncCompletionResponse = serde_json::from_value(value).unwrap();
         assert_eq!(response.status, AcpAsyncCompletionAckStatus::Accepted);
         assert_eq!(response.turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[tokio::test]
+    async fn async_completion_is_retryable_until_session_binding_is_positive() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
+        let router = AcpClientExtensionRouter::new(event_tx).with_async_completion(completion_route(completion_tx));
+
+        for expected_phase in ["before enable", "before bind"] {
+            let response = dispatch(
+                &router,
+                COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+                serde_json::to_value(completion_request("session-1")).unwrap(),
+            );
+            let response: AcpAsyncCompletionResponse =
+                serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
+            assert_eq!(
+                response.status,
+                AcpAsyncCompletionAckStatus::Retryable,
+                "{expected_phase}"
+            );
+            assert_eq!(response.code.as_deref(), Some("session_not_bound"));
+            assert!(completion_rx.try_recv().is_err(), "pre-bind wake must not dispatch");
+
+            if expected_phase == "before enable" {
+                router.enable_async_completion().unwrap();
+            }
+        }
+
+        router.bind_session("session-1").unwrap();
+        let mismatched = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-2")).unwrap(),
+        );
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(mismatched.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Rejected);
+        assert_eq!(response.code.as_deref(), Some("session_mismatch"));
     }
 
     #[tokio::test]

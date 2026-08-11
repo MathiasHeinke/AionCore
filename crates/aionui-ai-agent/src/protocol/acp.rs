@@ -26,11 +26,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use agent_client_protocol::schema::{
-    AGENT_METHOD_NAMES, AuthenticateResponse, ClientNotification, ClientRequest, CloseSessionResponse, ExtResponse,
-    ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse, PromptResponse, ProtocolVersion,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionResponse,
-    SelectedPermissionOutcome, SessionNotification, SetSessionConfigOptionResponse, SetSessionModeResponse,
-    SetSessionModelResponse,
+    AGENT_METHOD_NAMES, AuthenticateResponse, ClientCapabilities, ClientNotification, ClientRequest,
+    CloseSessionResponse, ExtResponse, ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse,
+    PromptResponse, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionResponse, SelectedPermissionOutcome, SessionNotification, SetSessionConfigOptionResponse,
+    SetSessionModeResponse, SetSessionModelResponse,
 };
 use agent_client_protocol::{
     Agent, AgentRequest, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
@@ -68,6 +68,7 @@ const INIT_TIMEOUT_SECS: u64 = 30;
 /// API rejects when empty. Always send non-empty values (see issue #3326).
 const ACP_CLIENT_NAME: &str = "AionUi";
 const ACP_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const COMMAND_EVE_ASYNC_COMPLETION_CAPABILITY_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcpConnectionPhase {
@@ -80,8 +81,23 @@ enum AcpConnectionPhase {
 /// Build the ACP `initialize` request, always populating `clientInfo` with a
 /// non-empty name and version so downstream agents that require client metadata
 /// (e.g. Mistral Vibe) accept the request. See issue #3326.
-fn build_initialize_request() -> InitializeRequest {
+fn build_initialize_request(advertise_async_completion: bool) -> InitializeRequest {
+    let mut client_capabilities = ClientCapabilities::new();
+    if advertise_async_completion {
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "command_eve".to_owned(),
+            serde_json::json!({
+                "async_completion": {
+                    "version": COMMAND_EVE_ASYNC_COMPLETION_CAPABILITY_VERSION
+                }
+            }),
+        );
+        client_capabilities = client_capabilities.meta(meta);
+    }
+
     InitializeRequest::new(ProtocolVersion::LATEST)
+        .client_capabilities(client_capabilities)
         .client_info(Implementation::new(ACP_CLIENT_NAME, ACP_CLIENT_VERSION))
 }
 
@@ -162,6 +178,7 @@ impl AcpProtocol {
     ) -> Result<Self, AcpError> {
         let alive = Arc::new(AtomicBool::new(true));
         let replay_suppression = Arc::new(AtomicBool::new(false));
+        let advertise_async_completion = async_completion.is_some();
         let client_extensions = match async_completion {
             Some(route) => AcpClientExtensionRouter::new(event_tx.clone()).with_async_completion(route),
             None => AcpClientExtensionRouter::new(event_tx.clone()),
@@ -190,6 +207,7 @@ impl AcpProtocol {
             Arc::clone(&alive),
             Arc::clone(&replay_suppression),
             client_extensions.clone(),
+            advertise_async_completion,
         ));
 
         // Wait for init to complete with timeout.
@@ -469,6 +487,7 @@ async fn run_sdk_background(
     alive: Arc<AtomicBool>,
     replay_suppression: Arc<AtomicBool>,
     client_extensions: AcpClientExtensionRouter,
+    advertise_async_completion: bool,
 ) {
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
@@ -532,7 +551,7 @@ async fn run_sdk_background(
             // Step 1 — initialize handshake. main_fn is the canonical place
             // to call `block_task` (see SDK `connect_with` doc example).
             let init_result = {
-                let req = build_initialize_request();
+                let req = build_initialize_request(advertise_async_completion);
                 log_client_request("initialize", &json_str(&req));
                 *phase_for_main.lock().unwrap() = AcpConnectionPhase::Initializing;
                 let raw = connection.send_request(req).block_task().await;
@@ -1207,7 +1226,7 @@ for line in sys.stdin:
     fn initialize_request_sends_non_empty_client_info() {
         // Regression test for #3326: agents like Mistral Vibe forward clientInfo
         // downstream as client_name/client_version and reject empty values.
-        let req = build_initialize_request();
+        let req = build_initialize_request(false);
 
         let client_info = req.client_info.as_ref().expect("clientInfo must be present");
         assert_eq!(client_info.name, "AionUi");
@@ -1218,5 +1237,21 @@ for line in sys.stdin:
         let json = serde_json::to_value(&req).expect("request serializes");
         assert_eq!(json["clientInfo"]["name"], "AionUi");
         assert_ne!(json["clientInfo"]["version"], "");
+        assert!(
+            json["clientCapabilities"].get("_meta").is_none(),
+            "ordinary ACP clients must not advertise Command EVE async completion"
+        );
+    }
+
+    #[test]
+    fn initialize_request_advertises_async_completion_only_for_a_configured_route() {
+        let enabled = serde_json::to_value(build_initialize_request(true)).expect("request serializes");
+        assert_eq!(
+            enabled["clientCapabilities"]["_meta"]["command_eve"]["async_completion"]["version"],
+            COMMAND_EVE_ASYNC_COMPLETION_CAPABILITY_VERSION
+        );
+
+        let disabled = serde_json::to_value(build_initialize_request(false)).expect("request serializes");
+        assert!(disabled["clientCapabilities"].get("_meta").is_none());
     }
 }

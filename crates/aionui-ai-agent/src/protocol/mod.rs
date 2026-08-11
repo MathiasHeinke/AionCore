@@ -5,3 +5,6 @@ pub(crate) mod custom_agent_probe;
 pub(crate) mod error;
 pub mod events;
 pub mod send_error;
+
+#[cfg(test)]
+mod provider_free_durable_wake_test;
