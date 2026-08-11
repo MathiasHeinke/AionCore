@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData, VerifiedAttachmentGrounding};
 use aionui_ai_agent::{
-    AgentSendError, AgentSessionKind, IWorkerTaskManager, forget_command_eve_prompt_admission,
+    AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager, forget_command_eve_prompt_admission,
     reject_command_eve_prompt_admission,
 };
 use aionui_common::{AgentType, ConversationStatus, ErrorChain, now_ms};
@@ -66,6 +66,7 @@ struct TurnAttemptInput {
     allowed_skill_names: Vec<String>,
     continuation_count: usize,
     defer_clean_terminal_errors: bool,
+    ready_agent_only: bool,
 }
 
 struct TurnAttemptResult {
@@ -101,11 +102,16 @@ impl ConversationTurnOrchestrator {
             "Agent task build started"
         );
 
-        let agent = match self
-            .task_manager
-            .get_or_build_task(&input.conv_id, input.build_options)
-            .await
-        {
+        let agent_result = if input.ready_agent_only {
+            self.task_manager
+                .get_task(&input.conv_id)
+                .ok_or_else(|| AgentError::conflict("ATTACHMENT_PROMPT_RUNTIME_NOT_READY"))
+        } else {
+            self.task_manager
+                .get_or_build_task(&input.conv_id, input.build_options)
+                .await
+        };
+        let agent = match agent_result {
             Ok(agent) => agent,
             Err(err) => {
                 reject_command_eve_prompt_admission(&input.turn_id, "ATTACHMENT_PROMPT_ADMISSION_AGENT_BUILD_FAILED");
@@ -373,6 +379,7 @@ impl ConversationTurnOrchestrator {
                     allowed_skill_names: allowed_skill_names.clone(),
                     continuation_count: 0,
                     defer_clean_terminal_errors: !replayed,
+                    ready_agent_only: !replayed && !initial_send.verified_attachment_grounding.is_empty(),
                 })
                 .await
             {

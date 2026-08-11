@@ -649,6 +649,10 @@ fn local_binding_error() -> AcpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt_admission::{
+        command_eve_prompt_admission_for_turn, forget_command_eve_prompt_admission,
+        register_command_eve_prompt_admission,
+    };
     use aionui_api_types::AcpReadPreviewResultKind;
     use tokio::sync::oneshot;
 
@@ -693,8 +697,225 @@ mod tests {
         rx
     }
 
+    fn dispatch_prompt_raw(
+        router: &AcpClientExtensionRouter,
+        raw: &str,
+    ) -> oneshot::Receiver<Result<serde_json::Value, JsonRpcError>> {
+        let (tx, rx) = oneshot::channel();
+        let sender: ResponseSender =
+            Box::new(move |result| tx.send(result).map_err(|_| JsonRpcError::internal_error()));
+        router.handle_prompt_admission_request(raw, sender);
+        rx
+    }
+
+    fn dispatch_prompt(
+        router: &AcpClientExtensionRouter,
+        wire: &CommandEvePromptAdmissionWireRequest,
+    ) -> oneshot::Receiver<Result<serde_json::Value, JsonRpcError>> {
+        dispatch_prompt_raw(router, &serde_json::to_string(wire).unwrap())
+    }
+
+    fn failing_prompt_delivery(router: &AcpClientExtensionRouter, wire: &CommandEvePromptAdmissionWireRequest) {
+        let sender: ResponseSender = Box::new(|_| Err(JsonRpcError::internal_error()));
+        router.handle_prompt_admission_request(&serde_json::to_string(wire).unwrap(), sender);
+    }
+
+    fn admission_wire(
+        turn_id: &str,
+        session_id: &str,
+        phase: CommandEvePromptAdmissionPhase,
+    ) -> CommandEvePromptAdmissionWireRequest {
+        let request = command_eve_prompt_admission_for_turn(turn_id).expect("registered admission");
+        CommandEvePromptAdmissionWireRequest {
+            version: request.version,
+            request_id: request.request_id,
+            turn_id: request.turn_id,
+            receipt_sha256: request.receipt_sha256,
+            session_id: session_id.to_owned(),
+            phase,
+        }
+    }
+
+    fn accepted_prompt_response(value: serde_json::Value) -> bool {
+        serde_json::from_value::<CommandEvePromptAdmissionResponse>(value)
+            .is_ok_and(|response| response.status == CommandEvePromptAdmissionStatus::Accepted)
+    }
+
     fn enable(router: &AcpClientExtensionRouter) {
         router.enable_read_preview().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_admission_router_rejects_bad_binding_wire_and_payload_without_consuming_the_ticket() {
+        let (event_tx, _event_rx) = broadcast::channel(4);
+        let router = AcpClientExtensionRouter::new(event_tx);
+        router.bind_session("session-router").unwrap();
+        let ticket = register_command_eve_prompt_admission("turn-router-wire", &"a".repeat(64)).unwrap();
+
+        let wrong_session = admission_wire(
+            "turn-router-wire",
+            "session-other",
+            CommandEvePromptAdmissionPhase::Accept,
+        );
+        assert!(!accepted_prompt_response(
+            dispatch_prompt(&router, &wrong_session).await.unwrap().unwrap()
+        ));
+        assert!(command_eve_prompt_admission_for_turn("turn-router-wire").is_some());
+
+        let oversized = "x".repeat(MAX_PROMPT_ADMISSION_PAYLOAD_BYTES + 1);
+        assert_eq!(
+            i32::from(
+                dispatch_prompt_raw(&router, &oversized)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .code
+            ),
+            -32603
+        );
+        for invalid in [
+            "{".to_owned(),
+            serde_json::json!({
+                "version": COMMAND_EVE_PROMPT_ADMISSION_VERSION,
+                "request_id": "request",
+                "turn_id": "turn",
+                "receipt_sha256": "a".repeat(64),
+                "session_id": "session-router",
+                "phase": "accept",
+                "unexpected": true,
+            })
+            .to_string(),
+            serde_json::json!({
+                "version": COMMAND_EVE_PROMPT_ADMISSION_VERSION,
+                "request_id": "request",
+                "turn_id": "turn",
+                "receipt_sha256": "a".repeat(64),
+                "session_id": "session-router",
+                "phase": "unknown",
+            })
+            .to_string(),
+        ] {
+            assert_eq!(
+                i32::from(dispatch_prompt_raw(&router, &invalid).await.unwrap().unwrap_err().code),
+                -32603
+            );
+        }
+
+        let accepted = admission_wire(
+            "turn-router-wire",
+            "session-router",
+            CommandEvePromptAdmissionPhase::Accept,
+        );
+        assert!(accepted_prompt_response(
+            dispatch_prompt(&router, &accepted).await.unwrap().unwrap()
+        ));
+        forget_command_eve_prompt_admission("turn-router-wire");
+        drop(ticket);
+    }
+
+    #[tokio::test]
+    async fn prompt_admission_router_publishes_commit_before_immediate_finalize_and_delivers_both_responses() {
+        let (event_tx, _event_rx) = broadcast::channel(4);
+        let router = AcpClientExtensionRouter::new(event_tx);
+        router.bind_session("session-router-race").unwrap();
+        let ticket = register_command_eve_prompt_admission("turn-router-race", &"b".repeat(64)).unwrap();
+
+        let accept = admission_wire(
+            "turn-router-race",
+            "session-router-race",
+            CommandEvePromptAdmissionPhase::Accept,
+        );
+        assert!(accepted_prompt_response(
+            dispatch_prompt(&router, &accept).await.unwrap().unwrap()
+        ));
+
+        let commit = admission_wire(
+            "turn-router-race",
+            "session-router-race",
+            CommandEvePromptAdmissionPhase::Commit,
+        );
+        let commit_response = dispatch_prompt(&router, &commit);
+        let claim = ticket.wait().await.unwrap();
+        let finalize_ticket = claim.accept().unwrap();
+        assert!(accepted_prompt_response(commit_response.await.unwrap().unwrap()));
+
+        let finalize = admission_wire(
+            "turn-router-race",
+            "session-router-race",
+            CommandEvePromptAdmissionPhase::Finalize,
+        );
+        let finalize_response = dispatch_prompt(&router, &finalize);
+        let finalize_claim = finalize_ticket.wait().await.unwrap();
+        finalize_claim.accept().unwrap();
+        assert!(accepted_prompt_response(finalize_response.await.unwrap().unwrap()));
+        forget_command_eve_prompt_admission("turn-router-race");
+    }
+
+    #[tokio::test]
+    async fn prompt_admission_router_rolls_back_accept_commit_and_finalize_delivery_failures() {
+        let (event_tx, _event_rx) = broadcast::channel(4);
+        let router = AcpClientExtensionRouter::new(event_tx);
+        router.bind_session("session-router-delivery").unwrap();
+
+        let accept_ticket = register_command_eve_prompt_admission("turn-router-accept-fail", &"c".repeat(64)).unwrap();
+        let accept = admission_wire(
+            "turn-router-accept-fail",
+            "session-router-delivery",
+            CommandEvePromptAdmissionPhase::Accept,
+        );
+        failing_prompt_delivery(&router, &accept);
+        assert!(accept_ticket.wait().await.is_err());
+        assert!(command_eve_prompt_admission_for_turn("turn-router-accept-fail").is_none());
+
+        let commit_ticket = register_command_eve_prompt_admission("turn-router-commit-fail", &"d".repeat(64)).unwrap();
+        let accept = admission_wire(
+            "turn-router-commit-fail",
+            "session-router-delivery",
+            CommandEvePromptAdmissionPhase::Accept,
+        );
+        assert!(accepted_prompt_response(
+            dispatch_prompt(&router, &accept).await.unwrap().unwrap()
+        ));
+        let commit = admission_wire(
+            "turn-router-commit-fail",
+            "session-router-delivery",
+            CommandEvePromptAdmissionPhase::Commit,
+        );
+        failing_prompt_delivery(&router, &commit);
+        let claim = commit_ticket.wait().await.unwrap();
+        let finalize_ticket = claim.accept().unwrap();
+        assert!(finalize_ticket.wait().await.is_err());
+        assert!(command_eve_prompt_admission_for_turn("turn-router-commit-fail").is_none());
+
+        let finalize_ticket_source =
+            register_command_eve_prompt_admission("turn-router-finalize-fail", &"e".repeat(64)).unwrap();
+        let accept = admission_wire(
+            "turn-router-finalize-fail",
+            "session-router-delivery",
+            CommandEvePromptAdmissionPhase::Accept,
+        );
+        assert!(accepted_prompt_response(
+            dispatch_prompt(&router, &accept).await.unwrap().unwrap()
+        ));
+        let commit = admission_wire(
+            "turn-router-finalize-fail",
+            "session-router-delivery",
+            CommandEvePromptAdmissionPhase::Commit,
+        );
+        let commit_response = dispatch_prompt(&router, &commit);
+        let claim = finalize_ticket_source.wait().await.unwrap();
+        let finalize_ticket = claim.accept().unwrap();
+        assert!(accepted_prompt_response(commit_response.await.unwrap().unwrap()));
+        let finalize = admission_wire(
+            "turn-router-finalize-fail",
+            "session-router-delivery",
+            CommandEvePromptAdmissionPhase::Finalize,
+        );
+        failing_prompt_delivery(&router, &finalize);
+        let claim = finalize_ticket.wait().await.unwrap();
+        claim.accept().unwrap();
+        tokio::task::yield_now().await;
+        assert!(command_eve_prompt_admission_for_turn("turn-router-finalize-fail").is_none());
     }
 
     #[tokio::test]

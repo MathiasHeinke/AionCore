@@ -279,6 +279,22 @@ impl AgentInstance {
         self.as_task().send_message(data).await
     }
 
+    /// Finish the native ACP session handshake without sending a prompt.
+    ///
+    /// Grounded Command EVE turns use this readiness seam before starting
+    /// their separate prompt-admission budget. Other agent variants keep the
+    /// historical warmup behavior.
+    pub async fn prepare_prompt_session(&self) -> Result<(), AgentError> {
+        match self {
+            Self::Acp(manager) if manager.backend() == Some("hermes") => {
+                manager.ensure_session_opened().await.map(|_| ())
+            }
+            Self::Acp(_) | Self::Aionrs(_) => Ok(()),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(_) => Ok(()),
+        }
+    }
+
     /// Cancel the current streaming response without killing the agent.
     pub async fn cancel(&self) -> Result<(), AgentError> {
         self.as_task().cancel().await

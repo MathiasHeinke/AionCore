@@ -3977,6 +3977,7 @@ impl IWorkerTaskManager for MockTaskManager {
 struct SlowBuildTaskManager {
     delay: Duration,
     built: AtomicBool,
+    agent: Mutex<Option<AgentInstance>>,
 }
 
 impl SlowBuildTaskManager {
@@ -3984,6 +3985,7 @@ impl SlowBuildTaskManager {
         Self {
             delay,
             built: AtomicBool::new(false),
+            agent: Mutex::new(None),
         }
     }
 
@@ -3995,7 +3997,7 @@ impl SlowBuildTaskManager {
 #[async_trait::async_trait]
 impl IWorkerTaskManager for SlowBuildTaskManager {
     fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
-        None
+        self.agent.lock().unwrap().clone()
     }
 
     async fn get_or_build_task(
@@ -4003,9 +4005,14 @@ impl IWorkerTaskManager for SlowBuildTaskManager {
         conversation_id: &str,
         _options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
+        if let Some(agent) = self.agent.lock().unwrap().clone() {
+            return Ok(agent);
+        }
         tokio::time::sleep(self.delay).await;
         self.built.store(true, Ordering::SeqCst);
-        Ok(AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id))))
+        let agent = AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id)));
+        *self.agent.lock().unwrap() = Some(agent.clone());
+        Ok(agent)
     }
 
     fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
@@ -4269,6 +4276,94 @@ async fn send_message_returns_accepted() {
     assert_eq!(response.msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
     assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
     assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+}
+
+fn grounded_pdf_request() -> (tempfile::TempDir, SendMessageRequest) {
+    let directory = tempfile::TempDir::new().unwrap();
+    let source = directory.path().join("brief.pdf");
+    let sidecar = directory.path().join("document.md");
+    let source_bytes = b"%PDF-1.4\n%%EOF\n";
+    let sidecar_bytes = b"## PDF p. 1\nVerified evidence.\n";
+    std::fs::write(&source, source_bytes).unwrap();
+    std::fs::write(&sidecar, sidecar_bytes).unwrap();
+    let source_path = source.to_string_lossy().into_owned();
+    let grounding_path = sidecar.to_string_lossy().into_owned();
+    let mut request = make_send_req();
+    request.files = vec![source_path.clone(), grounding_path.clone()];
+    request.attachment_grounding = Some(AttachmentGroundingRequest {
+        version: ATTACHMENT_GROUNDING_REQUEST_VERSION.into(),
+        entries: vec![AttachmentGroundingExpectation {
+            kind: AttachmentGroundingKind::Pdf,
+            source_path,
+            source_sha256: format!("{:x}", Sha256::digest(source_bytes)),
+            source_bytes: source_bytes.len() as u64,
+            grounding_path,
+            grounding_sha256: format!("{:x}", Sha256::digest(sidecar_bytes)),
+            grounding_bytes: sidecar_bytes.len() as u64,
+        }],
+    });
+    (directory, request)
+}
+
+#[tokio::test(start_paused = true)]
+async fn grounded_send_starts_admission_only_after_cold_runtime_readiness() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr_impl = Arc::new(SlowBuildTaskManager::new(Duration::from_secs(31)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr_impl.clone();
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("hermes"))
+        .await
+        .unwrap();
+    let (_directory, request) = grounded_pdf_request();
+    let send_service = svc.clone();
+    let conversation_id = conv.id.clone();
+    let send = tokio::spawn(async move {
+        send_service
+            .send_message("user_1", &conversation_id, request, &task_mgr)
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(30) + Duration::from_millis(1)).await;
+    assert!(!send.is_finished(), "readiness must not consume the admission budget");
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let response = send.await.unwrap().unwrap();
+    assert!(response.attachment_grounding_receipt.is_some());
+    wait_for_turn_released(&svc, &conv.id).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborting_grounded_cold_readiness_leaves_no_turn_or_transcript_side_effect() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr_impl = Arc::new(SlowBuildTaskManager::new(Duration::from_secs(31)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr_impl.clone();
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("hermes"))
+        .await
+        .unwrap();
+    broadcaster.take_events();
+    let (_directory, request) = grounded_pdf_request();
+    let send_service = svc.clone();
+    let conversation_id = conv.id.clone();
+    let send = tokio::spawn(async move {
+        send_service
+            .send_message("user_1", &conversation_id, request, &task_mgr)
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    send.abort();
+    let _ = send.await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    assert!(!task_mgr_impl.was_built());
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(broadcaster.take_events().is_empty());
 }
 
 #[tokio::test]

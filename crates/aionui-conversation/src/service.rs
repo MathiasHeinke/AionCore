@@ -2852,6 +2852,25 @@ impl ConversationService {
             }
             self.ensure_workspace_skill_links(&row, &build_opts).await;
             let stored_workspace = build_opts.context.workspace.stored_path.clone();
+            let project_runtime_workspace_path = build_opts
+                .project_runtime_context
+                .as_ref()
+                .map(|_| build_opts.context.workspace.path.clone());
+            let readiness_agent = task_manager
+                .get_or_build_task(conversation_id, build_opts.clone())
+                .await
+                .map_err(|error| match project_runtime_workspace_path.as_deref() {
+                    Some(path) => redact_project_runtime_agent_error(error, path).into(),
+                    None => ConversationError::from(error),
+                })?;
+            readiness_agent.prepare_prompt_session().await.map_err(|error| {
+                match project_runtime_workspace_path.as_deref() {
+                    Some(path) => redact_project_runtime_agent_error(error, path).into(),
+                    None => ConversationError::from(error),
+                }
+            })?;
+            self.maybe_persist_workspace(conversation_id, &stored_workspace, readiness_agent.workspace())
+                .await?;
             let receipt_sha256 = attachment_grounding_receipt_sha256(&verified)?;
             let accepted_receipt = accepted_attachment_grounding_receipt(&verified);
 
@@ -3611,6 +3630,16 @@ impl ConversationService {
                 return Err(err.into());
             }
         };
+
+        if backend.as_deref() == Some("hermes") {
+            agent
+                .prepare_prompt_session()
+                .await
+                .map_err(|error| match project_runtime_workspace_path.as_deref() {
+                    Some(path) => redact_project_runtime_agent_error(error, path).into(),
+                    None => ConversationError::from(error),
+                })?;
+        }
 
         // Persist auto-resolved workspace if factory picked a different path.
         self.maybe_persist_workspace(conversation_id, &stored_workspace, agent.workspace())
