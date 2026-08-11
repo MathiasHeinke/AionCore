@@ -74,11 +74,13 @@ pub use channel::{
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
-    AcpAsyncCompletionAckStatus, AcpAsyncCompletionRequest, AcpAsyncCompletionResponse, AcpReadPreviewRequestEventData,
-    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadPreviewResult, AcpReadPreviewResultKind,
-    AcpReadTerminalRequestEventData, AcpReadTerminalResponse, AcpReadTerminalResponseRequest, AcpReadTerminalResult,
-    ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
-    COMMAND_EVE_ASYNC_COMPLETION_VERSION, COMMAND_EVE_READ_PREVIEW_VERSION, COMMAND_EVE_READ_TERMINAL_VERSION,
+    AcpAsyncCompletionAckStatus, AcpAsyncCompletionReceiptListResponse, AcpAsyncCompletionReceiptOutcome,
+    AcpAsyncCompletionReceiptResponse, AcpAsyncCompletionReceiptState, AcpAsyncCompletionRequest,
+    AcpAsyncCompletionResponse, AcpReadPreviewRequestEventData, AcpReadPreviewResponse, AcpReadPreviewResponseRequest,
+    AcpReadPreviewResult, AcpReadPreviewResultKind, AcpReadTerminalRequestEventData, AcpReadTerminalResponse,
+    AcpReadTerminalResponseRequest, AcpReadTerminalResult, ActiveCountResponse, AssistantConversationOverridesRequest,
+    AssistantConversationRequest, COMMAND_EVE_ASYNC_COMPLETION_RECEIPTS_VERSION, COMMAND_EVE_ASYNC_COMPLETION_VERSION,
+    COMMAND_EVE_READ_PREVIEW_VERSION, COMMAND_EVE_READ_TERMINAL_VERSION, CancelConversationOutcome,
     CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,

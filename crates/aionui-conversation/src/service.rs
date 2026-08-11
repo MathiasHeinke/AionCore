@@ -21,14 +21,15 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::{ConversationRuntimeStateService, SteerRequestRegistration};
 use aionui_api_types::{
     AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadTerminalResponse, AcpReadTerminalResponseRequest,
-    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
-    ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
-    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, SteerConversationRequest, SteerConversationResponse, TeamSessionBinding,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationOutcome,
+    CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, ProjectRuntimeWorkspaceRequest,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
+    SteerConversationRequest, SteerConversationResponse, TeamSessionBinding, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -3345,6 +3346,7 @@ impl ConversationService {
                 "cancel ignored because turn id mismatched"
             );
             return Ok(CancelConversationResponse {
+                outcome: CancelConversationOutcome::TurnMismatch,
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
         }
@@ -3355,6 +3357,7 @@ impl ConversationService {
                 turn_id, "No active agent to cancel; returning runtime summary"
             );
             return Ok(CancelConversationResponse {
+                outcome: CancelConversationOutcome::NoActiveAgent,
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
         };
@@ -3392,6 +3395,7 @@ impl ConversationService {
 
         info!(conversation_id, turn_id, "Stream cancel acknowledged");
         Ok(CancelConversationResponse {
+            outcome: CancelConversationOutcome::Accepted,
             runtime: self.runtime_summary_for(conversation_id).await,
         })
     }

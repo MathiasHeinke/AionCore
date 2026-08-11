@@ -7100,6 +7100,10 @@ async fn cancel_with_mismatched_turn_id_does_not_cancel_and_returns_current_runt
 
     let response = svc.cancel("user_1", &conv.id, "turn_stale", &task_mgr).await.unwrap();
 
+    assert_eq!(
+        response.outcome,
+        aionui_api_types::CancelConversationOutcome::TurnMismatch
+    );
     assert_eq!(response.runtime.turn_id.as_deref(), Some(send.turn_id.as_str()));
     assert!(response.runtime.is_processing);
     assert!(svc.runtime_state().is_claimed(&conv.id));
@@ -7126,6 +7130,7 @@ async fn cancel_keeps_turn_claim_until_agent_terminal_event() {
         .await
         .unwrap();
 
+    assert_eq!(cancel.outcome, aionui_api_types::CancelConversationOutcome::Accepted);
     assert_eq!(cancel.runtime.turn_id.as_deref(), Some(send.turn_id.as_str()));
     assert!(cancel.runtime.is_processing);
     assert!(!cancel.runtime.can_send_message);
