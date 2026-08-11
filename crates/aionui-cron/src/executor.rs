@@ -631,6 +631,7 @@ impl JobExecutor {
         let send_req = SendMessageRequest {
             content: prompt,
             files: vec![],
+            attachment_grounding: None,
             inject_skills: skill_names.clone(),
             hidden: true,
             runtime_workspace: None,
@@ -794,6 +795,7 @@ impl JobExecutor {
                     msg_id: ConversationService::mint_msg_id(),
                     turn_id: None,
                     files: vec![],
+                    verified_attachment_grounding: vec![],
                     inject_skills: skill_names,
                 };
 

@@ -21,14 +21,15 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::{ConversationRuntimeStateService, SteerRequestRegistration};
 use aionui_api_types::{
     AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadTerminalResponse, AcpReadTerminalResponseRequest,
-    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
-    ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
-    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, SteerConversationRequest, SteerConversationResponse, TeamSessionBinding,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    ApprovalCheckResponse, AssistantConversationOverridesRequest, AttachmentGroundingReceipt,
+    CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, ProjectRuntimeWorkspaceRequest,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
+    SteerConversationRequest, SteerConversationResponse, TeamSessionBinding, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -50,6 +51,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use crate::attachment_grounding::verify_attachment_grounding;
 use crate::convert::{
     TOOL_CONTENT_COMPACT_THRESHOLD_BYTES, row_to_artifact_response, row_to_message_response,
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item,
@@ -696,11 +698,13 @@ impl ConversationService {
         conversation_id: &str,
         msg_id: String,
         turn_id: String,
+        attachment_grounding_receipt: Option<AttachmentGroundingReceipt>,
     ) -> SendMessageResponse {
         SendMessageResponse {
             msg_id,
             turn_id,
             runtime: self.runtime_summary_for(conversation_id).await,
+            attachment_grounding_receipt,
         }
     }
 
@@ -2791,6 +2795,18 @@ impl ConversationService {
         reject_deprecated_runtime_row(&row)?;
         let turn_id = Self::mint_turn_id();
 
+        // Byte-verify and materialize attachment evidence before the turn is
+        // claimed or the user message is persisted. A mismatch therefore
+        // remains a retryable HTTP failure with no transcript side effect.
+        let verified_attachment_grounding =
+            verify_attachment_grounding(req.attachment_grounding.as_ref(), &req.files).await?;
+        let attachment_grounding_receipt = verified_attachment_grounding
+            .as_ref()
+            .map(|verified| verified.receipt.clone());
+        let agent_attachment_grounding = verified_attachment_grounding
+            .map(|verified| verified.agent_grounding)
+            .unwrap_or_default();
+
         // Project conversations must validate the portable identity and the
         // request-only path before claiming a turn or persisting a message.
         let project_build_opts = match (parse_project_binding_from_row(&row)?, req.runtime_workspace.as_ref()) {
@@ -2829,12 +2845,18 @@ impl ConversationService {
         // key. We reuse the same value for `id` (primary key) and `msg_id`
         // to preserve legacy callers that still rely on `id == msg_id`.
         let user_msg_id = Self::mint_msg_id();
+        let mut user_message_content = serde_json::json!({ "content": req.content });
+        if let Some(receipt) = attachment_grounding_receipt.as_ref() {
+            user_message_content["attachment_grounding_receipt"] = serde_json::to_value(receipt).map_err(|error| {
+                ConversationError::internal(format!("Attachment receipt serialization failed: {error}"))
+            })?;
+        }
         let user_msg = aionui_db::models::MessageRow {
             id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
             msg_id: Some(user_msg_id.clone()),
             r#type: "text".into(),
-            content: serde_json::json!({ "content": req.content }).to_string(),
+            content: user_message_content.to_string(),
             position: Some("right".into()),
             status: Some("finish".into()),
             hidden: req.hidden,
@@ -2848,7 +2870,14 @@ impl ConversationService {
             let was_deleting = turn_claim.release();
             self.complete_released_turn(conversation_id, &turn_id, was_deleting)
                 .await;
-            return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
+            return Ok(self
+                .send_message_response(
+                    conversation_id,
+                    user_msg_id,
+                    turn_id,
+                    attachment_grounding_receipt.clone(),
+                )
+                .await);
         }
         if let Err(e) = self.conversation_repo.insert_message(&user_msg).await {
             warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
@@ -2896,7 +2925,14 @@ impl ConversationService {
                 let was_deleting = turn_claim.release();
                 self.complete_released_turn(conversation_id, &turn_id, was_deleting)
                     .await;
-                return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
+                return Ok(self
+                    .send_message_response(
+                        conversation_id,
+                        user_msg_id,
+                        turn_id,
+                        attachment_grounding_receipt.clone(),
+                    )
+                    .await);
             }
         };
         self.ensure_workspace_skill_links(&row, &build_opts).await;
@@ -2907,6 +2943,7 @@ impl ConversationService {
             user_id: user_id.to_owned(),
             conversation: row,
             request: req,
+            verified_attachment_grounding: agent_attachment_grounding,
             build_options: build_opts,
             stored_workspace,
             turn_id: turn_id.clone(),
@@ -2921,7 +2958,7 @@ impl ConversationService {
             "Message accepted, agent work scheduled"
         );
         Ok(self
-            .send_message_response(conversation_id, user_msg_id_ret, turn_id)
+            .send_message_response(conversation_id, user_msg_id_ret, turn_id, attachment_grounding_receipt)
             .await)
     }
 
@@ -2999,10 +3036,12 @@ impl ConversationService {
                 request: SendMessageRequest {
                     content: request.content,
                     files: request.files,
+                    attachment_grounding: None,
                     inject_skills: request.inject_skills,
                     hidden: false,
                     runtime_workspace: None,
                 },
+                verified_attachment_grounding: Vec::new(),
                 build_options: build_opts,
                 stored_workspace,
                 turn_id: turn_id.clone(),

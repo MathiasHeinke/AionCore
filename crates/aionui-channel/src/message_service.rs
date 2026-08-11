@@ -73,6 +73,7 @@ impl ChannelMessageService {
         let req = SendMessageRequest {
             content: text.to_owned(),
             files: vec![],
+            attachment_grounding: None,
             inject_skills: vec![],
             hidden: false,
             runtime_workspace: None,

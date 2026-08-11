@@ -74,18 +74,20 @@ pub use channel::{
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
-    AcpReadPreviewRequestEventData, AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadPreviewResult,
-    AcpReadPreviewResultKind, AcpReadTerminalRequestEventData, AcpReadTerminalResponse, AcpReadTerminalResponseRequest,
-    AcpReadTerminalResult, ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
-    COMMAND_EVE_READ_PREVIEW_VERSION, COMMAND_EVE_READ_TERMINAL_VERSION, CancelConversationRequest,
-    CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind, ConversationArtifactListResponse,
-    ConversationArtifactResponse, ConversationArtifactStatus, ConversationAssistantIdentityResponse,
-    ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationResponse,
-    ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
-    ProjectBindingExpectation, ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, SteerConversationRequest, SteerConversationResponse, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WarmupConversationRequest,
+    ATTACHMENT_GROUNDING_RECEIPT_VERSION, ATTACHMENT_GROUNDING_REQUEST_VERSION, AcpReadPreviewRequestEventData,
+    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadPreviewResult, AcpReadPreviewResultKind,
+    AcpReadTerminalRequestEventData, AcpReadTerminalResponse, AcpReadTerminalResponseRequest, AcpReadTerminalResult,
+    ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
+    AttachmentGroundingExpectation, AttachmentGroundingKind, AttachmentGroundingReceipt,
+    AttachmentGroundingReceiptEntry, AttachmentGroundingRequest, COMMAND_EVE_READ_PREVIEW_VERSION,
+    COMMAND_EVE_READ_TERMINAL_VERSION, CancelConversationRequest, CancelConversationResponse, CloneConversationRequest,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus,
+    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
+    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchItem, MessageSearchResponse, ProjectBindingExpectation, ProjectRuntimeWorkspaceRequest,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SteerConversationRequest, SteerConversationResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WarmupConversationRequest,
 };
 pub use cron::{
     CreateCronJobRequest, CronAgentConfigReadDto, CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto,

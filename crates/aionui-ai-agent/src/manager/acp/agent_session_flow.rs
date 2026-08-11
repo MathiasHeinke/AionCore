@@ -14,6 +14,7 @@ use agent_client_protocol::schema::{
 };
 use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -28,10 +29,25 @@ const UNRENDERED_STDERR_SETTLE_WINDOW: std::time::Duration = std::time::Duration
 const UNRENDERED_STDERR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 fn build_prompt_content_blocks(data: &SendMessageData) -> Result<Vec<ContentBlock>, AgentError> {
+    let grounding_by_path: HashMap<&str, _> = data
+        .verified_attachment_grounding
+        .iter()
+        .map(|grounding| (grounding.grounding_path.as_str(), grounding))
+        .collect();
     let mut blocks = Vec::with_capacity(data.files.len() + 1);
     blocks.push(ContentBlock::from(data.content.clone()));
 
     for file in &data.files {
+        if let Some(grounding) = grounding_by_path.get(file.as_str()) {
+            blocks.push(ContentBlock::from(format!(
+                "[[COMMAND_EVE_VERIFIED_ATTACHMENT_GROUNDING source_sha256={} grounding_sha256={} grounding_bytes={}]]\n{}\n[[/COMMAND_EVE_VERIFIED_ATTACHMENT_GROUNDING]]",
+                grounding.source_sha256,
+                grounding.grounding_sha256,
+                grounding.grounding_bytes,
+                grounding.grounding_text
+            )));
+            continue;
+        }
         let path = Path::new(file);
         if !path.is_absolute() {
             return Err(AgentError::bad_request(
@@ -596,6 +612,7 @@ mod tests {
                 first_path.to_string_lossy().into_owned(),
                 second_path.to_string_lossy().into_owned(),
             ],
+            verified_attachment_grounding: Vec::new(),
             inject_skills: Vec::new(),
         };
 
@@ -621,10 +638,46 @@ mod tests {
             msg_id: "msg-text".into(),
             turn_id: None,
             files: Vec::new(),
+            verified_attachment_grounding: Vec::new(),
             inject_skills: Vec::new(),
         };
         let blocks = build_prompt_content_blocks(&data).unwrap();
         assert!(matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text.text == "Hello"));
+    }
+
+    #[test]
+    fn prompt_blocks_embed_verified_sidecar_instead_of_forwarding_it_as_a_resource_link() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("brief.pdf");
+        let grounding_path = directory.path().join("document.md");
+        fs::write(&source_path, "%PDF-1.4\n%%EOF\n").unwrap();
+        fs::write(&grounding_path, "## PDF p. 1\nVerified evidence.\n").unwrap();
+        let data = SendMessageData {
+            content: "Summarize the document.".into(),
+            msg_id: "msg-grounded".into(),
+            turn_id: Some("turn-grounded".into()),
+            files: vec![
+                source_path.to_string_lossy().into_owned(),
+                grounding_path.to_string_lossy().into_owned(),
+            ],
+            verified_attachment_grounding: vec![crate::types::VerifiedAttachmentGrounding {
+                source_path: source_path.to_string_lossy().into_owned(),
+                source_sha256: "a".repeat(64),
+                source_bytes: 15,
+                grounding_path: grounding_path.to_string_lossy().into_owned(),
+                grounding_sha256: "b".repeat(64),
+                grounding_bytes: 31,
+                grounding_text: "## PDF p. 1\nVerified evidence.\n".into(),
+            }],
+            inject_skills: Vec::new(),
+        };
+
+        let blocks = build_prompt_content_blocks(&data).unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[1], ContentBlock::ResourceLink(link) if link.name == "brief.pdf"));
+        assert!(matches!(&blocks[2], ContentBlock::Text(text)
+            if text.text.contains("COMMAND_EVE_VERIFIED_ATTACHMENT_GROUNDING")
+                && text.text.contains("Verified evidence.")));
     }
 
     /// `open_session_resume` reads `session.agent_capabilities().load_session`

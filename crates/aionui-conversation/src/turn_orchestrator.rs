@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData, VerifiedAttachmentGrounding};
 use aionui_ai_agent::{AgentSendError, AgentSessionKind, IWorkerTaskManager};
 use aionui_common::{AgentType, ConversationStatus, ErrorChain, now_ms};
 use aionui_db::models::ConversationRow;
@@ -30,6 +30,7 @@ pub(crate) struct TurnStartInput {
     pub user_id: String,
     pub conversation: ConversationRow,
     pub request: SendMessageRequest,
+    pub verified_attachment_grounding: Vec<VerifiedAttachmentGrounding>,
     pub build_options: BuildTaskOptions,
     pub stored_workspace: String,
     pub turn_id: String,
@@ -303,6 +304,7 @@ impl ConversationTurnOrchestrator {
                             msg_id: next_turn_msg_id.clone(),
                             turn_id: Some(input.turn_id.clone()),
                             files: vec![],
+                            verified_attachment_grounding: vec![],
                             inject_skills: vec![],
                         },
                         next_turn_msg_id,
@@ -340,6 +342,7 @@ impl ConversationTurnOrchestrator {
             msg_id: first_turn_msg_id.clone(),
             turn_id: Some(turn_id.clone()),
             files: input.request.files,
+            verified_attachment_grounding: input.verified_attachment_grounding,
             inject_skills: input.request.inject_skills,
         };
         let mut replayed = false;

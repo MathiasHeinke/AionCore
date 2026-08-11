@@ -23,14 +23,15 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
+    ATTACHMENT_GROUNDING_REQUEST_VERSION, AttachmentGroundingExpectation, AttachmentGroundingKind,
+    AttachmentGroundingRequest, CloneConversationRequest, CreateConversationRequest, ListConversationsQuery,
+    ProjectBindingExpectation, ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest,
+    SteerConversationRequest, UpdateConversationRequest, WebSocketMessage,
+};
+use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentErrorOwnership, AgentModeResponse, ConfigOptionConfirmation,
     ConversationArtifactKind, ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry,
     ModelInfoPayload, SetConfigOptionRequest, SetConfigOptionResponse,
-};
-use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ProjectBindingExpectation,
-    ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest, SteerConversationRequest,
-    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
@@ -4208,6 +4209,64 @@ async fn send_message_returns_accepted() {
 }
 
 #[tokio::test]
+async fn attachment_grounding_is_verified_before_persistence_and_receipted_on_success() {
+    let (svc, broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    let directory = tempfile::TempDir::new().unwrap();
+    let source = directory.path().join("brief.pdf");
+    let sidecar = directory.path().join("document.md");
+    let source_bytes = b"%PDF-1.4\n%%EOF\n";
+    let sidecar_bytes = b"## PDF p. 1\nVerified evidence.\n";
+    std::fs::write(&source, source_bytes).unwrap();
+    std::fs::write(&sidecar, sidecar_bytes).unwrap();
+    let source_path = source.to_string_lossy().into_owned();
+    let grounding_path = sidecar.to_string_lossy().into_owned();
+    let source_sha256 = format!("{:x}", Sha256::digest(source_bytes));
+    let grounding_sha256 = format!("{:x}", Sha256::digest(sidecar_bytes));
+
+    let mut request = make_send_req();
+    request.files = vec![source_path.clone(), grounding_path.clone()];
+    request.attachment_grounding = Some(AttachmentGroundingRequest {
+        version: ATTACHMENT_GROUNDING_REQUEST_VERSION.into(),
+        entries: vec![AttachmentGroundingExpectation {
+            kind: AttachmentGroundingKind::Pdf,
+            source_path: source_path.clone(),
+            source_sha256: "0".repeat(64),
+            source_bytes: source_bytes.len() as u64,
+            grounding_path: grounding_path.clone(),
+            grounding_sha256: grounding_sha256.clone(),
+            grounding_bytes: sidecar_bytes.len() as u64,
+        }],
+    });
+
+    let mismatch = svc
+        .send_message("user_1", &conv.id, request.clone(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(mismatch, ConversationError::BadRequest { reason } if reason == "ATTACHMENT_GROUNDING_MISMATCH"));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert!(broadcaster.take_events().is_empty());
+
+    request.attachment_grounding.as_mut().unwrap().entries[0].source_sha256 = source_sha256.clone();
+    let response = svc.send_message("user_1", &conv.id, request, &task_mgr).await.unwrap();
+    let receipt = response.attachment_grounding_receipt.expect("verified receipt");
+    assert_eq!(receipt.status, "verified");
+    assert_eq!(receipt.entries.len(), 1);
+    assert_eq!(receipt.entries[0].source_sha256, source_sha256);
+    assert_eq!(receipt.entries[0].grounding_sha256, grounding_sha256);
+    assert!(receipt.entries[0].grounding_embedded);
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let messages = repo_messages_asc(&repo, &conv.id, 10).await;
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].content.contains("attachment_grounding_receipt"));
+}
+
+#[tokio::test]
 async fn project_send_validates_binding_before_persisting_message() {
     let (svc, broadcaster, repo, _default_task_mgr) = make_service();
     install_project_attestation_verifier(&svc);
@@ -5660,6 +5719,7 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
                 content: "hello".into(),
                 hidden: false,
                 files: vec![],
+                attachment_grounding: None,
                 inject_skills: vec![],
                 runtime_workspace: None,
             },

@@ -6,6 +6,20 @@ use serde::{Deserialize, Serialize};
 use crate::project_runtime_fence::ProjectRuntimeExecutionPermit;
 use crate::session_context::AgentSessionContext;
 
+/// Attachment evidence already byte-verified by the conversation boundary.
+/// `grounding_text` is carried in memory only and embedded directly into the
+/// ACP prompt, avoiding Hermes' bounded raw ResourceLink decoder.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifiedAttachmentGrounding {
+    pub source_path: String,
+    pub source_sha256: String,
+    pub source_bytes: u64,
+    pub grounding_path: String,
+    pub grounding_sha256: String,
+    pub grounding_bytes: u64,
+    pub grounding_text: String,
+}
+
 /// Data payload for sending a user message to an Agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageData {
@@ -19,6 +33,10 @@ pub struct SendMessageData {
     /// File paths attached to the message.
     #[serde(default)]
     pub files: Vec<String>,
+    /// Exact, verified sidecar evidence for this turn. Empty preserves the
+    /// legacy ResourceLink-only transport shape.
+    #[serde(default)]
+    pub verified_attachment_grounding: Vec<VerifiedAttachmentGrounding>,
     /// Skills to inject into this message turn.
     #[serde(default)]
     pub inject_skills: Vec<String>,
@@ -204,6 +222,7 @@ mod tests {
             msg_id: "msg-001".into(),
             turn_id: Some("turn-001".into()),
             files: vec!["/tmp/a.txt".into()],
+            verified_attachment_grounding: Vec::new(),
             inject_skills: vec!["review".into()],
         };
         let json = serde_json::to_value(&data).unwrap();
