@@ -5,6 +5,7 @@
 //! This file is a public façade — it only re-exports symbols defined in
 //! submodules. All logic lives in the modules below.
 
+mod acp_async_completion;
 mod config;
 mod router;
 mod services;

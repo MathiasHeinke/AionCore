@@ -45,6 +45,7 @@ use aionui_api_types::{
     AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadTerminalResponse, AcpReadTerminalResponseRequest,
 };
 
+use crate::CommandEveAsyncCompletionRoute;
 use crate::error::AgentError;
 use crate::protocol::client_extensions::AcpClientExtensionRouter;
 use crate::protocol::error::AcpError;
@@ -147,9 +148,24 @@ impl AcpProtocol {
         permission_tx: mpsc::Sender<PermissionRequest>,
         notification_tx: mpsc::Sender<SessionNotification>,
     ) -> Result<Self, AcpError> {
+        Self::connect_with_optional_async_completion(stdin, stdout, event_tx, permission_tx, notification_tx, None)
+            .await
+    }
+
+    pub(crate) async fn connect_with_optional_async_completion(
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        event_tx: broadcast::Sender<AgentStreamEvent>,
+        permission_tx: mpsc::Sender<PermissionRequest>,
+        notification_tx: mpsc::Sender<SessionNotification>,
+        async_completion: Option<CommandEveAsyncCompletionRoute>,
+    ) -> Result<Self, AcpError> {
         let alive = Arc::new(AtomicBool::new(true));
         let replay_suppression = Arc::new(AtomicBool::new(false));
-        let client_extensions = AcpClientExtensionRouter::new(event_tx.clone());
+        let client_extensions = match async_completion {
+            Some(route) => AcpClientExtensionRouter::new(event_tx.clone()).with_async_completion(route),
+            None => AcpClientExtensionRouter::new(event_tx.clone()),
+        };
 
         // Signals from the background task:
         // - `init_tx`: initialize handshake result (with possible SDK error)
@@ -290,6 +306,10 @@ impl AcpProtocol {
     /// manager instances. Other ACP backends remain method-not-found.
     pub(crate) fn enable_read_terminal(&self) -> Result<(), AcpError> {
         self.client_extensions.enable_read_terminal()
+    }
+
+    pub(crate) fn enable_async_completion(&self) -> Result<(), AcpError> {
+        self.client_extensions.enable_async_completion()
     }
 
     /// Send a prompt to the agent in an active session.

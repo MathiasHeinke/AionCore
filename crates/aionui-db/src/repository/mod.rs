@@ -1,6 +1,7 @@
 pub mod acp_session;
 pub mod agent_metadata;
 pub mod assistant;
+pub mod async_completion_receipt;
 pub mod channel;
 mod client_preference;
 pub mod conversation;
@@ -14,6 +15,7 @@ pub mod skill;
 mod sqlite_acp_session;
 mod sqlite_agent_metadata;
 mod sqlite_assistant;
+mod sqlite_async_completion_receipt;
 mod sqlite_channel;
 mod sqlite_client_preference;
 mod sqlite_conversation;
@@ -35,6 +37,9 @@ pub use assistant::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
     IAssistantPreferenceRepository, IAssistantRepository,
 };
+pub use async_completion_receipt::{
+    AsyncCompletionReceiptClaim, ClaimAsyncCompletionReceiptParams, IAsyncCompletionReceiptRepository,
+};
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
 pub use conversation::IConversationRepository;
@@ -51,6 +56,7 @@ pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, rebuild_legacy_assistant_mirror,
 };
+pub use sqlite_async_completion_receipt::SqliteAsyncCompletionReceiptRepository;
 pub use sqlite_channel::SqliteChannelRepository;
 pub use sqlite_client_preference::SqliteClientPreferenceRepository;
 pub use sqlite_conversation::SqliteConversationRepository;

@@ -167,6 +167,42 @@ pub struct SteerConversationResponse {
     pub runtime: ConversationRuntimeSummary,
 }
 
+/// Version marker for Hermes' durable async-completion ACP extension.
+pub const COMMAND_EVE_ASYNC_COMPLETION_VERSION: &str = "command-eve-async-completion/v1";
+
+/// Agent-to-client payload emitted after one Hermes background unit reaches a
+/// terminal result. The host binds it to the canonical conversation; the
+/// agent-provided session id is only a correlation proof.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpAsyncCompletionRequest {
+    pub version: String,
+    pub completion_id: String,
+    pub session_id: String,
+    pub content: String,
+}
+
+/// Stable acknowledgement status returned to Hermes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpAsyncCompletionAckStatus {
+    Accepted,
+    AlreadyApplied,
+    Retryable,
+    Rejected,
+}
+
+/// Typed acknowledgement returned by the Command EVE host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpAsyncCompletionResponse {
+    pub status: AcpAsyncCompletionAckStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
 /// Version marker for the bounded Hermes `read_preview` ACP extension.
 pub const COMMAND_EVE_READ_PREVIEW_VERSION: &str = "command-eve-read-preview/v1";
 
@@ -1224,6 +1260,27 @@ mod tests {
             "total_chars": 0
         });
         assert!(serde_json::from_value::<AcpReadPreviewResult>(unknown).is_err());
+    }
+
+    #[test]
+    fn async_completion_contract_is_minimal_and_status_is_typed() {
+        let request = json!({
+            "version": COMMAND_EVE_ASYNC_COMPLETION_VERSION,
+            "completion_id": "completion-1",
+            "session_id": "session-1",
+            "content": "continue"
+        });
+        assert!(serde_json::from_value::<AcpAsyncCompletionRequest>(request.clone()).is_ok());
+        let mut expanded = request;
+        expanded.as_object_mut().unwrap().insert("metadata".into(), json!({}));
+        assert!(serde_json::from_value::<AcpAsyncCompletionRequest>(expanded).is_err());
+
+        let response = AcpAsyncCompletionResponse {
+            status: AcpAsyncCompletionAckStatus::AlreadyApplied,
+            turn_id: Some("turn-1".to_owned()),
+            code: None,
+        };
+        assert_eq!(serde_json::to_value(response).unwrap()["status"], "already_applied");
     }
 
     #[test]

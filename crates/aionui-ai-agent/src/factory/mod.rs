@@ -12,6 +12,7 @@ use aionui_db::{IMcpServerRepository, IProviderRepository};
 use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
 
+use crate::CommandEveAsyncCompletionSender;
 use crate::agent_task::AgentInstance;
 use crate::capability::skill_manager::AcpSkillManager;
 use crate::error::AgentError;
@@ -43,6 +44,8 @@ pub struct AgentFactoryDeps {
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
+    /// App-level wake consumer. Only verified Hermes managers receive it.
+    pub async_completion_tx: Option<CommandEveAsyncCompletionSender>,
 }
 
 /// Build a production agent factory that dispatches to concrete agent types.
@@ -62,11 +65,19 @@ pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentFactory {
 }
 
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
+    let project_build_options = options.project_runtime_context.as_ref().map(|_| {
+        let mut snapshot = options.clone();
+        // The original permit belongs to the turn that built this task. A
+        // later completion must acquire a fresh native permit after DB
+        // revalidation; carrying the old guard would bypass that fence.
+        snapshot.project_runtime_execution = None;
+        snapshot
+    });
     let context = options.context;
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
     match context.kind {
-        AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
+        AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx, project_build_options).await,
         AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
     }
 }

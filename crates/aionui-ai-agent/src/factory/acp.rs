@@ -19,12 +19,15 @@ use aionui_runtime::{
 };
 use tracing::{debug, info, warn};
 
+use crate::CommandEveAsyncCompletionRoute;
 use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
+use crate::types::BuildTaskOptions;
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AcpSessionBuildContext,
     ctx: FactoryContext,
+    project_build_options: Option<BuildTaskOptions>,
 ) -> Result<AgentInstance, AgentError> {
     let belongs_to_team = build_context.team.is_some();
     let mut config = build_context.config;
@@ -169,7 +172,16 @@ pub(super) async fn build(
     let skill_mgr = deps.skill_manager.clone();
     let catalog_tx = deps.agent_registry.catalog_sender();
 
-    let (agent, domain_rx, notification_rx) = AcpAgentManager::build(params, skill_mgr, &catalog_tx).await?;
+    let async_completion_route = deps
+        .async_completion_tx
+        .clone()
+        .map(|sender| CommandEveAsyncCompletionRoute {
+            conversation_id: ctx.conversation_id.clone(),
+            sender,
+            project_build_options,
+        });
+    let (agent, domain_rx, notification_rx) =
+        AcpAgentManager::build_with_async_completion(params, skill_mgr, &catalog_tx, async_completion_route).await?;
 
     let arc = Arc::new(agent);
     arc.start_permission_handler();

@@ -57,7 +57,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, broadcast};
 
 use crate::ConversationError;
-use crate::service::{ConversationAgentTurnRequest, ConversationService};
+use crate::service::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationService};
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
@@ -1344,6 +1344,24 @@ fn make_service_with_mock_task_manager(
         broadcaster.clone(),
         Arc::new(FixedSkillResolver { names: vec![] }),
         task_mgr_dyn,
+        repo.clone(),
+        agent_metadata_repo,
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    (svc, broadcaster, repo)
+}
+
+fn make_service_with_worker_task_manager(
+    task_mgr: Arc<dyn IWorkerTaskManager>,
+) -> (ConversationService, Arc<MockBroadcaster>, Arc<MockRepo>) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr,
         repo.clone(),
         agent_metadata_repo,
         Arc::new(StubAcpSessionRepo::default()),
@@ -4434,6 +4452,123 @@ async fn project_bound_run_agent_turn_rejects_before_any_runtime_or_persistence_
     assert_eq!(task_mgr.active_count(), 0);
     assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
     assert!(broadcaster.take_events().is_empty());
+}
+
+#[tokio::test]
+async fn project_bound_async_completion_revalidates_transient_context_and_uses_stable_turn_id() {
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(Vec::new()));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let (svc, _broadcaster, repo) = make_service_with_worker_task_manager(task_mgr_dyn);
+    let verifier = install_project_attestation_verifier(&svc);
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
+    let conv = svc
+        .create("user_1", make_project_create_req(project_id, TEST_PROJECT_ROOT_REF))
+        .await
+        .unwrap();
+    task_mgr
+        .agents
+        .lock()
+        .unwrap()
+        .push_back(AgentInstance::Mock(Arc::new(ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        ))));
+    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    let runtime_workspace =
+        project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, &conv.extra, runtime_dir.path());
+    let verified = verified_project_runtime(
+        &verifier,
+        &conv.id,
+        ProjectRuntimeAttestationPurpose::Send,
+        &runtime_workspace,
+    );
+    let mut transient = svc
+        .build_task_options_with_project_workspace(&row, &runtime_workspace, &verified)
+        .await
+        .unwrap();
+    transient.project_runtime_execution = None;
+
+    let outcome = svc
+        .run_command_eve_async_completion_turn(
+            ConversationAgentTurnRequest {
+                user_id: "user_1".into(),
+                conversation_id: conv.id.clone(),
+                content: "continue after delegated work".into(),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                on_started: None,
+            },
+            "turn_async_completion_1".into(),
+            Some(transient.clone()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    assert_eq!(outcome.turn_id, "turn_async_completion_1");
+    let captured = task_mgr.captured_options();
+    assert_eq!(captured.len(), 1);
+    assert!(captured[0].project_runtime_execution.is_some());
+    assert_eq!(captured[0].project_runtime_context, transient.project_runtime_context);
+    let stored = repo.get(&conv.id).await.unwrap().unwrap();
+    assert!(!stored.extra.contains(runtime_workspace.path.as_str()));
+}
+
+#[tokio::test]
+async fn project_bound_async_completion_rejects_mismatched_transient_context_before_start() {
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(Vec::new()));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let (svc, _broadcaster, repo) = make_service_with_worker_task_manager(task_mgr_dyn);
+    let verifier = install_project_attestation_verifier(&svc);
+    let project_id = "018f0c00-0000-4000-8000-000000000001";
+    let conv = svc
+        .create("user_1", make_project_create_req(project_id, TEST_PROJECT_ROOT_REF))
+        .await
+        .unwrap();
+    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    let runtime_workspace =
+        project_runtime_workspace(project_id, TEST_PROJECT_ROOT_REF, &conv.extra, runtime_dir.path());
+    let verified = verified_project_runtime(
+        &verifier,
+        &conv.id,
+        ProjectRuntimeAttestationPurpose::Send,
+        &runtime_workspace,
+    );
+    let mut transient = svc
+        .build_task_options_with_project_workspace(&row, &runtime_workspace, &verified)
+        .await
+        .unwrap();
+    transient.project_runtime_execution = None;
+    transient
+        .project_runtime_context
+        .as_mut()
+        .unwrap()
+        .project_binding_revision += 1;
+
+    let error = svc
+        .run_command_eve_async_completion_turn(
+            ConversationAgentTurnRequest {
+                user_id: "user_1".into(),
+                conversation_id: conv.id.clone(),
+                content: "must not run".into(),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                on_started: None,
+            },
+            "turn_async_completion_mismatch".into(),
+            Some(transient),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_BINDING_MISMATCH"
+    ));
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.build_count(), 0);
 }
 
 #[tokio::test]

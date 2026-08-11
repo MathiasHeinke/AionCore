@@ -37,13 +37,15 @@ pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentPar
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
-    CreateAcpSessionParams, IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository,
-    IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
-    IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository, IMcpServerRepository,
-    IOAuthTokenRepository, IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISkillRepository,
-    ITeamRepository, IUserRepository, PersistedSessionState, SaveRuntimeStateParams, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
+    AsyncCompletionReceiptClaim, ClaimAsyncCompletionReceiptParams, CreateAcpSessionParams, IAcpSessionRepository,
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IAsyncCompletionReceiptRepository, IChannelRepository, IClientPreferenceRepository, IConversationRepository,
+    ICronRepository, IMcpServerRepository, IOAuthTokenRepository, IProviderRepository, IRemoteAgentRepository,
+    ISettingsRepository, ISkillRepository, ITeamRepository, IUserRepository, PersistedSessionState,
+    SaveRuntimeStateParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteAsyncCompletionReceiptRepository,
     SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
     SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
     SqliteSettingsRepository, SqliteSkillRepository, SqliteTeamRepository, SqliteUserRepository,

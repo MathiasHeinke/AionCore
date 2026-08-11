@@ -15,15 +15,16 @@ use aionui_auth::{
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
-    Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
-    SqliteUserRepository,
+    Database, IAcpSessionRepository, IAgentMetadataRepository, IAsyncCompletionReceiptRepository,
+    IConversationRepository, IMcpServerRepository, ISkillRepository, IUserRepository, SqliteAcpSessionRepository,
+    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantPreferenceRepository, SqliteAsyncCompletionReceiptRepository, SqliteConversationRepository,
+    SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository, SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 use aionui_team::GuideMcpServer;
 
+use crate::acp_async_completion::CommandEveAsyncCompletionConsumer;
 use crate::config::{AppConfig, derive_encryption_key};
 
 const APP_EVENT_BUS_CAPACITY: usize = 4_096;
@@ -212,6 +213,7 @@ impl AppServices {
             }
         };
 
+        let (async_completion_tx, async_completion_rx) = tokio::sync::mpsc::channel(64);
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo,
@@ -223,6 +225,7 @@ impl AppServices {
             backend_binary_path: backend_binary_path.clone(),
             guide_mcp_config: guide_mcp_config.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            async_completion_tx: Some(async_completion_tx),
         });
 
         // Agent factory is now wired. Future extension/custom agents
@@ -244,6 +247,17 @@ impl AppServices {
             task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
             project_runtime_attestation_verifier: project_runtime_attestation_verifier.clone(),
         });
+        let receipt_repo: Arc<dyn IAsyncCompletionReceiptRepository> =
+            Arc::new(SqliteAsyncCompletionReceiptRepository::new(database.pool().clone()));
+        CommandEveAsyncCompletionConsumer::new(
+            conversation_service.clone(),
+            conversation_repo.clone(),
+            acp_session_repo.clone(),
+            receipt_repo,
+            worker_task_manager.clone(),
+            ConversationService::mint_msg_id(),
+        )
+        .start(async_completion_rx);
 
         Ok(Self {
             database,

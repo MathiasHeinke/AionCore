@@ -13,24 +13,32 @@ use std::time::Duration;
 use agent_client_protocol::schema::{AgentRequest, ExtRequest};
 use agent_client_protocol::{Error as JsonRpcError, Responder};
 use aionui_api_types::{
-    AcpReadPreviewRequestEventData, AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadPreviewResult,
+    AcpAsyncCompletionAckStatus, AcpAsyncCompletionRequest, AcpAsyncCompletionResponse, AcpReadPreviewRequestEventData,
+    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadPreviewResult, COMMAND_EVE_ASYNC_COMPLETION_VERSION,
     COMMAND_EVE_READ_PREVIEW_VERSION,
 };
 use regex::Regex;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast, mpsc::error::TrySendError, oneshot};
 use tracing::{info, warn};
 
 use crate::error::AgentError;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::AgentStreamEvent;
+use crate::{CommandEveAsyncCompletionDispatch, CommandEveAsyncCompletionResult, CommandEveAsyncCompletionRoute};
 
 use read_terminal::{COMMAND_EVE_READ_TERMINAL_EXT_METHOD, PendingReadTerminal, cancel_pending_terminal};
 
 pub(crate) const COMMAND_EVE_READ_PREVIEW_EXT_METHOD: &str = "command_eve/read_preview";
 pub(crate) const COMMAND_EVE_READ_PREVIEW_WIRE_METHOD: &str = "_command_eve/read_preview";
+pub(crate) const COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD: &str = "command_eve/async_completion";
+pub(crate) const COMMAND_EVE_ASYNC_COMPLETION_WIRE_METHOD: &str = "_command_eve/async_completion";
 
 const CLIENT_EXTENSION_TIMEOUT: Duration = Duration::from_secs(45);
+const ASYNC_COMPLETION_REPLY_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+const ASYNC_COMPLETION_MAX_CONCURRENCY: usize = 4;
 const MAX_REQUEST_PAYLOAD_BYTES: usize = 4 * 1024;
+const MAX_ASYNC_COMPLETION_PAYLOAD_BYTES: usize = 96 * 1024;
+const MAX_ASYNC_COMPLETION_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_PAYLOAD_BYTES: usize = 32 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_START: u32 = 10_000_000;
@@ -56,6 +64,7 @@ struct PendingReadPreview {
 struct ExtensionState {
     read_preview_enabled: bool,
     read_terminal_enabled: bool,
+    async_completion_enabled: bool,
     bound_session_id: Option<String>,
     pending: HashMap<String, PendingReadPreview>,
     pending_terminal: HashMap<String, PendingReadTerminal>,
@@ -66,6 +75,9 @@ pub(crate) struct AcpClientExtensionRouter {
     event_tx: broadcast::Sender<AgentStreamEvent>,
     state: Arc<Mutex<ExtensionState>>,
     timeout: Duration,
+    async_completion_reply_timeout: Duration,
+    async_completion_slots: Arc<Semaphore>,
+    async_completion_route: Option<CommandEveAsyncCompletionRoute>,
 }
 
 impl AcpClientExtensionRouter {
@@ -78,7 +90,31 @@ impl AcpClientExtensionRouter {
             event_tx,
             state: Arc::new(Mutex::new(ExtensionState::default())),
             timeout,
+            async_completion_reply_timeout: ASYNC_COMPLETION_REPLY_TIMEOUT,
+            async_completion_slots: Arc::new(Semaphore::new(ASYNC_COMPLETION_MAX_CONCURRENCY)),
+            async_completion_route: None,
         }
+    }
+
+    pub(crate) fn with_async_completion(mut self, route: CommandEveAsyncCompletionRoute) -> Self {
+        self.async_completion_route = Some(route);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_async_completion_limits(mut self, reply_timeout: Duration, max_concurrency: usize) -> Self {
+        self.async_completion_reply_timeout = reply_timeout;
+        self.async_completion_slots = Arc::new(Semaphore::new(max_concurrency));
+        self
+    }
+
+    pub(crate) fn enable_async_completion(&self) -> Result<(), AcpError> {
+        if self.async_completion_route.is_none() {
+            return Err(local_binding_error());
+        }
+        let mut state = self.state.lock().map_err(|_| local_binding_error())?;
+        state.async_completion_enabled = true;
+        Ok(())
     }
 
     /// Enable the single allowlisted extension for a verified Hermes backend.
@@ -145,6 +181,7 @@ impl AcpClientExtensionRouter {
             };
             state.read_preview_enabled = false;
             state.read_terminal_enabled = false;
+            state.async_completion_enabled = false;
             state.bound_session_id = None;
             (
                 state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
@@ -238,6 +275,10 @@ impl AcpClientExtensionRouter {
     }
 
     fn handle_raw_request(&self, method: &str, raw_params: &str, respond: ResponseSender) {
+        if method == COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD {
+            self.handle_async_completion_request(raw_params, respond);
+            return;
+        }
         if method == COMMAND_EVE_READ_TERMINAL_EXT_METHOD {
             self.handle_read_terminal_request(raw_params, respond);
             return;
@@ -317,6 +358,127 @@ impl AcpClientExtensionRouter {
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
             expire_pending(state, &request.request_id, &request.session_id);
+        });
+    }
+
+    fn handle_async_completion_request(&self, raw_params: &str, respond: ResponseSender) {
+        let enabled = self.state.lock().is_ok_and(|state| state.async_completion_enabled);
+        if !enabled {
+            warn!(
+                method = COMMAND_EVE_ASYNC_COMPLETION_WIRE_METHOD,
+                "Rejected disabled ACP async completion"
+            );
+            respond_ignoring_transport(respond, Err(JsonRpcError::method_not_found()));
+            return;
+        }
+        if raw_params.len() > MAX_ASYNC_COMPLETION_PAYLOAD_BYTES {
+            respond_async_completion_rejected(respond, "payload_too_large");
+            return;
+        }
+        let request = match serde_json::from_str::<AcpAsyncCompletionRequest>(raw_params) {
+            Ok(request) => request,
+            Err(_) => {
+                respond_async_completion_rejected(respond, "invalid_shape");
+                return;
+            }
+        };
+        if request.version != COMMAND_EVE_ASYNC_COMPLETION_VERSION {
+            respond_async_completion_rejected(respond, "unsupported_version");
+            return;
+        }
+        if validate_identifier(&request.completion_id).is_err() {
+            respond_async_completion_rejected(respond, "invalid_completion_id");
+            return;
+        }
+        if validate_identifier(&request.session_id).is_err() {
+            respond_async_completion_rejected(respond, "invalid_session_id");
+            return;
+        }
+        if request.content.trim().is_empty() || request.content.len() > MAX_ASYNC_COMPLETION_CONTENT_BYTES {
+            respond_async_completion_rejected(respond, "invalid_content");
+            return;
+        }
+        if !self
+            .state
+            .lock()
+            .is_ok_and(|state| state.bound_session_id.as_deref() == Some(request.session_id.as_str()))
+        {
+            respond_async_completion_rejected(respond, "session_mismatch");
+            return;
+        }
+
+        let Some(route) = self.async_completion_route.clone() else {
+            respond_async_completion_rejected(respond, "consumer_unavailable");
+            return;
+        };
+        let permit = match Arc::clone(&self.async_completion_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                respond_async_completion_retryable(respond, "consumer_saturated");
+                return;
+            }
+        };
+        let (reply, reply_rx) = oneshot::channel();
+        let dispatch = CommandEveAsyncCompletionDispatch {
+            conversation_id: route.conversation_id,
+            request,
+            project_build_options: route.project_build_options,
+            reply,
+        };
+        match route.sender.try_send(dispatch) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                respond_async_completion_retryable(respond, "consumer_saturated");
+                return;
+            }
+            Err(TrySendError::Closed(_)) => {
+                respond_async_completion_rejected(respond, "consumer_unavailable");
+                return;
+            }
+        }
+        let reply_timeout = self.async_completion_reply_timeout;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = match tokio::time::timeout(reply_timeout, reply_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => CommandEveAsyncCompletionResult::Unknown {
+                    code: "outcome_unknown_consumer_dropped".to_owned(),
+                },
+                Err(_) => CommandEveAsyncCompletionResult::Unknown {
+                    code: "outcome_unknown_reply_timeout".to_owned(),
+                },
+            };
+            let response = match result {
+                CommandEveAsyncCompletionResult::Completed { turn_id } => AcpAsyncCompletionResponse {
+                    status: AcpAsyncCompletionAckStatus::Accepted,
+                    turn_id: Some(turn_id),
+                    code: None,
+                },
+                CommandEveAsyncCompletionResult::AlreadyCompleted { turn_id } => AcpAsyncCompletionResponse {
+                    status: AcpAsyncCompletionAckStatus::AlreadyApplied,
+                    turn_id: Some(turn_id),
+                    code: None,
+                },
+                CommandEveAsyncCompletionResult::RetryableBusy { code } => AcpAsyncCompletionResponse {
+                    status: AcpAsyncCompletionAckStatus::Retryable,
+                    turn_id: None,
+                    code: Some(code),
+                },
+                CommandEveAsyncCompletionResult::Rejected { code } => AcpAsyncCompletionResponse {
+                    status: AcpAsyncCompletionAckStatus::Rejected,
+                    turn_id: None,
+                    code: Some(code),
+                },
+                CommandEveAsyncCompletionResult::Unknown { code } => AcpAsyncCompletionResponse {
+                    status: AcpAsyncCompletionAckStatus::Rejected,
+                    turn_id: None,
+                    code: Some(code),
+                },
+            };
+            respond_ignoring_transport(
+                respond,
+                serde_json::to_value(response).map_err(|_| rpc_internal("response_encode_failed")),
+            );
         });
     }
 
@@ -514,6 +676,34 @@ fn reject_request(respond: ResponseSender, reason: &'static str) {
     );
 }
 
+fn respond_async_completion_rejected(respond: ResponseSender, code: &'static str) {
+    warn!(
+        method = COMMAND_EVE_ASYNC_COMPLETION_WIRE_METHOD,
+        code, "Rejected ACP async completion"
+    );
+    let response = AcpAsyncCompletionResponse {
+        status: AcpAsyncCompletionAckStatus::Rejected,
+        turn_id: None,
+        code: Some(code.to_owned()),
+    };
+    respond_ignoring_transport(
+        respond,
+        serde_json::to_value(response).map_err(|_| rpc_internal("response_encode_failed")),
+    );
+}
+
+fn respond_async_completion_retryable(respond: ResponseSender, code: &'static str) {
+    let response = AcpAsyncCompletionResponse {
+        status: AcpAsyncCompletionAckStatus::Retryable,
+        turn_id: None,
+        code: Some(code.to_owned()),
+    };
+    respond_ignoring_transport(
+        respond,
+        serde_json::to_value(response).map_err(|_| rpc_internal("response_encode_failed")),
+    );
+}
+
 fn rpc_internal(reason: &'static str) -> JsonRpcError {
     JsonRpcError::internal_error().data(serde_json::json!({ "reason": reason }))
 }
@@ -535,6 +725,7 @@ fn local_binding_error() -> AcpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::JsonRpcMessage;
     use aionui_api_types::AcpReadPreviewResultKind;
     use tokio::sync::oneshot;
 
@@ -581,6 +772,162 @@ mod tests {
 
     fn enable(router: &AcpClientExtensionRouter) {
         router.enable_read_preview().unwrap();
+    }
+
+    fn completion_request(session_id: &str) -> AcpAsyncCompletionRequest {
+        AcpAsyncCompletionRequest {
+            version: COMMAND_EVE_ASYNC_COMPLETION_VERSION.to_owned(),
+            completion_id: "completion-1".to_owned(),
+            session_id: session_id.to_owned(),
+            content: "Continue the conversation".to_owned(),
+        }
+    }
+
+    fn completion_route(sender: crate::CommandEveAsyncCompletionSender) -> CommandEveAsyncCompletionRoute {
+        CommandEveAsyncCompletionRoute {
+            conversation_id: "conversation-1".to_owned(),
+            sender,
+            project_build_options: None,
+        }
+    }
+
+    #[test]
+    fn sdk_strips_private_wire_prefix_before_router_matching() {
+        let parsed = AgentRequest::parse_message(
+            COMMAND_EVE_ASYNC_COMPLETION_WIRE_METHOD,
+            &serde_json::to_value(completion_request("session-1")).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            AgentRequest::ExtMethodRequest(request)
+                if request.method.as_ref() == COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_completion_is_canonically_bound_and_acknowledged() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
+        let router = AcpClientExtensionRouter::new(event_tx).with_async_completion(completion_route(completion_tx));
+        router.enable_async_completion().unwrap();
+        router.bind_session("session-1").unwrap();
+
+        let response_rx = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let dispatched = completion_rx.recv().await.unwrap();
+        assert_eq!(dispatched.conversation_id, "conversation-1");
+        assert_eq!(dispatched.request.session_id, "session-1");
+        assert!(dispatched.project_build_options.is_none());
+        dispatched
+            .reply
+            .send(CommandEveAsyncCompletionResult::Completed {
+                turn_id: "turn-1".to_owned(),
+            })
+            .unwrap();
+        let value = response_rx.await.unwrap().unwrap();
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Accepted);
+        assert_eq!(response.turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[tokio::test]
+    async fn async_completion_rejects_session_mismatch_and_maps_busy_retryably() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
+        let router = AcpClientExtensionRouter::new(event_tx).with_async_completion(completion_route(completion_tx));
+        router.enable_async_completion().unwrap();
+        router.bind_session("session-1").unwrap();
+
+        let mismatched = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-2")).unwrap(),
+        );
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(mismatched.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Rejected);
+        assert_eq!(response.code.as_deref(), Some("session_mismatch"));
+
+        let busy = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        completion_rx
+            .recv()
+            .await
+            .unwrap()
+            .reply
+            .send(CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "conversation_busy".to_owned(),
+            })
+            .unwrap();
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(busy.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(response.code.as_deref(), Some("conversation_busy"));
+    }
+
+    #[tokio::test]
+    async fn async_completion_concurrency_saturation_is_retryable_before_dispatch() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(4);
+        let router = AcpClientExtensionRouter::new(event_tx)
+            .with_async_completion(completion_route(completion_tx))
+            .with_async_completion_limits(Duration::from_secs(1), 1);
+        router.enable_async_completion().unwrap();
+        router.bind_session("session-1").unwrap();
+
+        let first = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let first_dispatch = completion_rx.recv().await.unwrap();
+
+        let mut second_request = completion_request("session-1");
+        second_request.completion_id = "completion-2".to_owned();
+        let second = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(second_request).unwrap(),
+        );
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(second.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(response.code.as_deref(), Some("consumer_saturated"));
+        assert!(completion_rx.try_recv().is_err(), "saturated request must not dispatch");
+
+        first_dispatch
+            .reply
+            .send(CommandEveAsyncCompletionResult::Completed {
+                turn_id: "turn-1".to_owned(),
+            })
+            .unwrap();
+        assert!(first.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn async_completion_reply_timeout_is_explicitly_unknown_not_retryable() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
+        let router = AcpClientExtensionRouter::new(event_tx)
+            .with_async_completion(completion_route(completion_tx))
+            .with_async_completion_limits(Duration::from_millis(20), 1);
+        router.enable_async_completion().unwrap();
+        router.bind_session("session-1").unwrap();
+
+        let response = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let in_flight = completion_rx.recv().await.unwrap();
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Rejected);
+        assert_eq!(response.code.as_deref(), Some("outcome_unknown_reply_timeout"));
+        drop(in_flight);
     }
 
     #[tokio::test]

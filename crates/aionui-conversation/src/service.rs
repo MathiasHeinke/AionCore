@@ -2933,6 +2933,36 @@ impl ConversationService {
         &self,
         request: ConversationAgentTurnRequest,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
+        let turn_id = Self::mint_turn_id();
+        self.run_agent_turn_with_transient_project_options(request, turn_id, None)
+            .await
+    }
+
+    /// Resume the canonical conversation from a verified in-process Hermes
+    /// completion. `turn_id` was durably assigned by the completion receipt;
+    /// project options originate from the already-attested task build and are
+    /// revalidated under a fresh native execution permit below.
+    pub async fn run_command_eve_async_completion_turn(
+        &self,
+        request: ConversationAgentTurnRequest,
+        turn_id: String,
+        project_build_options: Option<BuildTaskOptions>,
+    ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
+        if turn_id.trim().is_empty() {
+            return Err(ConversationError::BadRequest {
+                reason: "Agent turn_id must not be empty".into(),
+            });
+        }
+        self.run_agent_turn_with_transient_project_options(request, turn_id, project_build_options)
+            .await
+    }
+
+    async fn run_agent_turn_with_transient_project_options(
+        &self,
+        request: ConversationAgentTurnRequest,
+        turn_id: String,
+        project_build_options: Option<BuildTaskOptions>,
+    ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
         if request.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Agent turn content must not be empty".into(),
@@ -2950,11 +2980,16 @@ impl ConversationService {
 
         reject_deprecated_runtime_row(&row)?;
 
-        if parse_project_binding_from_row(&row)?.is_some() {
-            return Err(project_bad_request(PROJECT_RUNTIME_BINDING_REQUIRED));
-        }
+        let project_build_opts = match (parse_project_binding_from_row(&row)?, project_build_options) {
+            (Some(binding), Some(options)) => Some(
+                self.revalidate_transient_project_build_options(&row, &binding, &turn_id, options)
+                    .await?,
+            ),
+            (Some(_), None) => return Err(project_bad_request(PROJECT_RUNTIME_BINDING_REQUIRED)),
+            (None, Some(_)) => return Err(project_bad_request(PROJECT_RUNTIME_BINDING_UNEXPECTED)),
+            (None, None) => None,
+        };
 
-        let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(ConversationAgentTurnStarted {
@@ -2964,7 +2999,11 @@ impl ConversationService {
             .await;
         }
 
-        let build_opts = match self.build_task_options(&row).await {
+        let build_opts_result = match project_build_opts {
+            Some(options) => Ok(options),
+            None => self.build_task_options(&row).await,
+        };
+        let build_opts = match build_opts_result {
             Ok(opts) => opts,
             Err(err) => {
                 let top_level_code = err.error_code();
@@ -3558,6 +3597,85 @@ impl ConversationService {
             ProjectRuntimeUse::Warmup,
         )
         .await
+    }
+
+    async fn revalidate_transient_project_build_options(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+        binding: &crate::project_workspace::ProjectConversationBinding,
+        turn_id: &str,
+        mut options: BuildTaskOptions,
+    ) -> Result<BuildTaskOptions, ConversationError> {
+        let Some(context) = options.project_runtime_context.clone() else {
+            return Err(project_bad_request(PROJECT_RUNTIME_BINDING_MISMATCH));
+        };
+        if options.project_runtime_execution.is_some()
+            || options.context.conversation.conversation_id != row.id
+            || options.context.conversation.user_id != row.user_id
+            || options.context.workspace.project_environment_hint.is_none()
+            || context.project_binding_revision != binding.project_binding_revision
+        {
+            return Err(project_bad_request(PROJECT_RUNTIME_BINDING_MISMATCH));
+        }
+
+        let expected_binding = binding.clone();
+        let conversation_id = row.id.clone();
+        let repo = Arc::clone(&self.conversation_repo);
+        let revalidate: ProjectRuntimeRevalidator = Arc::new(move || {
+            let repo = Arc::clone(&repo);
+            let conversation_id = conversation_id.clone();
+            let expected_binding = expected_binding.clone();
+            Box::pin(async move {
+                let row = repo
+                    .get(&conversation_id)
+                    .await
+                    .map_err(|_| AgentError::internal("PROJECT_RUNTIME_REVALIDATION_UNAVAILABLE"))?
+                    .ok_or_else(|| AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"))?;
+                let current = parse_project_binding_from_row(&row)
+                    .map_err(|_| AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"))?
+                    .ok_or_else(|| AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"))?;
+                if current != expected_binding {
+                    return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"));
+                }
+                Ok(())
+            })
+        });
+        let gate = ProjectRuntimeBuildGate::new(
+            Arc::clone(&self.project_runtime_epochs),
+            &row.id,
+            binding.project_binding_revision,
+            revalidate,
+        );
+        if gate.process_runtime_generation() != context.process_runtime_generation {
+            return Err(ConversationError::Busy {
+                reason: "PROJECT_RUNTIME_CONTEXT_INVALIDATED".into(),
+            });
+        }
+        let execution_permit = gate
+            .acquire_and_revalidate(ProjectRuntimeUse::Turn {
+                turn_id: turn_id.to_owned(),
+            })
+            .await?;
+
+        // Re-read while the native execution permit is held. No path or
+        // attestation material is persisted; the already-attested transient
+        // options remain the only source of the runtime workspace.
+        let current_row = self
+            .conversation_repo
+            .get(&row.id)
+            .await?
+            .filter(|current| current.user_id == row.user_id)
+            .ok_or_else(|| ConversationError::NotFound { id: row.id.clone() })?;
+        let current_binding = parse_project_binding_from_row(&current_row)?
+            .ok_or_else(|| project_bad_request(PROJECT_RUNTIME_BINDING_UNEXPECTED))?;
+        if &current_binding != binding {
+            return Err(ConversationError::Busy {
+                reason: "PROJECT_RUNTIME_CONTEXT_INVALIDATED".into(),
+            });
+        }
+
+        options.project_runtime_execution = Some(execution_permit);
+        Ok(options)
     }
 
     async fn build_task_options_with_project_workspace_for_use(

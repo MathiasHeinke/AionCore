@@ -490,7 +490,24 @@ impl AcpAgentManager {
         ),
         AgentError,
     > {
-        let (this, domain_event_rx, notification_rx) = AcpAgentManager::new(params, skill_manager).await?;
+        Self::build_with_async_completion(params, skill_manager, catalog_tx, None).await
+    }
+
+    pub(crate) async fn build_with_async_completion(
+        params: Arc<AcpSessionParams>,
+        skill_manager: Arc<AcpSkillManager>,
+        catalog_tx: &CatalogSender,
+        async_completion_route: Option<crate::CommandEveAsyncCompletionRoute>,
+    ) -> Result<
+        (
+            Self,
+            mpsc::Receiver<AcpSessionEvent>,
+            mpsc::Receiver<SessionNotification>,
+        ),
+        AgentError,
+    > {
+        let (this, domain_event_rx, notification_rx) =
+            AcpAgentManager::new(params, skill_manager, async_completion_route).await?;
         this.init(catalog_tx).await;
         Ok((this, domain_event_rx, notification_rx))
     }
@@ -498,6 +515,7 @@ impl AcpAgentManager {
     async fn new(
         params: Arc<AcpSessionParams>,
         skill_manager: Arc<AcpSkillManager>,
+        async_completion_route: Option<crate::CommandEveAsyncCompletionRoute>,
     ) -> Result<
         (
             Self,
@@ -545,7 +563,20 @@ impl AcpAgentManager {
         // 70ms in — ELECTRON-1BT), so we explicitly watch the child. If
         // it dies before init completes, surface a `StartupCrash` carrying
         // the buffered stderr instead of waiting out the timeout.
-        let connect_fut = AcpProtocol::connect(stdin, stdout, runtime.event_sender(), permission_tx, notification_tx);
+        let has_async_completion = async_completion_route.is_some();
+        let async_completion = if params.metadata.backend.as_deref() == Some("hermes") {
+            async_completion_route
+        } else {
+            None
+        };
+        let connect_fut = AcpProtocol::connect_with_optional_async_completion(
+            stdin,
+            stdout,
+            runtime.event_sender(),
+            permission_tx,
+            notification_tx,
+            async_completion,
+        );
         tokio::pin!(connect_fut);
         let protocol = tokio::select! {
             biased;
@@ -575,6 +606,9 @@ impl AcpAgentManager {
         if params.metadata.backend.as_deref() == Some("hermes") {
             protocol.enable_read_preview().map_err(AgentError::from)?;
             protocol.enable_read_terminal().map_err(AgentError::from)?;
+            if has_async_completion {
+                protocol.enable_async_completion().map_err(AgentError::from)?;
+            }
         }
         let permission_router = Arc::new(PermissionRouter::new(permission_rx));
 
