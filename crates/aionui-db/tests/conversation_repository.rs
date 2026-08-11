@@ -1141,6 +1141,50 @@ async fn delete_message_removes_only_the_exact_conversation_row() {
 }
 
 #[tokio::test]
+async fn stale_runtime_query_includes_only_exact_provisional_grounding_rows() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("stale-provisional-grounding");
+    repo.create(&conv).await.unwrap();
+
+    let mut provisional = make_message(&conv.id, "provisional");
+    provisional.id = "provisional-grounding".to_owned();
+    provisional.msg_id = Some(provisional.id.clone());
+    provisional.position = Some("right".to_owned());
+    provisional.status = Some("pending".to_owned());
+    provisional.hidden = true;
+    provisional.content = serde_json::json!({
+        "content": "question",
+        "command_eve_prompt_admission": {
+            "version": "command-eve-prompt-admission/v1",
+            "state": "provisional",
+            "turn_id": "turn-1",
+            "receipt_sha256": "a".repeat(64),
+        }
+    })
+    .to_string();
+    repo.insert_message(&provisional).await.unwrap();
+
+    let mut ordinary_pending = make_message(&conv.id, "ordinary pending");
+    ordinary_pending.id = "ordinary-pending".to_owned();
+    ordinary_pending.msg_id = Some(ordinary_pending.id.clone());
+    ordinary_pending.position = Some("right".to_owned());
+    ordinary_pending.status = Some("pending".to_owned());
+    ordinary_pending.hidden = true;
+    repo.insert_message(&ordinary_pending).await.unwrap();
+
+    let mut malformed_pending = ordinary_pending.clone();
+    malformed_pending.id = "malformed-pending".to_owned();
+    malformed_pending.msg_id = Some(malformed_pending.id.clone());
+    malformed_pending.content = "not-json".to_owned();
+    repo.insert_message(&malformed_pending).await.unwrap();
+
+    let stale = repo.list_stale_runtime_messages().await.unwrap();
+    assert!(stale.iter().any(|message| message.id == provisional.id));
+    assert!(stale.iter().all(|message| message.id != ordinary_pending.id));
+    assert!(stale.iter().all(|message| message.id != malformed_pending.id));
+}
+
+#[tokio::test]
 async fn get_message_by_msg_id_triple() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("msg-find");

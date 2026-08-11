@@ -901,9 +901,19 @@ impl IConversationRepository for SqliteConversationRepository {
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT m.* FROM messages m \
              INNER JOIN conversations c ON c.id = m.conversation_id \
-             WHERE m.position = 'left' \
-               AND m.status IN ('work', 'pending') \
-               AND m.type IN ('text', 'thinking') \
+             WHERE (m.position = 'left' \
+                    AND m.status IN ('work', 'pending') \
+                    AND m.type IN ('text', 'thinking')) \
+                OR (m.position = 'right' \
+                    AND m.status = 'pending' \
+                    AND m.type = 'text' \
+                    AND m.hidden = 1 \
+                    AND CASE WHEN json_valid(m.content) \
+                        THEN json_extract(m.content, '$.command_eve_prompt_admission.version') \
+                        ELSE NULL END = 'command-eve-prompt-admission/v1' \
+                    AND CASE WHEN json_valid(m.content) \
+                        THEN json_extract(m.content, '$.command_eve_prompt_admission.state') \
+                        ELSE NULL END = 'provisional') \
              ORDER BY m.created_at ASC",
         )
         .fetch_all(&self.pool)

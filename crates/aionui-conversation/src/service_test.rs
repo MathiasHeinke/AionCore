@@ -9,9 +9,10 @@ use std::time::Duration;
 use aionui_ai_agent::agent_task::{AgentInstance, ConfirmationPrincipalContext, IAgentTask, IMockAgent};
 use aionui_ai_agent::prompt_admission::{
     CommandEvePromptAdmissionClaimResult, CommandEvePromptAdmissionDecision,
-    CommandEvePromptAdmissionFinalizeClaimResult, admit_command_eve_prompt_admission,
-    claim_command_eve_prompt_admission, command_eve_prompt_admission_for_turn, complete_command_eve_prompt_admission,
-    complete_command_eve_prompt_admission_commit, finalize_command_eve_prompt_admission,
+    CommandEvePromptAdmissionFinalizeClaimResult, CommandEvePromptAdmissionPeerAckClaimResult,
+    acknowledge_command_eve_prompt_admission, admit_command_eve_prompt_admission, claim_command_eve_prompt_admission,
+    command_eve_prompt_admission_for_turn, complete_command_eve_prompt_admission_commit,
+    finalize_command_eve_prompt_admission, mark_command_eve_prompt_finalize_response,
 };
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
@@ -825,9 +826,22 @@ impl IConversationRepository for MockRepo {
         Ok(messages
             .iter()
             .filter(|message| {
-                message.position.as_deref() == Some("left")
+                let stale_assistant = message.position.as_deref() == Some("left")
                     && matches!(message.status.as_deref(), Some("work" | "pending"))
-                    && matches!(message.r#type.as_str(), "text" | "thinking")
+                    && matches!(message.r#type.as_str(), "text" | "thinking");
+                let provisional_grounding = message.position.as_deref() == Some("right")
+                    && message.status.as_deref() == Some("pending")
+                    && message.r#type == "text"
+                    && message.hidden
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("command_eve_prompt_admission").cloned())
+                        .is_some_and(|marker| {
+                            marker.get("version").and_then(|value| value.as_str())
+                                == Some("command-eve-prompt-admission/v1")
+                                && marker.get("state").and_then(|value| value.as_str()) == Some("provisional")
+                        });
+                stale_assistant || provisional_grounding
             })
             .cloned()
             .collect())
@@ -3207,7 +3221,6 @@ async fn list_artifacts_includes_legacy_cron_trigger_messages() {
     })
     .await
     .unwrap();
-
     let artifacts = svc.list_artifacts("user_1", &conv.id).await.unwrap();
 
     assert_eq!(artifacts.len(), 1);
@@ -3279,6 +3292,8 @@ struct MockAgent {
     steer_release: Arc<Notify>,
     admission_started: Option<Arc<Notify>>,
     admission_release: Option<Arc<Notify>>,
+    peer_ack_started: Option<Arc<Notify>>,
+    peer_ack_release: Option<Arc<Notify>>,
     finalize_delivery_succeeds: bool,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
@@ -3326,6 +3341,8 @@ impl MockAgent {
             steer_release: Arc::new(Notify::new()),
             admission_started: None,
             admission_release: None,
+            peer_ack_started: None,
+            peer_ack_release: None,
             finalize_delivery_succeeds: true,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
@@ -3353,6 +3370,8 @@ impl MockAgent {
             steer_release: Arc::new(Notify::new()),
             admission_started: None,
             admission_release: None,
+            peer_ack_started: None,
+            peer_ack_release: None,
             finalize_delivery_succeeds: true,
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
@@ -3380,6 +3399,8 @@ impl MockAgent {
             steer_release: Arc::new(Notify::new()),
             admission_started: None,
             admission_release: None,
+            peer_ack_started: None,
+            peer_ack_release: None,
             finalize_delivery_succeeds: true,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
@@ -3427,6 +3448,12 @@ impl MockAgent {
         self.finalize_delivery_succeeds = false;
         self
     }
+
+    fn with_blocking_peer_ack(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.peer_ack_started = Some(started);
+        self.peer_ack_release = Some(release);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -3469,28 +3496,60 @@ impl IAgentTask for MockAgent {
                         match finalize_command_eve_prompt_admission(&request, "mock-session")
                             .expect("mock Hermes consumed the commit response")
                         {
-                            CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision {
-                                decision_rx,
-                                delivery_tx,
-                            } => match decision_rx.await {
-                                Ok(CommandEvePromptAdmissionDecision::Accepted) => {
-                                    if self.finalize_delivery_succeeds {
-                                        complete_command_eve_prompt_admission(&request_id, "mock-session", true);
-                                        let _ = delivery_tx.send(Ok(()));
-                                    } else {
-                                        complete_command_eve_prompt_admission(&request_id, "mock-session", false);
-                                        let _ = delivery_tx
-                                            .send(Err("ATTACHMENT_PROMPT_FINALIZE_DELIVERY_REJECTED".to_owned()));
+                            CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision(decision_rx) => {
+                                match decision_rx.await {
+                                    Ok(CommandEvePromptAdmissionDecision::Accepted) => {
+                                        if self.finalize_delivery_succeeds {
+                                            mark_command_eve_prompt_finalize_response(
+                                                &request_id,
+                                                "mock-session",
+                                                true,
+                                            )
+                                            .expect("mock finalize response queued");
+                                            if let (Some(started), Some(release)) =
+                                                (&self.peer_ack_started, &self.peer_ack_release)
+                                            {
+                                                started.notify_one();
+                                                release.notified().await;
+                                            }
+                                            let peer_ack =
+                                                acknowledge_command_eve_prompt_admission(&request, "mock-session")
+                                                    .map_err(|code| {
+                                                        AgentSendError::from_agent_error(AgentError::bad_gateway(code))
+                                                    })?;
+                                            match peer_ack {
+                                                CommandEvePromptAdmissionPeerAckClaimResult::AwaitingDecision(
+                                                    peer_ack_decision,
+                                                ) => {
+                                                    let accepted = matches!(
+                                                        peer_ack_decision.await,
+                                                        Ok(CommandEvePromptAdmissionDecision::Accepted)
+                                                    );
+                                                    if !accepted {
+                                                        return Err(AgentSendError::from_agent_error(
+                                                            AgentError::bad_gateway(
+                                                                "ATTACHMENT_PROMPT_PEER_ACK_REJECTED",
+                                                            ),
+                                                        ));
+                                                    }
+                                                }
+                                                CommandEvePromptAdmissionPeerAckClaimResult::AlreadyAccepted => {}
+                                            }
+                                        } else {
+                                            let _ = mark_command_eve_prompt_finalize_response(
+                                                &request_id,
+                                                "mock-session",
+                                                false,
+                                            );
+                                        }
+                                    }
+                                    Ok(CommandEvePromptAdmissionDecision::Rejected) | Err(_) => {
+                                        return Err(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                                            "ATTACHMENT_PROMPT_FINALIZE_REJECTED",
+                                        )));
                                     }
                                 }
-                                Ok(CommandEvePromptAdmissionDecision::Rejected) | Err(_) => {
-                                    let _ = delivery_tx
-                                        .send(Err("ATTACHMENT_PROMPT_FINALIZE_DELIVERY_REJECTED".to_owned()));
-                                    return Err(AgentSendError::from_agent_error(AgentError::bad_gateway(
-                                        "ATTACHMENT_PROMPT_FINALIZE_REJECTED",
-                                    )));
-                                }
-                            },
+                            }
                             CommandEvePromptAdmissionFinalizeClaimResult::AlreadyAccepted => {}
                         }
                     }
@@ -4501,6 +4560,9 @@ async fn attachment_grounding_is_verified_before_persistence_and_receipted_on_su
         .collect::<Vec<_>>();
     assert_eq!(user_messages.len(), 1);
     assert!(user_messages[0].content.contains("attachment_grounding_receipt"));
+    assert!(!user_messages[0].content.contains("command_eve_prompt_admission"));
+    assert_eq!(user_messages[0].status.as_deref(), Some("finish"));
+    assert!(!user_messages[0].hidden);
 }
 
 #[tokio::test]
@@ -4551,6 +4613,65 @@ async fn finalize_delivery_failure_hides_grounded_row_and_allows_retry() {
             .filter(|message| message.position.as_deref() == Some("right") && !message.hidden)
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn aborted_grounded_send_keeps_only_hidden_provisional_state_until_restart_cleanup() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr_impl = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr_impl.clone();
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("hermes"))
+        .await
+        .unwrap();
+    broadcaster.take_events();
+    let (directory, request) = grounded_pdf_request();
+    let peer_ack_started = Arc::new(Notify::new());
+    let peer_ack_release = Arc::new(Notify::new());
+    let mut agent =
+        MockAgent::new(&conv.id).with_blocking_peer_ack(Arc::clone(&peer_ack_started), Arc::clone(&peer_ack_release));
+    agent.workspace_override = Some(directory.path().to_string_lossy().into_owned());
+    task_mgr_impl.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
+
+    let send_service = svc.clone();
+    let send_conversation_id = conv.id.clone();
+    let send_task_mgr = Arc::clone(&task_mgr);
+    let send = tokio::spawn(async move {
+        send_service
+            .send_message("user_1", &send_conversation_id, request, &send_task_mgr)
+            .await
+    });
+    peer_ack_started.notified().await;
+
+    let provisional_rows = repo_messages_asc(&repo, &conv.id, 10).await;
+    let provisional = provisional_rows
+        .iter()
+        .find(|message| message.position.as_deref() == Some("right"))
+        .expect("finalize barrier must persist one provisional user row");
+    assert_eq!(provisional.status.as_deref(), Some("pending"));
+    assert!(provisional.hidden);
+    assert!(provisional.content.contains("\"state\":\"provisional\""));
+    assert!(!provisional.content.contains("attachment_grounding_receipt"));
+    assert!(
+        broadcaster
+            .take_events()
+            .iter()
+            .all(|event| event.name != "message.userCreated")
+    );
+
+    send.abort();
+    assert!(send.await.unwrap_err().is_cancelled());
+    peer_ack_release.notify_one();
+    wait_for_turn_released(&svc, &conv.id).await;
+    svc.recover_stale_runtime_state_on_startup().await;
+
+    assert!(
+        repo_messages_asc(&repo, &conv.id, 10)
+            .await
+            .iter()
+            .all(|message| message.id != provisional.id),
+        "restart recovery must delete the stale provisional prompt before it can become transcript truth"
     );
 }
 
@@ -6339,6 +6460,28 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
     })
     .await
     .unwrap();
+    repo.insert_message(&MessageRow {
+        id: "provisional-grounded".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("provisional-grounded".into()),
+        r#type: "text".into(),
+        content: json!({
+            "content": "must not survive restart",
+            "command_eve_prompt_admission": {
+                "version": "command-eve-prompt-admission/v1",
+                "state": "provisional",
+                "turn_id": "turn-provisional",
+                "receipt_sha256": "a".repeat(64),
+            }
+        })
+        .to_string(),
+        position: Some("right".into()),
+        status: Some("pending".into()),
+        hidden: true,
+        created_at: 3,
+    })
+    .await
+    .unwrap();
 
     svc.recover_stale_runtime_state_on_startup().await;
 
@@ -6360,6 +6503,7 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
     let empty = messages.iter().find(|message| message.id == "empty-stale").unwrap();
     assert_eq!(empty.status.as_deref(), Some("finish"));
     assert!(empty.hidden);
+    assert!(messages.iter().all(|message| message.id != "provisional-grounded"));
 
     assert!(
         messages.iter().all(|message| message.r#type != "tips"),

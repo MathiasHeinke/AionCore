@@ -24,10 +24,12 @@ use crate::error::AgentError;
 use crate::prompt_admission::{
     COMMAND_EVE_PROMPT_ADMISSION_EXT_METHOD, COMMAND_EVE_PROMPT_ADMISSION_VERSION,
     CommandEvePromptAdmissionClaimResult, CommandEvePromptAdmissionDecision,
-    CommandEvePromptAdmissionFinalizeClaimResult, CommandEvePromptAdmissionPhase, CommandEvePromptAdmissionResponse,
-    CommandEvePromptAdmissionStatus, CommandEvePromptAdmissionWireRequest, admit_command_eve_prompt_admission,
+    CommandEvePromptAdmissionFinalizeClaimResult, CommandEvePromptAdmissionPeerAckClaimResult,
+    CommandEvePromptAdmissionPhase, CommandEvePromptAdmissionResponse, CommandEvePromptAdmissionStatus,
+    CommandEvePromptAdmissionWireRequest, acknowledge_command_eve_prompt_admission, admit_command_eve_prompt_admission,
     claim_command_eve_prompt_admission, complete_command_eve_prompt_admission,
     complete_command_eve_prompt_admission_commit, finalize_command_eve_prompt_admission,
+    mark_command_eve_prompt_finalize_response, reject_command_eve_prompt_admissions_for_session,
 };
 use crate::protocol::error::AcpError;
 use crate::protocol::events::AgentStreamEvent;
@@ -101,13 +103,14 @@ impl AcpClientExtensionRouter {
     /// Rebinding cancels every request from the previous session.
     pub(crate) fn bind_session(&self, session_id: &str) -> Result<(), AcpError> {
         validate_identifier(session_id).map_err(|_| local_binding_error())?;
-        let (cancelled, cancelled_terminal) = {
+        let (previous_session, cancelled, cancelled_terminal) = {
             let mut state = self.state.lock().map_err(|_| local_binding_error())?;
             if state.bound_session_id.as_deref() == Some(session_id) {
                 return Ok(());
             }
-            state.bound_session_id = Some(session_id.to_owned());
+            let previous_session = state.bound_session_id.replace(session_id.to_owned());
             (
+                previous_session,
                 state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
                 state
                     .pending_terminal
@@ -116,6 +119,12 @@ impl AcpClientExtensionRouter {
                     .collect::<Vec<_>>(),
             )
         };
+        if let Some(previous_session) = previous_session {
+            reject_command_eve_prompt_admissions_for_session(
+                &previous_session,
+                "ATTACHMENT_PROMPT_FINALIZE_PEER_ACK_UNAVAILABLE",
+            );
+        }
         cancel_pending(cancelled, "session_rebound");
         cancel_pending_terminal(cancelled_terminal, "session_rebound");
         Ok(())
@@ -123,7 +132,7 @@ impl AcpClientExtensionRouter {
 
     /// Unbind a successfully closed session and cancel its outstanding reads.
     pub(crate) fn unbind_session(&self, session_id: &str) {
-        let (cancelled, cancelled_terminal) = {
+        let (cancelled_session, cancelled, cancelled_terminal) = {
             let Ok(mut state) = self.state.lock() else {
                 warn!("ACP client extension state unavailable while closing session");
                 return;
@@ -133,6 +142,7 @@ impl AcpClientExtensionRouter {
             }
             state.bound_session_id = None;
             (
+                session_id.to_owned(),
                 state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
                 state
                     .pending_terminal
@@ -141,21 +151,26 @@ impl AcpClientExtensionRouter {
                     .collect::<Vec<_>>(),
             )
         };
+        reject_command_eve_prompt_admissions_for_session(
+            &cancelled_session,
+            "ATTACHMENT_PROMPT_FINALIZE_PEER_ACK_UNAVAILABLE",
+        );
         cancel_pending(cancelled, "session_closed");
         cancel_pending_terminal(cancelled_terminal, "session_closed");
     }
 
     /// Cancel all pending requests before transport shutdown/disconnect.
     pub(crate) fn cancel_all(&self, reason: &'static str) {
-        let (cancelled, cancelled_terminal) = {
+        let (cancelled_session, cancelled, cancelled_terminal) = {
             let Ok(mut state) = self.state.lock() else {
                 warn!("ACP client extension state unavailable during cancellation");
                 return;
             };
             state.read_preview_enabled = false;
             state.read_terminal_enabled = false;
-            state.bound_session_id = None;
+            let cancelled_session = state.bound_session_id.take();
             (
+                cancelled_session,
                 state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
                 state
                     .pending_terminal
@@ -164,6 +179,12 @@ impl AcpClientExtensionRouter {
                     .collect::<Vec<_>>(),
             )
         };
+        if let Some(cancelled_session) = cancelled_session {
+            reject_command_eve_prompt_admissions_for_session(
+                &cancelled_session,
+                "ATTACHMENT_PROMPT_FINALIZE_PEER_ACK_UNAVAILABLE",
+            );
+        }
         cancel_pending(cancelled, reason);
         cancel_pending_terminal(cancelled_terminal, reason);
     }
@@ -312,22 +333,34 @@ impl AcpClientExtensionRouter {
                     Ok(CommandEvePromptAdmissionFinalizeClaimResult::AlreadyAccepted) => {
                         respond_prompt_admission(respond, &wire.request_id, true);
                     }
-                    Ok(CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision {
-                        decision_rx,
-                        delivery_tx,
-                    }) => {
+                    Ok(CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision(decision_rx)) => {
                         let request_id = wire.request_id;
                         let session_id = wire.session_id;
                         tokio::spawn(async move {
                             let accepted = matches!(decision_rx.await, Ok(CommandEvePromptAdmissionDecision::Accepted));
-                            let transport_ok = respond_prompt_admission(respond, &request_id, accepted);
-                            let delivered = accepted && transport_ok;
-                            complete_command_eve_prompt_admission(&request_id, &session_id, delivered);
-                            let _ = delivery_tx.send(if delivered {
-                                Ok(())
-                            } else {
-                                Err("ATTACHMENT_PROMPT_FINALIZE_DELIVERY_REJECTED".to_owned())
-                            });
+                            let response_queued = respond_prompt_admission(respond, &request_id, accepted);
+                            let _ = mark_command_eve_prompt_finalize_response(
+                                &request_id,
+                                &session_id,
+                                accepted && response_queued,
+                            );
+                        });
+                    }
+                    Err(_) => {
+                        respond_prompt_admission(respond, &wire.request_id, false);
+                    }
+                }
+            }
+            CommandEvePromptAdmissionPhase::Ack => {
+                match acknowledge_command_eve_prompt_admission(&request, &wire.session_id) {
+                    Ok(CommandEvePromptAdmissionPeerAckClaimResult::AlreadyAccepted) => {
+                        respond_prompt_admission(respond, &wire.request_id, true);
+                    }
+                    Ok(CommandEvePromptAdmissionPeerAckClaimResult::AwaitingDecision(decision_rx)) => {
+                        let request_id = wire.request_id;
+                        tokio::spawn(async move {
+                            let accepted = matches!(decision_rx.await, Ok(CommandEvePromptAdmissionDecision::Accepted));
+                            respond_prompt_admission(respond, &request_id, accepted);
                         });
                     }
                     Err(_) => {
@@ -629,12 +662,12 @@ fn respond_prompt_admission(respond: ResponseSender, request_id: &str, accepted:
         respond_ignoring_transport(respond, Err(rpc_internal("response_encoding_failed")));
         return false;
     };
-    let delivered = respond(Ok(value)).is_ok();
+    let queued = respond(Ok(value)).is_ok();
     info!(
         method = COMMAND_EVE_PROMPT_ADMISSION_EXT_METHOD,
-        accepted, delivered, "ACP prompt admission decision delivered"
+        accepted, queued, "ACP prompt admission decision queued"
     );
-    delivered
+    queued
 }
 
 fn rpc_internal(reason: &'static str) -> JsonRpcError {
@@ -823,7 +856,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_admission_router_publishes_commit_before_immediate_finalize_and_delivers_both_responses() {
+    async fn prompt_admission_router_requires_peer_ack_after_finalize_before_acceptance() {
         let (event_tx, _event_rx) = broadcast::channel(4);
         let router = AcpClientExtensionRouter::new(event_tx);
         router.bind_session("session-router-race").unwrap();
@@ -855,9 +888,32 @@ mod tests {
         );
         let finalize_response = dispatch_prompt(&router, &finalize);
         let finalize_claim = finalize_ticket.wait().await.unwrap();
-        let delivery_ticket = finalize_claim.accept().unwrap();
+        let peer_ack_ticket = finalize_claim.accept().unwrap();
         assert!(accepted_prompt_response(finalize_response.await.unwrap().unwrap()));
-        delivery_ticket.wait().await.unwrap();
+        assert!(matches!(
+            claim_command_eve_prompt_admission(
+                &command_eve_prompt_admission_for_turn("turn-router-race").unwrap(),
+                "session-router-race",
+            ),
+            Err("request_in_progress")
+        ));
+
+        let ack = admission_wire(
+            "turn-router-race",
+            "session-router-race",
+            CommandEvePromptAdmissionPhase::Ack,
+        );
+        let ack_response = dispatch_prompt(&router, &ack);
+        let peer_ack_claim = peer_ack_ticket.wait().await.unwrap();
+        peer_ack_claim.accept().unwrap();
+        assert!(accepted_prompt_response(ack_response.await.unwrap().unwrap()));
+        assert!(matches!(
+            claim_command_eve_prompt_admission(
+                &command_eve_prompt_admission_for_turn("turn-router-race").unwrap(),
+                "session-router-race",
+            ),
+            Ok(CommandEvePromptAdmissionClaimResult::AlreadyAccepted)
+        ));
         forget_command_eve_prompt_admission("turn-router-race");
     }
 
@@ -923,9 +979,56 @@ mod tests {
         );
         failing_prompt_delivery(&router, &finalize);
         let claim = finalize_ticket.wait().await.unwrap();
-        let delivery_ticket = claim.accept().unwrap();
-        assert!(delivery_ticket.wait().await.is_err());
+        let peer_ack_ticket = claim.accept().unwrap();
+        let error = match peer_ack_ticket.wait().await {
+            Err(error) => error,
+            Ok(_) => panic!("local finalize enqueue cannot substitute for a peer acknowledgement"),
+        };
+        assert!(error.to_string().contains("PEER_ACK_UNAVAILABLE"));
         assert!(command_eve_prompt_admission_for_turn("turn-router-finalize-fail").is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_admission_router_connection_drop_before_peer_ack_is_typed_unavailable() {
+        let (event_tx, _event_rx) = broadcast::channel(4);
+        let router = AcpClientExtensionRouter::new(event_tx);
+        router.bind_session("session-router-drop").unwrap();
+        let ticket = register_command_eve_prompt_admission("turn-router-drop", &"f".repeat(64)).unwrap();
+
+        let accept = admission_wire(
+            "turn-router-drop",
+            "session-router-drop",
+            CommandEvePromptAdmissionPhase::Accept,
+        );
+        assert!(accepted_prompt_response(
+            dispatch_prompt(&router, &accept).await.unwrap().unwrap()
+        ));
+        let commit = admission_wire(
+            "turn-router-drop",
+            "session-router-drop",
+            CommandEvePromptAdmissionPhase::Commit,
+        );
+        let commit_response = dispatch_prompt(&router, &commit);
+        let claim = ticket.wait().await.unwrap();
+        let finalize_ticket = claim.accept().unwrap();
+        assert!(accepted_prompt_response(commit_response.await.unwrap().unwrap()));
+        let finalize = admission_wire(
+            "turn-router-drop",
+            "session-router-drop",
+            CommandEvePromptAdmissionPhase::Finalize,
+        );
+        let finalize_response = dispatch_prompt(&router, &finalize);
+        let finalize_claim = finalize_ticket.wait().await.unwrap();
+        let peer_ack_ticket = finalize_claim.accept().unwrap();
+        assert!(accepted_prompt_response(finalize_response.await.unwrap().unwrap()));
+
+        router.cancel_all("protocol_dropped");
+        let error = match peer_ack_ticket.wait().await {
+            Err(error) => error,
+            Ok(_) => panic!("connection drop must reject the pending peer acknowledgement"),
+        };
+        assert!(error.to_string().contains("PEER_ACK_UNAVAILABLE"));
+        assert!(command_eve_prompt_admission_for_turn("turn-router-drop").is_none());
     }
 
     #[tokio::test]

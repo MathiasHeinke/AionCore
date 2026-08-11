@@ -43,8 +43,8 @@ use aionui_db::{
     AgentBindingResolution, ConversationExtraPatch, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams,
     IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
-    MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
-    resolve_agent_binding_from_rows,
+    MessagePageDirection, MessagePageParams, MessageRowUpdate, SaveRuntimeStateParams,
+    UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -2914,34 +2914,44 @@ impl ConversationService {
             });
 
             let admission_claim = admission_ticket.wait().await?;
-            let mut user_message_content = serde_json::json!({ "content": user_content });
-            user_message_content["attachment_grounding_receipt"] =
-                serde_json::to_value(&accepted_receipt).map_err(|error| {
+            let mut accepted_user_message_content = serde_json::json!({ "content": user_content.clone() });
+            accepted_user_message_content["attachment_grounding_receipt"] = serde_json::to_value(&accepted_receipt)
+                .map_err(|error| {
                     ConversationError::internal(format!("Attachment receipt serialization failed: {error}"))
                 })?;
-            let user_msg = aionui_db::models::MessageRow {
+            let provisional_user_message_content = serde_json::json!({
+                "content": user_content.clone(),
+                "command_eve_prompt_admission": {
+                    "version": "command-eve-prompt-admission/v1",
+                    "state": "provisional",
+                    "turn_id": turn_id.clone(),
+                    "receipt_sha256": receipt_sha256.clone(),
+                }
+            });
+            let provisional_user_msg = aionui_db::models::MessageRow {
                 id: user_msg_id.clone(),
                 conversation_id: conversation_id.to_owned(),
                 msg_id: Some(user_msg_id.clone()),
                 r#type: "text".into(),
-                content: user_message_content.to_string(),
+                content: provisional_user_message_content.to_string(),
                 position: Some("right".into()),
-                status: Some("finish".into()),
-                hidden: user_hidden,
+                status: Some("pending".into()),
+                hidden: true,
                 created_at,
             };
             // Release phase=commit, then wait for Hermes to consume that
-            // response and issue phase=finalize. Only that peer-originated
-            // acknowledgement permits the final accepted receipt to be stored.
-            // Hermes remains blocked before the provider until finalize accepts.
+            // response and issue phase=finalize. Finalize permits only a hidden
+            // provisional row. Hermes must consume the finalize response and
+            // issue phase=ack before this row is atomically promoted. Hermes
+            // remains blocked before the provider until that promotion accepts.
             let finalize_ticket = admission_claim.accept()?;
             let finalize_claim = finalize_ticket.wait().await?;
-            if let Err(error) = self.conversation_repo.insert_message(&user_msg).await {
+            if let Err(error) = self.conversation_repo.insert_message(&provisional_user_msg).await {
                 finalize_claim.reject("ATTACHMENT_PROMPT_ADMISSION_PERSISTENCE_FAILED");
                 warn!(msg_id = %user_msg_id, error = %ErrorChain(&error), "Grounded user message persistence rejected ACP admission");
                 return Err(error.into());
             }
-            let delivery_ticket = match finalize_claim.accept() {
+            let peer_ack_ticket = match finalize_claim.accept() {
                 Ok(ticket) => ticket,
                 Err(error) => {
                     self.conversation_repo
@@ -2955,7 +2965,27 @@ impl ConversationService {
                     return Err(error.into());
                 }
             };
-            if let Err(error) = delivery_ticket.wait().await {
+            let peer_ack_claim = match peer_ack_ticket.wait().await {
+                Ok(claim) => claim,
+                Err(error) => {
+                    self.conversation_repo
+                        .delete_message(conversation_id, &user_msg_id)
+                        .await
+                        .map_err(|rollback_error| {
+                            ConversationError::internal(format!(
+                                "ATTACHMENT_PROMPT_FINALIZE_ROLLBACK_FAILED: {rollback_error}"
+                            ))
+                        })?;
+                    return Err(error.into());
+                }
+            };
+            let promotion = MessageRowUpdate {
+                content: Some(accepted_user_message_content.to_string()),
+                status: Some(Some("finish".to_owned())),
+                hidden: Some(user_hidden),
+            };
+            if let Err(error) = self.conversation_repo.update_message(&user_msg_id, &promotion).await {
+                peer_ack_claim.reject("ATTACHMENT_PROMPT_ADMISSION_PROMOTION_FAILED");
                 self.conversation_repo
                     .delete_message(conversation_id, &user_msg_id)
                     .await
@@ -2964,6 +2994,30 @@ impl ConversationService {
                             "ATTACHMENT_PROMPT_FINALIZE_ROLLBACK_FAILED: {rollback_error}"
                         ))
                     })?;
+                return Err(error.into());
+            }
+            if let Err(error) = peer_ack_claim.accept() {
+                if let Err(delete_error) = self
+                    .conversation_repo
+                    .delete_message(conversation_id, &user_msg_id)
+                    .await
+                {
+                    self.conversation_repo
+                        .update_message(
+                            &user_msg_id,
+                            &MessageRowUpdate {
+                                content: Some(provisional_user_message_content.to_string()),
+                                status: Some(Some("pending".to_owned())),
+                                hidden: Some(true),
+                            },
+                        )
+                        .await
+                        .map_err(|demotion_error| {
+                            ConversationError::internal(format!(
+                                "ATTACHMENT_PROMPT_FINALIZE_ROLLBACK_FAILED: delete={delete_error}; demote={demotion_error}"
+                            ))
+                        })?;
+                }
                 return Err(error.into());
             }
 
