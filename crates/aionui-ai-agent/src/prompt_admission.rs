@@ -88,7 +88,14 @@ pub struct CommandEvePromptAdmissionFinalizeTicket {
 }
 
 pub struct CommandEvePromptAdmissionFinalizeClaim {
+    turn_id: String,
     decision_tx: Option<oneshot::Sender<CommandEvePromptAdmissionDecision>>,
+    delivery_rx: oneshot::Receiver<Result<(), String>>,
+}
+
+pub struct CommandEvePromptAdmissionDeliveryTicket {
+    turn_id: String,
+    delivery_rx: oneshot::Receiver<Result<(), String>>,
 }
 
 impl CommandEvePromptAdmissionClaim {
@@ -129,8 +136,12 @@ impl CommandEvePromptAdmissionFinalizeTicket {
 }
 
 impl CommandEvePromptAdmissionFinalizeClaim {
-    pub fn accept(mut self) -> Result<(), AgentError> {
-        self.send(CommandEvePromptAdmissionDecision::Accepted)
+    pub fn accept(mut self) -> Result<CommandEvePromptAdmissionDeliveryTicket, AgentError> {
+        self.send(CommandEvePromptAdmissionDecision::Accepted)?;
+        Ok(CommandEvePromptAdmissionDeliveryTicket {
+            turn_id: self.turn_id,
+            delivery_rx: self.delivery_rx,
+        })
     }
 
     pub fn reject(mut self, _code: &'static str) {
@@ -143,6 +154,23 @@ impl CommandEvePromptAdmissionFinalizeClaim {
             .ok_or_else(|| AgentError::conflict("ATTACHMENT_PROMPT_FINALIZE_ALREADY_DECIDED"))?
             .send(decision)
             .map_err(|_| AgentError::bad_gateway("ATTACHMENT_PROMPT_FINALIZE_TRANSPORT_CLOSED"))
+    }
+}
+
+impl CommandEvePromptAdmissionDeliveryTicket {
+    pub async fn wait(self) -> Result<(), AgentError> {
+        let outcome = tokio::time::timeout(PROMPT_ADMISSION_FINALIZE_TIMEOUT, self.delivery_rx).await;
+        match outcome {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(code))) => Err(AgentError::bad_gateway(code)),
+            Ok(Err(_)) => Err(AgentError::bad_gateway(
+                "ATTACHMENT_PROMPT_FINALIZE_DELIVERY_CHANNEL_CLOSED",
+            )),
+            Err(_) => {
+                reject_command_eve_prompt_admission(&self.turn_id, "ATTACHMENT_PROMPT_FINALIZE_DELIVERY_TIMEOUT");
+                Err(AgentError::timeout("ATTACHMENT_PROMPT_FINALIZE_DELIVERY_TIMEOUT"))
+            }
+        }
     }
 }
 
@@ -176,7 +204,10 @@ pub enum CommandEvePromptAdmissionClaimResult {
 
 #[doc(hidden)]
 pub enum CommandEvePromptAdmissionFinalizeClaimResult {
-    AwaitingDecision(oneshot::Receiver<CommandEvePromptAdmissionDecision>),
+    AwaitingDecision {
+        decision_rx: oneshot::Receiver<CommandEvePromptAdmissionDecision>,
+        delivery_tx: oneshot::Sender<Result<(), String>>,
+    },
     AlreadyAccepted,
 }
 
@@ -584,8 +615,11 @@ pub fn finalize_command_eve_prompt_admission(
                 return Err("request_mismatch");
             }
             let (decision_tx, decision_rx) = oneshot::channel();
+            let (delivery_tx, delivery_rx) = oneshot::channel();
             let claim = CommandEvePromptAdmissionFinalizeClaim {
                 decision_tx: Some(decision_tx),
+                delivery_rx,
+                turn_id: request.turn_id.clone(),
             };
             if finalize_tx.send(Ok(claim)).is_err() {
                 state.request_by_turn.remove(&request.turn_id);
@@ -598,9 +632,10 @@ pub fn finalize_command_eve_prompt_admission(
                     session_id: session_id.to_owned(),
                 },
             );
-            Ok(CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision(
+            Ok(CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision {
                 decision_rx,
-            ))
+                delivery_tx,
+            })
         }
         AdmissionEntry::Accepted {
             request: expected,
@@ -822,19 +857,25 @@ mod tests {
             CommandEvePromptAdmissionDecision::Accepted
         ));
         complete_command_eve_prompt_admission_commit(&request.request_id, "session-1", true);
-        let finalize_decision = match finalize_command_eve_prompt_admission(&request, "session-1").unwrap() {
-            CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision(decision) => decision,
-            CommandEvePromptAdmissionFinalizeClaimResult::AlreadyAccepted => {
-                panic!("first finalize cannot be accepted")
-            }
-        };
+        let (finalize_decision, delivery_tx) =
+            match finalize_command_eve_prompt_admission(&request, "session-1").unwrap() {
+                CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision {
+                    decision_rx,
+                    delivery_tx,
+                } => (decision_rx, delivery_tx),
+                CommandEvePromptAdmissionFinalizeClaimResult::AlreadyAccepted => {
+                    panic!("first finalize cannot be accepted")
+                }
+            };
         let finalize_claim = finalize_ticket.wait().await.unwrap();
-        finalize_claim.accept().unwrap();
+        let delivery_ticket = finalize_claim.accept().unwrap();
         assert!(matches!(
             finalize_decision.await.unwrap(),
             CommandEvePromptAdmissionDecision::Accepted
         ));
         complete_command_eve_prompt_admission(&request.request_id, "session-1", true);
+        delivery_tx.send(Ok(())).unwrap();
+        delivery_ticket.wait().await.unwrap();
         assert!(matches!(
             claim_command_eve_prompt_admission(&request, "session-1").unwrap(),
             CommandEvePromptAdmissionClaimResult::AlreadyAccepted

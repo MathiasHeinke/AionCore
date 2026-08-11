@@ -785,6 +785,16 @@ impl IConversationRepository for MockRepo {
         Ok(())
     }
 
+    async fn delete_message(&self, conv_id: &str, message_id: &str) -> Result<(), aionui_db::DbError> {
+        let mut messages = self.messages.lock().unwrap();
+        let before = messages.len();
+        messages.retain(|message| !(message.conversation_id == conv_id && message.id == message_id));
+        if messages.len() == before {
+            return Err(aionui_db::DbError::NotFound(format!("Message {message_id}")));
+        }
+        Ok(())
+    }
+
     async fn delete_messages_by_conversation(&self, conv_id: &str) -> Result<(), aionui_db::DbError> {
         self.messages
             .lock()
@@ -3269,6 +3279,7 @@ struct MockAgent {
     steer_release: Arc<Notify>,
     admission_started: Option<Arc<Notify>>,
     admission_release: Option<Arc<Notify>>,
+    finalize_delivery_succeeds: bool,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
     allow_direct_confirm: bool,
@@ -3315,6 +3326,7 @@ impl MockAgent {
             steer_release: Arc::new(Notify::new()),
             admission_started: None,
             admission_release: None,
+            finalize_delivery_succeeds: true,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -3341,6 +3353,7 @@ impl MockAgent {
             steer_release: Arc::new(Notify::new()),
             admission_started: None,
             admission_release: None,
+            finalize_delivery_succeeds: true,
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -3367,6 +3380,7 @@ impl MockAgent {
             steer_release: Arc::new(Notify::new()),
             admission_started: None,
             admission_release: None,
+            finalize_delivery_succeeds: true,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: true,
@@ -3406,6 +3420,11 @@ impl MockAgent {
     fn with_blocking_admission(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
         self.admission_started = Some(started);
         self.admission_release = Some(release);
+        self
+    }
+
+    fn with_finalize_delivery_failure(mut self) -> Self {
+        self.finalize_delivery_succeeds = false;
         self
     }
 }
@@ -3450,18 +3469,28 @@ impl IAgentTask for MockAgent {
                         match finalize_command_eve_prompt_admission(&request, "mock-session")
                             .expect("mock Hermes consumed the commit response")
                         {
-                            CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision(decision) => {
-                                match decision.await {
-                                    Ok(CommandEvePromptAdmissionDecision::Accepted) => {
+                            CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision {
+                                decision_rx,
+                                delivery_tx,
+                            } => match decision_rx.await {
+                                Ok(CommandEvePromptAdmissionDecision::Accepted) => {
+                                    if self.finalize_delivery_succeeds {
                                         complete_command_eve_prompt_admission(&request_id, "mock-session", true);
-                                    }
-                                    Ok(CommandEvePromptAdmissionDecision::Rejected) | Err(_) => {
-                                        return Err(AgentSendError::from_agent_error(AgentError::bad_gateway(
-                                            "ATTACHMENT_PROMPT_FINALIZE_REJECTED",
-                                        )));
+                                        let _ = delivery_tx.send(Ok(()));
+                                    } else {
+                                        complete_command_eve_prompt_admission(&request_id, "mock-session", false);
+                                        let _ = delivery_tx
+                                            .send(Err("ATTACHMENT_PROMPT_FINALIZE_DELIVERY_REJECTED".to_owned()));
                                     }
                                 }
-                            }
+                                Ok(CommandEvePromptAdmissionDecision::Rejected) | Err(_) => {
+                                    let _ = delivery_tx
+                                        .send(Err("ATTACHMENT_PROMPT_FINALIZE_DELIVERY_REJECTED".to_owned()));
+                                    return Err(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                                        "ATTACHMENT_PROMPT_FINALIZE_REJECTED",
+                                    )));
+                                }
+                            },
                             CommandEvePromptAdmissionFinalizeClaimResult::AlreadyAccepted => {}
                         }
                     }
@@ -4472,6 +4501,57 @@ async fn attachment_grounding_is_verified_before_persistence_and_receipted_on_su
         .collect::<Vec<_>>();
     assert_eq!(user_messages.len(), 1);
     assert!(user_messages[0].content.contains("attachment_grounding_receipt"));
+}
+
+#[tokio::test]
+async fn finalize_delivery_failure_hides_grounded_row_and_allows_retry() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr_impl = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr_impl.clone();
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("hermes"))
+        .await
+        .unwrap();
+    broadcaster.take_events();
+    let (directory, request) = grounded_pdf_request();
+    let workspace = directory.path().to_string_lossy().into_owned();
+
+    let mut failing_agent = MockAgent::new(&conv.id).with_finalize_delivery_failure();
+    failing_agent.workspace_override = Some(workspace.clone());
+    task_mgr_impl.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(failing_agent)));
+    let error = svc
+        .send_message("user_1", &conv.id, request.clone(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::BadGateway { .. }));
+    wait_for_turn_released(&svc, &conv.id).await;
+    assert!(
+        repo_messages_asc(&repo, &conv.id, 10)
+            .await
+            .iter()
+            .all(|message| message.position.as_deref() != Some("right")),
+        "a failed finalize response must remove the provisional user row"
+    );
+    assert!(
+        broadcaster
+            .take_events()
+            .iter()
+            .all(|event| event.name != "message.userCreated")
+    );
+
+    let mut retry_agent = MockAgent::new(&conv.id);
+    retry_agent.workspace_override = Some(workspace);
+    task_mgr_impl.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(retry_agent)));
+    let retry = svc.send_message("user_1", &conv.id, request, &task_mgr).await.unwrap();
+    assert!(retry.attachment_grounding_receipt.is_some());
+    wait_for_turn_released(&svc, &conv.id).await;
+    let rows = repo_messages_asc(&repo, &conv.id, 10).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|message| message.position.as_deref() == Some("right") && !message.hidden)
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

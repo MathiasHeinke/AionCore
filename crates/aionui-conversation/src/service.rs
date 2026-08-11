@@ -2941,7 +2941,31 @@ impl ConversationService {
                 warn!(msg_id = %user_msg_id, error = %ErrorChain(&error), "Grounded user message persistence rejected ACP admission");
                 return Err(error.into());
             }
-            finalize_claim.accept()?;
+            let delivery_ticket = match finalize_claim.accept() {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.conversation_repo
+                        .delete_message(conversation_id, &user_msg_id)
+                        .await
+                        .map_err(|rollback_error| {
+                            ConversationError::internal(format!(
+                                "ATTACHMENT_PROMPT_FINALIZE_ROLLBACK_FAILED: {rollback_error}"
+                            ))
+                        })?;
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = delivery_ticket.wait().await {
+                self.conversation_repo
+                    .delete_message(conversation_id, &user_msg_id)
+                    .await
+                    .map_err(|rollback_error| {
+                        ConversationError::internal(format!(
+                            "ATTACHMENT_PROMPT_FINALIZE_ROLLBACK_FAILED: {rollback_error}"
+                        ))
+                    })?;
+                return Err(error.into());
+            }
 
             self.broadcaster.broadcast(WebSocketMessage::new(
                 "message.userCreated",

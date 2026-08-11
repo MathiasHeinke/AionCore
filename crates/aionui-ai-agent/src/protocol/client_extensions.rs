@@ -312,13 +312,22 @@ impl AcpClientExtensionRouter {
                     Ok(CommandEvePromptAdmissionFinalizeClaimResult::AlreadyAccepted) => {
                         respond_prompt_admission(respond, &wire.request_id, true);
                     }
-                    Ok(CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision(decision_rx)) => {
+                    Ok(CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision {
+                        decision_rx,
+                        delivery_tx,
+                    }) => {
                         let request_id = wire.request_id;
                         let session_id = wire.session_id;
                         tokio::spawn(async move {
                             let accepted = matches!(decision_rx.await, Ok(CommandEvePromptAdmissionDecision::Accepted));
                             let transport_ok = respond_prompt_admission(respond, &request_id, accepted);
-                            complete_command_eve_prompt_admission(&request_id, &session_id, accepted && transport_ok);
+                            let delivered = accepted && transport_ok;
+                            complete_command_eve_prompt_admission(&request_id, &session_id, delivered);
+                            let _ = delivery_tx.send(if delivered {
+                                Ok(())
+                            } else {
+                                Err("ATTACHMENT_PROMPT_FINALIZE_DELIVERY_REJECTED".to_owned())
+                            });
                         });
                     }
                     Err(_) => {
@@ -846,8 +855,9 @@ mod tests {
         );
         let finalize_response = dispatch_prompt(&router, &finalize);
         let finalize_claim = finalize_ticket.wait().await.unwrap();
-        finalize_claim.accept().unwrap();
+        let delivery_ticket = finalize_claim.accept().unwrap();
         assert!(accepted_prompt_response(finalize_response.await.unwrap().unwrap()));
+        delivery_ticket.wait().await.unwrap();
         forget_command_eve_prompt_admission("turn-router-race");
     }
 
@@ -913,8 +923,8 @@ mod tests {
         );
         failing_prompt_delivery(&router, &finalize);
         let claim = finalize_ticket.wait().await.unwrap();
-        claim.accept().unwrap();
-        tokio::task::yield_now().await;
+        let delivery_ticket = claim.accept().unwrap();
+        assert!(delivery_ticket.wait().await.is_err());
         assert!(command_eve_prompt_admission_for_turn("turn-router-finalize-fail").is_none());
     }
 

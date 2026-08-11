@@ -1119,6 +1119,28 @@ async fn delete_messages_by_conversation_clears_all() {
 }
 
 #[tokio::test]
+async fn delete_message_removes_only_the_exact_conversation_row() {
+    let (repo, _db) = setup().await;
+    let first = make_conversation("msg-delete-one-a");
+    let second = make_conversation("msg-delete-one-b");
+    repo.create(&first).await.unwrap();
+    repo.create(&second).await.unwrap();
+    let removed = make_message(&first.id, "remove me");
+    let retained = make_message(&second.id, "keep me");
+    repo.insert_message(&removed).await.unwrap();
+    repo.insert_message(&retained).await.unwrap();
+
+    repo.delete_message(&first.id, &removed.id).await.unwrap();
+
+    assert!(repo.get_message(&first.id, &removed.id).await.unwrap().is_none());
+    assert!(repo.get_message(&second.id, &retained.id).await.unwrap().is_some());
+    assert!(matches!(
+        repo.delete_message(&first.id, &removed.id).await.unwrap_err(),
+        aionui_db::DbError::NotFound(_)
+    ));
+}
+
+#[tokio::test]
 async fn get_message_by_msg_id_triple() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("msg-find");

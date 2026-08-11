@@ -854,6 +854,21 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn delete_message(&self, conv_id: &str, message_id: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM messages WHERE conversation_id = ? AND id = ?")
+            .bind(conv_id)
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!(
+                "Message '{message_id}' not found in conversation '{conv_id}'"
+            )));
+        }
+        Ok(())
+    }
+
     async fn delete_messages_by_conversation(&self, conv_id: &str) -> Result<(), DbError> {
         sqlx::query("DELETE FROM messages WHERE conversation_id = ?")
             .bind(conv_id)
