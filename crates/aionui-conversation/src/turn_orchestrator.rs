@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData, VerifiedAttachmentGrounding};
-use aionui_ai_agent::{AgentSendError, AgentSessionKind, IWorkerTaskManager};
+use aionui_ai_agent::{
+    AgentSendError, AgentSessionKind, IWorkerTaskManager, forget_command_eve_prompt_admission,
+    reject_command_eve_prompt_admission,
+};
 use aionui_common::{AgentType, ConversationStatus, ErrorChain, now_ms};
 use aionui_db::models::ConversationRow;
 use tokio::sync::oneshot;
@@ -105,6 +108,7 @@ impl ConversationTurnOrchestrator {
         {
             Ok(agent) => agent,
             Err(err) => {
+                reject_command_eve_prompt_admission(&input.turn_id, "ATTACHMENT_PROMPT_ADMISSION_AGENT_BUILD_FAILED");
                 let top_level_code = agent_error_top_level_code(&err);
                 let send_error = redact_project_send_error(
                     AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref()),
@@ -170,6 +174,7 @@ impl ConversationTurnOrchestrator {
             .maybe_persist_workspace(&input.conv_id, &input.stored_workspace, agent.workspace())
             .await
         {
+            reject_command_eve_prompt_admission(&input.turn_id, "ATTACHMENT_PROMPT_ADMISSION_WORKSPACE_PERSIST_FAILED");
             let top_level_code = err.error_code();
             let send_error = AgentSendError::from_agent_error(err.to_agent_error());
             error!(
@@ -242,6 +247,10 @@ impl ConversationTurnOrchestrator {
 
             tokio::spawn(async move {
                 if let Err(e) = send_agent.send_message(current_send).await {
+                    reject_command_eve_prompt_admission(
+                        &turn_id_for_send,
+                        "ATTACHMENT_PROMPT_ADMISSION_AGENT_SEND_FAILED",
+                    );
                     let e = redact_project_send_error(e, send_project_runtime_workspace_path.as_deref());
                     let failure_message = availability_failure_message(&e);
                     record_agent_session_failure(
@@ -470,6 +479,7 @@ impl ConversationTurnOrchestrator {
         self.service
             .complete_released_turn(&conv_id, &turn_id, was_deleting)
             .await;
+        forget_command_eve_prompt_admission(&turn_id);
 
         ConversationTurnResult {
             status: if final_failed {

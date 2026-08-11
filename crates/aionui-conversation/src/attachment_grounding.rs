@@ -15,6 +15,9 @@ const MAX_TOTAL_GROUNDING_BYTES: u64 = 512 * 1024;
 const MAX_GROUNDING_ENTRIES: usize = 12;
 const MAX_PDF_SOURCE_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_IMAGE_SOURCE_BYTES: u64 = 20 * 1024 * 1024;
+const VISUAL_SOURCE_EXTENSIONS: &[&str] = &[
+    "pdf", "png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "ico", "tif", "tiff", "avif",
+];
 
 #[derive(Debug)]
 pub(crate) struct VerifiedAttachmentGroundingSet {
@@ -37,17 +40,37 @@ fn extension_matches(kind: AttachmentGroundingKind, path: &Path) -> bool {
     let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
     match kind {
         AttachmentGroundingKind::Pdf => extension.eq_ignore_ascii_case("pdf"),
-        AttachmentGroundingKind::Image => ["png", "jpg", "jpeg", "webp", "gif"]
+        AttachmentGroundingKind::Image => VISUAL_SOURCE_EXTENSIONS
             .iter()
+            .filter(|candidate| **candidate != "pdf")
             .any(|candidate| extension.eq_ignore_ascii_case(candidate)),
     }
 }
 
 fn is_visual_source_path(path: &Path) -> bool {
     let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
-    ["pdf", "png", "jpg", "jpeg", "webp", "gif", "bmp", "svg"]
+    VISUAL_SOURCE_EXTENSIONS
         .iter()
         .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+pub(crate) fn attachment_grounding_receipt_sha256(
+    verified: &VerifiedAttachmentGroundingSet,
+) -> Result<String, ConversationError> {
+    let bytes = serde_json::to_vec(&verified.receipt)
+        .map_err(|error| ConversationError::internal(format!("Attachment receipt serialization failed: {error}")))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub(crate) fn accepted_attachment_grounding_receipt(
+    verified: &VerifiedAttachmentGroundingSet,
+) -> AttachmentGroundingReceipt {
+    let mut receipt = verified.receipt.clone();
+    receipt.status = "accepted".into();
+    for entry in &mut receipt.entries {
+        entry.grounding_embedded = true;
+    }
+    receipt
 }
 
 fn max_source_bytes(kind: AttachmentGroundingKind) -> u64 {
@@ -97,15 +120,8 @@ pub(crate) async fn verify_attachment_grounding(
     request: Option<&AttachmentGroundingRequest>,
     files: &[String],
 ) -> Result<Option<VerifiedAttachmentGroundingSet>, ConversationError> {
-    let carries_prepared_visual_pair = files.windows(2).any(|pair| {
-        is_visual_source_path(Path::new(&pair[0]))
-            && Path::new(&pair[1])
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.eq_ignore_ascii_case("md"))
-    });
     let Some(request) = request else {
-        if carries_prepared_visual_pair {
+        if files.iter().any(|file| is_visual_source_path(Path::new(file))) {
             return Err(grounding_bad_request("ATTACHMENT_GROUNDING_REQUIRED"));
         }
         return Ok(None);
@@ -177,7 +193,7 @@ pub(crate) async fn verify_attachment_grounding(
             grounding_path: expectation.grounding_path.clone(),
             grounding_sha256: expectation.grounding_sha256.clone(),
             grounding_bytes: expectation.grounding_bytes,
-            grounding_embedded: true,
+            grounding_embedded: false,
         });
         agent_grounding.push(VerifiedAttachmentGrounding {
             source_path: expectation.source_path.clone(),
@@ -197,7 +213,7 @@ pub(crate) async fn verify_attachment_grounding(
     Ok(Some(VerifiedAttachmentGroundingSet {
         receipt: AttachmentGroundingReceipt {
             version: ATTACHMENT_GROUNDING_RECEIPT_VERSION.into(),
-            status: "verified".into(),
+            status: "verified_pending_admission".into(),
             entries: receipt_entries,
         },
         agent_grounding,
@@ -212,7 +228,10 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use super::{MAX_GROUNDING_BYTES, verify_attachment_grounding};
+    use super::{
+        MAX_GROUNDING_BYTES, accepted_attachment_grounding_receipt, attachment_grounding_receipt_sha256,
+        verify_attachment_grounding,
+    };
 
     fn hash(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
@@ -246,8 +265,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(verified.receipt.status, "verified");
-        assert!(verified.receipt.entries[0].grounding_embedded);
+        assert_eq!(verified.receipt.status, "verified_pending_admission");
+        assert!(!verified.receipt.entries[0].grounding_embedded);
+        assert_eq!(attachment_grounding_receipt_sha256(&verified).unwrap().len(), 64);
+        let accepted = accepted_attachment_grounding_receipt(&verified);
+        assert_eq!(accepted.status, "accepted");
+        assert!(accepted.entries[0].grounding_embedded);
         assert_eq!(
             verified.agent_grounding[0].grounding_text,
             String::from_utf8_lossy(sidecar_bytes)
@@ -343,16 +366,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_a_prepared_visual_pair_without_a_grounding_request() {
-        let error = verify_attachment_grounding(
-            None,
-            &[
-                "/tmp/report.pdf".into(),
-                "/tmp/document-intelligence/document.md".into(),
-            ],
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("ATTACHMENT_GROUNDING_REQUIRED"));
+    async fn rejects_every_raw_visual_without_a_grounding_request() {
+        for extension in ["pdf", "png", "gif", "bmp", "svg", "ico", "tif", "tiff", "avif"] {
+            let error = verify_attachment_grounding(None, &[format!("/tmp/raw.{extension}")])
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ATTACHMENT_GROUNDING_REQUIRED"));
+        }
     }
 }

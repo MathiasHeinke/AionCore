@@ -21,6 +21,14 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::error::AgentError;
+use crate::prompt_admission::{
+    COMMAND_EVE_PROMPT_ADMISSION_EXT_METHOD, COMMAND_EVE_PROMPT_ADMISSION_VERSION,
+    CommandEvePromptAdmissionClaimResult, CommandEvePromptAdmissionDecision,
+    CommandEvePromptAdmissionFinalizeClaimResult, CommandEvePromptAdmissionPhase, CommandEvePromptAdmissionResponse,
+    CommandEvePromptAdmissionStatus, CommandEvePromptAdmissionWireRequest, admit_command_eve_prompt_admission,
+    claim_command_eve_prompt_admission, complete_command_eve_prompt_admission,
+    complete_command_eve_prompt_admission_commit, finalize_command_eve_prompt_admission,
+};
 use crate::protocol::error::AcpError;
 use crate::protocol::events::AgentStreamEvent;
 
@@ -41,6 +49,7 @@ const MAX_URL_BYTES: usize = 4 * 1024;
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_NOTE_BYTES: usize = 2 * 1024;
 const MAX_PATH_BYTES: usize = 4 * 1024;
+const MAX_PROMPT_ADMISSION_PAYLOAD_BYTES: usize = 2 * 1024;
 
 type ResponseSender =
     Box<dyn FnOnce(Result<serde_json::Value, JsonRpcError>) -> Result<(), JsonRpcError> + Send + 'static>;
@@ -234,7 +243,90 @@ impl AcpClientExtensionRouter {
     }
 
     fn handle_ext_request(&self, request: ExtRequest, respond: ResponseSender) {
+        if request.method.as_ref() == COMMAND_EVE_PROMPT_ADMISSION_EXT_METHOD {
+            self.handle_prompt_admission_request(request.params.get(), respond);
+            return;
+        }
         self.handle_raw_request(request.method.as_ref(), request.params.get(), respond);
+    }
+
+    fn handle_prompt_admission_request(&self, raw_params: &str, respond: ResponseSender) {
+        if raw_params.len() > MAX_PROMPT_ADMISSION_PAYLOAD_BYTES {
+            respond_ignoring_transport(respond, Err(rpc_internal("payload_too_large")));
+            return;
+        }
+        let wire = match serde_json::from_str::<CommandEvePromptAdmissionWireRequest>(raw_params) {
+            Ok(wire) => wire,
+            Err(_) => {
+                respond_ignoring_transport(respond, Err(rpc_internal("invalid_shape")));
+                return;
+            }
+        };
+        let bound_session_matches = self
+            .state
+            .lock()
+            .is_ok_and(|state| state.bound_session_id.as_deref() == Some(wire.session_id.as_str()));
+        if !bound_session_matches {
+            respond_prompt_admission(respond, &wire.request_id, false);
+            return;
+        }
+
+        let request = wire.request();
+        match wire.phase {
+            CommandEvePromptAdmissionPhase::Accept => {
+                let accepted = admit_command_eve_prompt_admission(&request, &wire.session_id).is_ok();
+                let transport_ok = respond_prompt_admission(respond, &wire.request_id, accepted);
+                if !accepted || !transport_ok {
+                    complete_command_eve_prompt_admission(&wire.request_id, &wire.session_id, false);
+                }
+            }
+            CommandEvePromptAdmissionPhase::Commit => {
+                match claim_command_eve_prompt_admission(&request, &wire.session_id) {
+                    Ok(CommandEvePromptAdmissionClaimResult::AlreadyAccepted) => {
+                        respond_prompt_admission(respond, &wire.request_id, true);
+                    }
+                    Ok(CommandEvePromptAdmissionClaimResult::AwaitingDecision(decision_rx)) => {
+                        let request_id = wire.request_id;
+                        let session_id = wire.session_id;
+                        tokio::spawn(async move {
+                            let accepted = matches!(decision_rx.await, Ok(CommandEvePromptAdmissionDecision::Accepted));
+                            if accepted {
+                                // Publish the committed state before enqueueing
+                                // the response so an immediate peer finalize
+                                // cannot race the local state transition.
+                                complete_command_eve_prompt_admission_commit(&request_id, &session_id, true);
+                            }
+                            let transport_ok = respond_prompt_admission(respond, &request_id, accepted);
+                            if !accepted || !transport_ok {
+                                complete_command_eve_prompt_admission_commit(&request_id, &session_id, false);
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        respond_prompt_admission(respond, &wire.request_id, false);
+                    }
+                }
+            }
+            CommandEvePromptAdmissionPhase::Finalize => {
+                match finalize_command_eve_prompt_admission(&request, &wire.session_id) {
+                    Ok(CommandEvePromptAdmissionFinalizeClaimResult::AlreadyAccepted) => {
+                        respond_prompt_admission(respond, &wire.request_id, true);
+                    }
+                    Ok(CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision(decision_rx)) => {
+                        let request_id = wire.request_id;
+                        let session_id = wire.session_id;
+                        tokio::spawn(async move {
+                            let accepted = matches!(decision_rx.await, Ok(CommandEvePromptAdmissionDecision::Accepted));
+                            let transport_ok = respond_prompt_admission(respond, &request_id, accepted);
+                            complete_command_eve_prompt_admission(&request_id, &session_id, accepted && transport_ok);
+                        });
+                    }
+                    Err(_) => {
+                        respond_prompt_admission(respond, &wire.request_id, false);
+                    }
+                }
+            }
+        }
     }
 
     fn handle_raw_request(&self, method: &str, raw_params: &str, respond: ResponseSender) {
@@ -512,6 +604,28 @@ fn reject_request(respond: ResponseSender, reason: &'static str) {
         respond,
         Err(JsonRpcError::invalid_params().data(serde_json::json!({ "reason": reason }))),
     );
+}
+
+fn respond_prompt_admission(respond: ResponseSender, request_id: &str, accepted: bool) -> bool {
+    let response = CommandEvePromptAdmissionResponse {
+        version: COMMAND_EVE_PROMPT_ADMISSION_VERSION.to_owned(),
+        request_id: request_id.to_owned(),
+        status: if accepted {
+            CommandEvePromptAdmissionStatus::Accepted
+        } else {
+            CommandEvePromptAdmissionStatus::Rejected
+        },
+    };
+    let Ok(value) = serde_json::to_value(response) else {
+        respond_ignoring_transport(respond, Err(rpc_internal("response_encoding_failed")));
+        return false;
+    };
+    let delivered = respond(Ok(value)).is_ok();
+    info!(
+        method = COMMAND_EVE_PROMPT_ADMISSION_EXT_METHOD,
+        accepted, delivered, "ACP prompt admission decision delivered"
+    );
+    delivered
 }
 
 fn rpc_internal(reason: &'static str) -> JsonRpcError {

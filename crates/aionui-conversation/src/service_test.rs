@@ -7,6 +7,12 @@ use std::sync::{
 use std::time::Duration;
 
 use aionui_ai_agent::agent_task::{AgentInstance, ConfirmationPrincipalContext, IAgentTask, IMockAgent};
+use aionui_ai_agent::prompt_admission::{
+    CommandEvePromptAdmissionClaimResult, CommandEvePromptAdmissionDecision,
+    CommandEvePromptAdmissionFinalizeClaimResult, admit_command_eve_prompt_admission,
+    claim_command_eve_prompt_admission, command_eve_prompt_admission_for_turn, complete_command_eve_prompt_admission,
+    complete_command_eve_prompt_admission_commit, finalize_command_eve_prompt_admission,
+};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
@@ -3261,6 +3267,8 @@ struct MockAgent {
     block_steer: bool,
     steer_started: Arc<Notify>,
     steer_release: Arc<Notify>,
+    admission_started: Option<Arc<Notify>>,
+    admission_release: Option<Arc<Notify>>,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
     allow_direct_confirm: bool,
@@ -3305,6 +3313,8 @@ impl MockAgent {
             block_steer: false,
             steer_started: Arc::new(Notify::new()),
             steer_release: Arc::new(Notify::new()),
+            admission_started: None,
+            admission_release: None,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -3329,6 +3339,8 @@ impl MockAgent {
             block_steer: false,
             steer_started: Arc::new(Notify::new()),
             steer_release: Arc::new(Notify::new()),
+            admission_started: None,
+            admission_release: None,
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -3353,6 +3365,8 @@ impl MockAgent {
             block_steer: false,
             steer_started: Arc::new(Notify::new()),
             steer_release: Arc::new(Notify::new()),
+            admission_started: None,
+            admission_release: None,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: true,
@@ -3388,6 +3402,12 @@ impl MockAgent {
         self.block_steer = true;
         self
     }
+
+    fn with_blocking_admission(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.admission_started = Some(started);
+        self.admission_release = Some(release);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -3410,7 +3430,50 @@ impl IAgentTask for MockAgent {
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.event_tx.subscribe()
     }
-    async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+    async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        if !data.verified_attachment_grounding.is_empty() {
+            let turn_id = data.turn_id.as_deref().expect("grounded mock turn id");
+            let request = command_eve_prompt_admission_for_turn(turn_id).expect("registered grounded admission");
+            let request_id = request.request_id.clone();
+            admit_command_eve_prompt_admission(&request, "mock-session")
+                .expect("mock Hermes accepted the exact grounded prompt");
+            match claim_command_eve_prompt_admission(&request, "mock-session")
+                .expect("exact grounded admission request")
+            {
+                CommandEvePromptAdmissionClaimResult::AwaitingDecision(decision) => match decision.await {
+                    Ok(CommandEvePromptAdmissionDecision::Accepted) => {
+                        complete_command_eve_prompt_admission_commit(&request_id, "mock-session", true);
+                        if let (Some(started), Some(release)) = (&self.admission_started, &self.admission_release) {
+                            started.notify_one();
+                            release.notified().await;
+                        }
+                        match finalize_command_eve_prompt_admission(&request, "mock-session")
+                            .expect("mock Hermes consumed the commit response")
+                        {
+                            CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision(decision) => {
+                                match decision.await {
+                                    Ok(CommandEvePromptAdmissionDecision::Accepted) => {
+                                        complete_command_eve_prompt_admission(&request_id, "mock-session", true);
+                                    }
+                                    Ok(CommandEvePromptAdmissionDecision::Rejected) | Err(_) => {
+                                        return Err(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                                            "ATTACHMENT_PROMPT_FINALIZE_REJECTED",
+                                        )));
+                                    }
+                                }
+                            }
+                            CommandEvePromptAdmissionFinalizeClaimResult::AlreadyAccepted => {}
+                        }
+                    }
+                    Ok(CommandEvePromptAdmissionDecision::Rejected) | Err(_) => {
+                        return Err(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                            "ATTACHMENT_PROMPT_ADMISSION_REJECTED",
+                        )));
+                    }
+                },
+                CommandEvePromptAdmissionClaimResult::AlreadyAccepted => {}
+            }
+        }
         // Emit finish event so the relay task completes
         let _ = self.event_tx.send(AgentStreamEvent::Finish(
             aionui_ai_agent::protocol::events::FinishEventData::default(),
@@ -4211,8 +4274,12 @@ async fn send_message_returns_accepted() {
 #[tokio::test]
 async fn attachment_grounding_is_verified_before_persistence_and_receipted_on_success() {
     let (svc, broadcaster, repo, _task_mgr) = make_service();
-    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
-    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let task_mgr_impl = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr_impl.clone();
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("hermes"))
+        .await
+        .unwrap();
     broadcaster.take_events();
 
     let directory = tempfile::TempDir::new().unwrap();
@@ -4252,9 +4319,51 @@ async fn attachment_grounding_is_verified_before_persistence_and_receipted_on_su
     assert!(broadcaster.take_events().is_empty());
 
     request.attachment_grounding.as_mut().unwrap().entries[0].source_sha256 = source_sha256.clone();
-    let response = svc.send_message("user_1", &conv.id, request, &task_mgr).await.unwrap();
-    let receipt = response.attachment_grounding_receipt.expect("verified receipt");
-    assert_eq!(receipt.status, "verified");
+    let failing_task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(FailingBuildTaskManager::new("stubbed build failure"));
+    let build_error = svc
+        .send_message("user_1", &conv.id, request.clone(), &failing_task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(build_error, ConversationError::BadGateway { .. }));
+    wait_for_turn_released(&svc, &conv.id).await;
+    assert!(
+        repo_messages_asc(&repo, &conv.id, 10)
+            .await
+            .iter()
+            .all(|message| message.position.as_deref() != Some("right")),
+        "a pre-admission build failure must not persist the user attachment turn"
+    );
+    broadcaster.take_events();
+
+    let admission_started = Arc::new(Notify::new());
+    let admission_release = Arc::new(Notify::new());
+    task_mgr_impl.insert_agent(
+        &conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id).with_blocking_admission(
+            Arc::clone(&admission_started),
+            Arc::clone(&admission_release),
+        ))),
+    );
+    let send_service = svc.clone();
+    let send_conversation_id = conv.id.clone();
+    let send_task_mgr = Arc::clone(&task_mgr);
+    let send = tokio::spawn(async move {
+        send_service
+            .send_message("user_1", &send_conversation_id, request, &send_task_mgr)
+            .await
+    });
+    admission_started.notified().await;
+    assert!(
+        repo_messages_asc(&repo, &conv.id, 10)
+            .await
+            .iter()
+            .all(|message| message.position.as_deref() != Some("right")),
+        "the final user row must not exist before Hermes acknowledges commit with phase=finalize"
+    );
+    admission_release.notify_one();
+    let response = send.await.unwrap().unwrap();
+    let receipt = response.attachment_grounding_receipt.expect("accepted receipt");
+    assert_eq!(receipt.status, "accepted");
     assert_eq!(receipt.entries.len(), 1);
     assert_eq!(receipt.entries[0].source_sha256, source_sha256);
     assert_eq!(receipt.entries[0].grounding_sha256, grounding_sha256);
@@ -4262,8 +4371,12 @@ async fn attachment_grounding_is_verified_before_persistence_and_receipted_on_su
     wait_for_turn_released(&svc, &conv.id).await;
 
     let messages = repo_messages_asc(&repo, &conv.id, 10).await;
-    assert_eq!(messages.len(), 1);
-    assert!(messages[0].content.contains("attachment_grounding_receipt"));
+    let user_messages = messages
+        .iter()
+        .filter(|message| message.position.as_deref() == Some("right"))
+        .collect::<Vec<_>>();
+    assert_eq!(user_messages.len(), 1);
+    assert!(user_messages[0].content.contains("attachment_grounding_receipt"));
 }
 
 #[tokio::test]
@@ -4487,6 +4600,43 @@ async fn project_bound_run_agent_turn_rejects_before_any_runtime_or_persistence_
     assert!(matches!(
         error,
         ConversationError::BadRequest { reason } if reason == "PROJECT_RUNTIME_BINDING_REQUIRED"
+    ));
+    assert_eq!(callback_count.load(Ordering::SeqCst), 0);
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.active_count(), 0);
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(broadcaster.take_events().is_empty());
+}
+
+#[tokio::test]
+async fn run_agent_turn_rejects_raw_visuals_before_started_callback_or_runtime_claim() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_count_for_turn = Arc::clone(&callback_count);
+    broadcaster.take_events();
+
+    let error = svc
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "internal image turn".into(),
+            files: vec!["/tmp/raw.png".into()],
+            inject_skills: Vec::new(),
+            on_started: Some(Arc::new(move |_| {
+                let callback_count = Arc::clone(&callback_count_for_turn);
+                Box::pin(async move {
+                    callback_count.fetch_add(1, Ordering::SeqCst);
+                })
+            })),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConversationError::BadRequest { reason } if reason == "ATTACHMENT_GROUNDING_REQUIRED"
     ));
     assert_eq!(callback_count.load(Ordering::SeqCst), 0);
     assert!(!svc.runtime_state().is_claimed(&conv.id));

@@ -8,7 +8,10 @@ use aionui_ai_agent::project_runtime_fence::{
 };
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind, ProjectEnvironmentHint};
 use aionui_ai_agent::types::{BuildTaskOptions, ProjectRuntimeContext};
-use aionui_ai_agent::{AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{
+    AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
+    register_command_eve_prompt_admission,
+};
 use aionui_auth::{
     ProjectRuntimeAttestationPurpose, ProjectRuntimeAttestationVerifier, ProjectRuntimeVerificationExpectation,
     VerifiedProjectRuntimeAttestation,
@@ -51,7 +54,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::attachment_grounding::verify_attachment_grounding;
+use crate::attachment_grounding::{
+    accepted_attachment_grounding_receipt, attachment_grounding_receipt_sha256, verify_attachment_grounding,
+};
 use crate::convert::{
     TOOL_CONTENT_COMPACT_THRESHOLD_BYTES, row_to_artifact_response, row_to_message_response,
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item,
@@ -2800,16 +2805,10 @@ impl ConversationService {
         // remains a retryable HTTP failure with no transcript side effect.
         let verified_attachment_grounding =
             verify_attachment_grounding(req.attachment_grounding.as_ref(), &req.files).await?;
-        let attachment_grounding_receipt = verified_attachment_grounding
-            .as_ref()
-            .map(|verified| verified.receipt.clone());
-        let agent_attachment_grounding = verified_attachment_grounding
-            .map(|verified| verified.agent_grounding)
-            .unwrap_or_default();
 
         // Project conversations must validate the portable identity and the
         // request-only path before claiming a turn or persisting a message.
-        let project_build_opts = match (parse_project_binding_from_row(&row)?, req.runtime_workspace.as_ref()) {
+        let mut project_build_opts = match (parse_project_binding_from_row(&row)?, req.runtime_workspace.as_ref()) {
             (Some(binding), Some(runtime_workspace)) => {
                 let verified = self.verify_project_runtime_attestation(
                     project_attestation,
@@ -2838,6 +2837,117 @@ impl ConversationService {
             (None, None) => None,
         };
 
+        // A grounded turn is not accepted at the HTTP boundary until Hermes has
+        // entered its native run_conversation seam for this exact prompt. Build
+        // all fallible runtime inputs first, then use the one-shot ACP admission
+        // broker to keep the transcript and the model call on the same side of
+        // the persistence barrier.
+        if let Some(verified) = verified_attachment_grounding {
+            let build_opts = match project_build_opts.take() {
+                Some(options) => options,
+                None => self.build_task_options(&row).await?,
+            };
+            if build_options_backend(&build_opts) != Some("hermes") {
+                return Err(ConversationError::bad_request("ATTACHMENT_GROUNDING_HERMES_REQUIRED"));
+            }
+            self.ensure_workspace_skill_links(&row, &build_opts).await;
+            let stored_workspace = build_opts.context.workspace.stored_path.clone();
+            let receipt_sha256 = attachment_grounding_receipt_sha256(&verified)?;
+            let accepted_receipt = accepted_attachment_grounding_receipt(&verified);
+
+            let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
+            if !self
+                .runtime_persistence()
+                .allows(conversation_id, RuntimeWriteKind::UserMessage)
+            {
+                let mut turn_claim = turn_claim;
+                let was_deleting = turn_claim.release();
+                self.complete_released_turn(conversation_id, &turn_id, was_deleting)
+                    .await;
+                return Err(ConversationError::internal(
+                    "ATTACHMENT_PROMPT_ADMISSION_PERSISTENCE_UNAVAILABLE",
+                ));
+            }
+            let admission_ticket = match register_command_eve_prompt_admission(&turn_id, &receipt_sha256) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    let mut turn_claim = turn_claim;
+                    let was_deleting = turn_claim.release();
+                    self.complete_released_turn(conversation_id, &turn_id, was_deleting)
+                        .await;
+                    return Err(error.into());
+                }
+            };
+
+            let user_msg_id = Self::mint_msg_id();
+            let user_content = req.content.clone();
+            let user_hidden = req.hidden;
+            let created_at = now_ms();
+            ConversationTurnOrchestrator::new(self.clone(), Arc::clone(task_manager)).spawn_user_turn(TurnStartInput {
+                user_id: user_id.to_owned(),
+                conversation: row,
+                request: req,
+                verified_attachment_grounding: verified.agent_grounding,
+                build_options: build_opts,
+                stored_workspace,
+                turn_id: turn_id.clone(),
+                turn_claim,
+            });
+
+            let admission_claim = admission_ticket.wait().await?;
+            let mut user_message_content = serde_json::json!({ "content": user_content });
+            user_message_content["attachment_grounding_receipt"] =
+                serde_json::to_value(&accepted_receipt).map_err(|error| {
+                    ConversationError::internal(format!("Attachment receipt serialization failed: {error}"))
+                })?;
+            let user_msg = aionui_db::models::MessageRow {
+                id: user_msg_id.clone(),
+                conversation_id: conversation_id.to_owned(),
+                msg_id: Some(user_msg_id.clone()),
+                r#type: "text".into(),
+                content: user_message_content.to_string(),
+                position: Some("right".into()),
+                status: Some("finish".into()),
+                hidden: user_hidden,
+                created_at,
+            };
+            // Release phase=commit, then wait for Hermes to consume that
+            // response and issue phase=finalize. Only that peer-originated
+            // acknowledgement permits the final accepted receipt to be stored.
+            // Hermes remains blocked before the provider until finalize accepts.
+            let finalize_ticket = admission_claim.accept()?;
+            let finalize_claim = finalize_ticket.wait().await?;
+            if let Err(error) = self.conversation_repo.insert_message(&user_msg).await {
+                finalize_claim.reject("ATTACHMENT_PROMPT_ADMISSION_PERSISTENCE_FAILED");
+                warn!(msg_id = %user_msg_id, error = %ErrorChain(&error), "Grounded user message persistence rejected ACP admission");
+                return Err(error.into());
+            }
+            finalize_claim.accept()?;
+
+            self.broadcaster.broadcast(WebSocketMessage::new(
+                "message.userCreated",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "msg_id": &user_msg_id,
+                    "content": &user_content,
+                    "position": "right",
+                    "status": "finish",
+                    "hidden": user_hidden,
+                    "created_at": created_at,
+                }),
+            ));
+            info!(
+                conversation_id = %conversation_id,
+                msg_id = %user_msg_id,
+                turn_id = %turn_id,
+                elapsed_ms = now_ms().saturating_sub(send_started_at),
+                "Grounded message accepted after native ACP prompt admission"
+            );
+            return Ok(self
+                .send_message_response(conversation_id, user_msg_id, turn_id, Some(accepted_receipt))
+                .await);
+        }
+
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
 
         // Store user message. `msg_id` is server-generated so the WebSocket
@@ -2845,12 +2955,7 @@ impl ConversationService {
         // key. We reuse the same value for `id` (primary key) and `msg_id`
         // to preserve legacy callers that still rely on `id == msg_id`.
         let user_msg_id = Self::mint_msg_id();
-        let mut user_message_content = serde_json::json!({ "content": req.content });
-        if let Some(receipt) = attachment_grounding_receipt.as_ref() {
-            user_message_content["attachment_grounding_receipt"] = serde_json::to_value(receipt).map_err(|error| {
-                ConversationError::internal(format!("Attachment receipt serialization failed: {error}"))
-            })?;
-        }
+        let user_message_content = serde_json::json!({ "content": req.content });
         let user_msg = aionui_db::models::MessageRow {
             id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
@@ -2871,12 +2976,7 @@ impl ConversationService {
             self.complete_released_turn(conversation_id, &turn_id, was_deleting)
                 .await;
             return Ok(self
-                .send_message_response(
-                    conversation_id,
-                    user_msg_id,
-                    turn_id,
-                    attachment_grounding_receipt.clone(),
-                )
+                .send_message_response(conversation_id, user_msg_id, turn_id, None)
                 .await);
         }
         if let Err(e) = self.conversation_repo.insert_message(&user_msg).await {
@@ -2926,12 +3026,7 @@ impl ConversationService {
                 self.complete_released_turn(conversation_id, &turn_id, was_deleting)
                     .await;
                 return Ok(self
-                    .send_message_response(
-                        conversation_id,
-                        user_msg_id,
-                        turn_id,
-                        attachment_grounding_receipt.clone(),
-                    )
+                    .send_message_response(conversation_id, user_msg_id, turn_id, None)
                     .await);
             }
         };
@@ -2943,7 +3038,7 @@ impl ConversationService {
             user_id: user_id.to_owned(),
             conversation: row,
             request: req,
-            verified_attachment_grounding: agent_attachment_grounding,
+            verified_attachment_grounding: Vec::new(),
             build_options: build_opts,
             stored_workspace,
             turn_id: turn_id.clone(),
@@ -2958,7 +3053,7 @@ impl ConversationService {
             "Message accepted, agent work scheduled"
         );
         Ok(self
-            .send_message_response(conversation_id, user_msg_id_ret, turn_id, attachment_grounding_receipt)
+            .send_message_response(conversation_id, user_msg_id_ret, turn_id, None)
             .await)
     }
 
@@ -2990,6 +3085,11 @@ impl ConversationService {
         if parse_project_binding_from_row(&row)?.is_some() {
             return Err(project_bad_request(PROJECT_RUNTIME_BINDING_REQUIRED));
         }
+
+        // Upper-level team/mailbox callers do not carry a grounding request.
+        // Refuse visual files here rather than letting a raw ResourceLink bypass
+        // the ordinary send boundary.
+        verify_attachment_grounding(None, &request.files).await?;
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
