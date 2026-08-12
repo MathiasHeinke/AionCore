@@ -1199,7 +1199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_out_preturn_drops_real_sqlite_claim_before_bounded_recovery() {
+    async fn stalled_sqlite_preturn_claim_is_cancelled_before_bounded_recovery_and_close() {
         let claim_started = Arc::new(Barrier::new(2));
         let pool = test_pool(Some("session-1")).await;
         let repo = Arc::new(TransactionalStalledClaimRepo {
@@ -1220,13 +1220,31 @@ mod tests {
         let binding = AcpSessionBinding::bound_for_test("session-1").await;
         let (reply, receiver) = oneshot::channel();
         let (completion, _unused_reply) = dispatch_for_binding("session-1", binding.clone(), reply, receiver);
+        let deferred_turn_gate = completion.turn_gate.clone();
 
         let consumer = Arc::new(consumer);
         let completion_task = tokio::spawn({
             let consumer = Arc::clone(&consumer);
             async move { consumer.consume(&completion).await }
         });
-        claim_started.wait().await;
+        tokio::time::timeout(Duration::from_secs(1), claim_started.wait())
+            .await
+            .expect("the receipt claim must open its SQLite transaction");
+
+        // The real SQLite transaction above is still open, but it is no
+        // longer protected by a binding reader. A close therefore wins before
+        // the admission deadline and makes the deferred gate unable to insert
+        // a post-close turn.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), binding.close_for_test("session-1"))
+                .await
+                .expect("close must not wait for a stalled pre-turn SQLite transaction"),
+            "close must drop the live binding"
+        );
+        assert!(
+            deferred_turn_gate.try_admit_turn().is_none(),
+            "close must fence the deferred turn gate"
+        );
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), completion_task)
