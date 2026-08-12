@@ -37,12 +37,13 @@ pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentPar
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
-    AsyncCompletionReceiptClaim, ClaimAsyncCompletionReceiptParams, CreateAcpSessionParams, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
-    IAsyncCompletionReceiptRepository, IChannelRepository, IClientPreferenceRepository, IConversationRepository,
-    ICronRepository, IMcpServerRepository, IOAuthTokenRepository, IProviderRepository, IRemoteAgentRepository,
-    ISettingsRepository, ISkillRepository, ITeamRepository, IUserRepository, PersistedSessionState,
+    AsyncCompletionAckStatus, AsyncCompletionReceiptClaim, AsyncCompletionReceiptRecord,
+    ClaimAsyncCompletionReceiptParams, CreateAcpSessionParams, IAcpSessionRepository, IAgentMetadataRepository,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
+    IAssistantPreferenceRepository, IAssistantRepository, IAsyncCompletionReceiptRepository, IChannelRepository,
+    IClientPreferenceRepository, IConversationRepository, ICronRepository, IMcpServerRepository, IOAuthTokenRepository,
+    IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISkillRepository, ITeamRepository,
+    IUserRepository, PersistedSessionState, RecordAsyncCompletionAckParams, RecordRejectedAsyncCompletionReceiptParams,
     SaveRuntimeStateParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteAsyncCompletionReceiptRepository,

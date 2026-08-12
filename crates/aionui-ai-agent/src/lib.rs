@@ -28,8 +28,9 @@ pub use agent_task::IMockAgent;
 pub use agent_task::{AgentInstance, IAgentTask};
 pub use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashCommandItem};
 pub use async_completion::{
-    CommandEveAsyncCompletionDispatch, CommandEveAsyncCompletionResult, CommandEveAsyncCompletionRoute,
-    CommandEveAsyncCompletionSender,
+    AcpSessionBinding, AcpSessionBindingAdmission, AcpSessionBindingLease, AcpSessionBindingTurnGate,
+    CommandEveAsyncCompletionDispatch, CommandEveAsyncCompletionDispatchKind, CommandEveAsyncCompletionResult,
+    CommandEveAsyncCompletionRoute, CommandEveAsyncCompletionSender,
 };
 pub use capability::skill_manager::{
     AcpSkillManager, SkillDefinition, SkillIndex, build_skills_index_text, build_system_instructions,

@@ -718,6 +718,14 @@ impl AcpAgentManager {
         Err(AcpError::NotConnected.into())
     }
 
+    fn require_cancel_transport(session_id: Option<&str>, connected: bool) -> Result<&str, AgentError> {
+        let session_id = session_id.ok_or_else(|| AgentError::from(AcpError::NotConnected))?;
+        if !connected {
+            return Err(AcpError::NotConnected.into());
+        }
+        Ok(session_id)
+    }
+
     pub(crate) async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AgentError> {
         let desired = self
             .session
@@ -1509,11 +1517,13 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]
     async fn cancel(&self) -> Result<(), AgentError> {
         info!("Cancelling ACP session");
-        let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
-        if let Some(sid) = &session_id {
-            self.protocol
-                .cancel(CancelNotification::new(SessionId::new(sid.as_str())));
-        }
+        let session_id = {
+            let session = self.session.read().await;
+            Self::require_cancel_transport(session.session_id(), self.protocol.is_connected())?.to_owned()
+        };
+        self.protocol
+            .cancel(CancelNotification::new(SessionId::new(session_id.as_str())))
+            .map_err(AgentError::from)?;
         self.permission_router.cancel_all();
 
         {
@@ -1524,7 +1534,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
         info!(
             agent_type = "acp",
             source = "cancel_request",
-            session_id = session_id.as_deref().unwrap_or("none"),
+            session_id = %session_id,
             "ACP cancel requested; waiting for prompt outcome before terminal finish"
         );
 
@@ -1555,7 +1565,9 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
         }
 
         if let Some(sid) = session_id.as_deref() {
-            self.protocol.cancel(CancelNotification::new(SessionId::new(sid)));
+            // Shutdown is intentionally best effort; unlike the user-facing
+            // cancel action, it must not claim transport acceptance.
+            let _ = self.protocol.cancel(CancelNotification::new(SessionId::new(sid)));
             if idle_timeout {
                 log_idle_acp_cancel_sent(&self.params.conversation_id, backend, sid, pid);
             }
@@ -1887,6 +1899,22 @@ mod tests {
         assert_eq!(runtime.status(), None);
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         assert!(res.is_err(), "cancel request must not emit a terminal event");
+    }
+
+    #[test]
+    fn cancel_transport_requires_a_live_session_and_connection() {
+        assert!(matches!(
+            AcpAgentManager::require_cancel_transport(None, true),
+            Err(AgentError::Acp(AcpError::NotConnected))
+        ));
+        assert!(matches!(
+            AcpAgentManager::require_cancel_transport(Some("session-1"), false),
+            Err(AgentError::Acp(AcpError::NotConnected))
+        ));
+        assert_eq!(
+            AcpAgentManager::require_cancel_transport(Some("session-1"), true).unwrap(),
+            "session-1"
+        );
     }
 
     // ---- augment_with_stderr behavioral tests ------------------------------

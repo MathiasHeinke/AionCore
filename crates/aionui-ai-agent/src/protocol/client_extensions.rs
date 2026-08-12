@@ -24,7 +24,10 @@ use tracing::{info, warn};
 use crate::error::AgentError;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::AgentStreamEvent;
-use crate::{CommandEveAsyncCompletionDispatch, CommandEveAsyncCompletionResult, CommandEveAsyncCompletionRoute};
+use crate::{
+    AcpSessionBinding, CommandEveAsyncCompletionDispatch, CommandEveAsyncCompletionDispatchKind,
+    CommandEveAsyncCompletionResult, CommandEveAsyncCompletionRoute,
+};
 
 use read_terminal::{COMMAND_EVE_READ_TERMINAL_EXT_METHOD, PendingReadTerminal, cancel_pending_terminal};
 
@@ -65,7 +68,6 @@ struct ExtensionState {
     read_preview_enabled: bool,
     read_terminal_enabled: bool,
     async_completion_enabled: bool,
-    bound_session_id: Option<String>,
     pending: HashMap<String, PendingReadPreview>,
     pending_terminal: HashMap<String, PendingReadTerminal>,
 }
@@ -74,6 +76,7 @@ struct ExtensionState {
 pub(crate) struct AcpClientExtensionRouter {
     event_tx: broadcast::Sender<AgentStreamEvent>,
     state: Arc<Mutex<ExtensionState>>,
+    session_binding: AcpSessionBinding,
     timeout: Duration,
     async_completion_reply_timeout: Duration,
     async_completion_slots: Arc<Semaphore>,
@@ -89,6 +92,7 @@ impl AcpClientExtensionRouter {
         Self {
             event_tx,
             state: Arc::new(Mutex::new(ExtensionState::default())),
+            session_binding: AcpSessionBinding::default(),
             timeout,
             async_completion_reply_timeout: ASYNC_COMPLETION_REPLY_TIMEOUT,
             async_completion_slots: Arc::new(Semaphore::new(ASYNC_COMPLETION_MAX_CONCURRENCY)),
@@ -97,6 +101,7 @@ impl AcpClientExtensionRouter {
     }
 
     pub(crate) fn with_async_completion(mut self, route: CommandEveAsyncCompletionRoute) -> Self {
+        self.session_binding = route.session_binding.clone();
         self.async_completion_route = Some(route);
         self
     }
@@ -125,15 +130,19 @@ impl AcpClientExtensionRouter {
     }
 
     /// Bind extension requests to the canonical session acknowledged by ACP.
-    /// Rebinding cancels every request from the previous session.
-    pub(crate) fn bind_session(&self, session_id: &str) -> Result<(), AcpError> {
+    /// Rebinding cancels every request from the previous session and advances
+    /// the binding generation so previously minted completion leases become
+    /// stale. A same-session bind is idempotent only when no begin-binding
+    /// transition occurred.
+    pub(crate) async fn bind_session(&self, session_id: &str) -> Result<(), AcpError> {
         validate_identifier(session_id).map_err(|_| local_binding_error())?;
+        match self.session_binding.bind(session_id).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(()) => return Err(local_binding_error()),
+        }
         let (cancelled, cancelled_terminal) = {
             let mut state = self.state.lock().map_err(|_| local_binding_error())?;
-            if state.bound_session_id.as_deref() == Some(session_id) {
-                return Ok(());
-            }
-            state.bound_session_id = Some(session_id.to_owned());
             (
                 state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
                 state
@@ -148,17 +157,52 @@ impl AcpClientExtensionRouter {
         Ok(())
     }
 
-    /// Unbind a successfully closed session and cancel its outstanding reads.
-    pub(crate) fn unbind_session(&self, session_id: &str) {
+    /// Invalidate the live binding at the beginning of every
+    /// `session/new|load|resume` attempt. While the request is in flight the
+    /// route is unbound: async completions stay retryable
+    /// (`session_not_bound`), pending renderer reads from the previous
+    /// session are cancelled, and every lease minted before this transition
+    /// is stale. A failed request leaves the route unbound until a later
+    /// successful bind.
+    pub(crate) async fn begin_session_binding(&self) {
+        if self.session_binding.invalidate().await.is_err() {
+            warn!("ACP binding admission gate unavailable while beginning session binding");
+            return;
+        }
         let (cancelled, cancelled_terminal) = {
             let Ok(mut state) = self.state.lock() else {
-                warn!("ACP client extension state unavailable while closing session");
+                warn!("ACP client extension state unavailable while beginning session binding");
                 return;
             };
-            if state.bound_session_id.as_deref() != Some(session_id) {
-                return;
-            }
-            state.bound_session_id = None;
+            (
+                state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
+                state
+                    .pending_terminal
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        cancel_pending(cancelled, "session_rebinding");
+        cancel_pending_terminal(cancelled_terminal, "session_rebinding");
+    }
+
+    /// Fence a close before its RPC crosses the transport. The original
+    /// session id is retained by the caller for that RPC, while completion
+    /// admission is already fail-closed and every pre-close lease is stale.
+    /// A failed close leaves the route unbound; reopening must be a positive
+    /// `session/new|load|resume` bind, never restoration of an old lease.
+    pub(crate) async fn begin_session_close(&self, session_id: &str) -> Result<(), AcpError> {
+        if !self
+            .session_binding
+            .unbind_matching(session_id)
+            .await
+            .map_err(|_| local_binding_error())?
+        {
+            return Ok(());
+        }
+        let (cancelled, cancelled_terminal) = {
+            let mut state = self.state.lock().map_err(|_| local_binding_error())?;
             (
                 state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
                 state
@@ -170,6 +214,7 @@ impl AcpClientExtensionRouter {
         };
         cancel_pending(cancelled, "session_closed");
         cancel_pending_terminal(cancelled_terminal, "session_closed");
+        Ok(())
     }
 
     /// Cancel all pending requests before transport shutdown/disconnect.
@@ -182,7 +227,7 @@ impl AcpClientExtensionRouter {
             state.read_preview_enabled = false;
             state.read_terminal_enabled = false;
             state.async_completion_enabled = false;
-            state.bound_session_id = None;
+            self.session_binding.close_admissions();
             (
                 state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
                 state
@@ -226,7 +271,7 @@ impl AcpClientExtensionRouter {
             let pending = state.pending.get(&response.request_id).ok_or_else(|| {
                 AgentError::conflict("ACP read_preview request is unknown, expired, or already answered")
             })?;
-            if state.bound_session_id.as_deref() != Some(response.session_id.as_str())
+            if self.session_binding.bound_session_id().as_deref() != Some(response.session_id.as_str())
                 || pending.session_id != response.session_id
             {
                 return Err(AgentError::conflict("ACP read_preview session binding mismatch"));
@@ -317,7 +362,7 @@ impl AcpClientExtensionRouter {
                     return;
                 }
             };
-            if state.bound_session_id.as_deref() != Some(request.session_id.as_str()) {
+            if self.session_binding.bound_session_id().as_deref() != Some(request.session_id.as_str()) {
                 reject_request(respond, "session_mismatch");
                 return;
             }
@@ -402,21 +447,24 @@ impl AcpClientExtensionRouter {
             respond_async_completion_rejected(respond, "invalid_content");
             return;
         }
-        match self.state.lock().ok().and_then(|state| state.bound_session_id.clone()) {
-            None => {
-                respond_async_completion_retryable(respond, "session_not_bound");
-                return;
-            }
-            Some(bound_session_id) if bound_session_id != request.session_id => {
-                respond_async_completion_rejected(respond, "session_mismatch");
-                return;
-            }
-            Some(_) => {}
-        }
+        let Some(lease) = self.session_binding.lease() else {
+            respond_async_completion_retryable(respond, "session_not_bound");
+            return;
+        };
 
         let Some(route) = self.async_completion_route.clone() else {
-            respond_async_completion_rejected(respond, "consumer_unavailable");
+            respond_async_completion_retryable(respond, "consumer_unavailable");
             return;
+        };
+        let kind = if lease.session_id() == request.session_id.as_str() {
+            CommandEveAsyncCompletionDispatchKind::Apply
+        } else {
+            // A genuine post-bind mismatch becomes terminal only after the
+            // existing consumer has durably recorded it in the canonical
+            // conversation's rejection receipt domain.
+            CommandEveAsyncCompletionDispatchKind::RejectSessionMismatch {
+                bound_session_id: lease.session_id().to_owned(),
+            }
         };
         let permit = match Arc::clone(&self.async_completion_slots).try_acquire_owned() {
             Ok(permit) => permit,
@@ -429,6 +477,9 @@ impl AcpClientExtensionRouter {
         let dispatch = CommandEveAsyncCompletionDispatch {
             conversation_id: route.conversation_id,
             request,
+            kind,
+            turn_gate: crate::AcpSessionBindingTurnGate::new(self.session_binding.clone(), lease.clone()),
+            lease,
             project_build_options: route.project_build_options,
             reply,
         };
@@ -439,20 +490,23 @@ impl AcpClientExtensionRouter {
                 return;
             }
             Err(TrySendError::Closed(_)) => {
-                respond_async_completion_rejected(respond, "consumer_unavailable");
+                respond_async_completion_retryable(respond, "consumer_unavailable");
                 return;
             }
         }
         let reply_timeout = self.async_completion_reply_timeout;
         tokio::spawn(async move {
             let _permit = permit;
+            // Transport gaps between router and consumer are never terminal:
+            // the receipt ledger remains the sole authority that may record
+            // an explicit-unknown outcome, so Hermes retains and retries.
             let result = match tokio::time::timeout(reply_timeout, reply_rx).await {
                 Ok(Ok(result)) => result,
-                Ok(Err(_)) => CommandEveAsyncCompletionResult::Unknown {
-                    code: "outcome_unknown_consumer_dropped".to_owned(),
+                Ok(Err(_)) => CommandEveAsyncCompletionResult::RetryableBusy {
+                    code: "consumer_reply_dropped".to_owned(),
                 },
-                Err(_) => CommandEveAsyncCompletionResult::Unknown {
-                    code: "outcome_unknown_reply_timeout".to_owned(),
+                Err(_) => CommandEveAsyncCompletionResult::RetryableBusy {
+                    code: "consumer_reply_timeout".to_owned(),
                 },
             };
             let response = match result {
@@ -476,7 +530,7 @@ impl AcpClientExtensionRouter {
                     turn_id: None,
                     code: Some(code),
                 },
-                CommandEveAsyncCompletionResult::Unknown { code } => AcpAsyncCompletionResponse {
+                CommandEveAsyncCompletionResult::PersistedUnknown { code } => AcpAsyncCompletionResponse {
                     status: AcpAsyncCompletionAckStatus::Rejected,
                     turn_id: None,
                     code: Some(code),
@@ -502,7 +556,7 @@ impl AcpClientExtensionRouter {
 
     #[cfg(test)]
     pub(crate) fn bound_session_id(&self) -> Option<String> {
-        self.state.lock().ok().and_then(|state| state.bound_session_id.clone())
+        self.session_binding.bound_session_id()
     }
 
     #[cfg(test)]
@@ -795,6 +849,7 @@ mod tests {
             conversation_id: "conversation-1".to_owned(),
             sender,
             project_build_options: None,
+            session_binding: AcpSessionBinding::default(),
         }
     }
 
@@ -818,7 +873,7 @@ mod tests {
         let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
         let router = AcpClientExtensionRouter::new(event_tx).with_async_completion(completion_route(completion_tx));
         router.enable_async_completion().unwrap();
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
 
         let response_rx = dispatch(
             &router,
@@ -828,6 +883,7 @@ mod tests {
         let dispatched = completion_rx.recv().await.unwrap();
         assert_eq!(dispatched.conversation_id, "conversation-1");
         assert_eq!(dispatched.request.session_id, "session-1");
+        assert!(matches!(&dispatched.kind, CommandEveAsyncCompletionDispatchKind::Apply));
         assert!(dispatched.project_build_options.is_none());
         dispatched
             .reply
@@ -868,12 +924,24 @@ mod tests {
             }
         }
 
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
         let mismatched = dispatch(
             &router,
             COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
             serde_json::to_value(completion_request("session-2")).unwrap(),
         );
+        let rejected = completion_rx.recv().await.unwrap();
+        assert!(matches!(
+            &rejected.kind,
+            CommandEveAsyncCompletionDispatchKind::RejectSessionMismatch { bound_session_id }
+                if bound_session_id == "session-1"
+        ));
+        rejected
+            .reply
+            .send(CommandEveAsyncCompletionResult::Rejected {
+                code: "session_mismatch".to_owned(),
+            })
+            .unwrap();
         let response: AcpAsyncCompletionResponse = serde_json::from_value(mismatched.await.unwrap().unwrap()).unwrap();
         assert_eq!(response.status, AcpAsyncCompletionAckStatus::Rejected);
         assert_eq!(response.code.as_deref(), Some("session_mismatch"));
@@ -885,13 +953,25 @@ mod tests {
         let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
         let router = AcpClientExtensionRouter::new(event_tx).with_async_completion(completion_route(completion_tx));
         router.enable_async_completion().unwrap();
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
 
         let mismatched = dispatch(
             &router,
             COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
             serde_json::to_value(completion_request("session-2")).unwrap(),
         );
+        let rejected = completion_rx.recv().await.unwrap();
+        assert!(matches!(
+            &rejected.kind,
+            CommandEveAsyncCompletionDispatchKind::RejectSessionMismatch { bound_session_id }
+                if bound_session_id == "session-1"
+        ));
+        rejected
+            .reply
+            .send(CommandEveAsyncCompletionResult::Rejected {
+                code: "session_mismatch".to_owned(),
+            })
+            .unwrap();
         let response: AcpAsyncCompletionResponse = serde_json::from_value(mismatched.await.unwrap().unwrap()).unwrap();
         assert_eq!(response.status, AcpAsyncCompletionAckStatus::Rejected);
         assert_eq!(response.code.as_deref(), Some("session_mismatch"));
@@ -923,7 +1003,7 @@ mod tests {
             .with_async_completion(completion_route(completion_tx))
             .with_async_completion_limits(Duration::from_secs(1), 1);
         router.enable_async_completion().unwrap();
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
 
         let first = dispatch(
             &router,
@@ -954,14 +1034,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_completion_reply_timeout_is_explicitly_unknown_not_retryable() {
+    async fn async_completion_reply_timeout_is_retryable_never_terminal_unknown() {
         let (event_tx, _) = broadcast::channel(4);
         let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
         let router = AcpClientExtensionRouter::new(event_tx)
             .with_async_completion(completion_route(completion_tx))
             .with_async_completion_limits(Duration::from_millis(20), 1);
         router.enable_async_completion().unwrap();
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
 
         let response = dispatch(
             &router,
@@ -970,9 +1050,187 @@ mod tests {
         );
         let in_flight = completion_rx.recv().await.unwrap();
         let response: AcpAsyncCompletionResponse = serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
-        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Rejected);
-        assert_eq!(response.code.as_deref(), Some("outcome_unknown_reply_timeout"));
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(response.code.as_deref(), Some("consumer_reply_timeout"));
         drop(in_flight);
+    }
+
+    #[tokio::test]
+    async fn async_completion_dropped_consumer_reply_is_retryable_never_terminal_unknown() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
+        let router = AcpClientExtensionRouter::new(event_tx)
+            .with_async_completion(completion_route(completion_tx))
+            .with_async_completion_limits(Duration::from_secs(5), 1);
+        router.enable_async_completion().unwrap();
+        router.bind_session("session-1").await.unwrap();
+
+        let response = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let in_flight = completion_rx.recv().await.unwrap();
+        // Dropping the dispatch drops the reply oneshot: the consumer never
+        // answered, so the outcome is unknown to the router but must stay
+        // retryable — only the receipt ledger may record a terminal unknown.
+        drop(in_flight);
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(response.code.as_deref(), Some("consumer_reply_dropped"));
+    }
+
+    #[tokio::test]
+    async fn async_completion_closed_consumer_channel_is_retryable() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, completion_rx) = tokio::sync::mpsc::channel(1);
+        drop(completion_rx);
+        let router = AcpClientExtensionRouter::new(event_tx).with_async_completion(completion_route(completion_tx));
+        router.enable_async_completion().unwrap();
+        router.bind_session("session-1").await.unwrap();
+
+        let response = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(response.code.as_deref(), Some("consumer_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn binding_lease_generation_tracks_the_session_lifecycle() {
+        let (event_tx, _) = broadcast::channel(4);
+        let router = AcpClientExtensionRouter::new(event_tx);
+        assert!(router.session_binding.lease().is_none());
+
+        router.bind_session("session-1").await.unwrap();
+        let first = router.session_binding.lease().unwrap();
+        assert_eq!(first.session_id(), "session-1");
+        assert!(router.session_binding.validate_lease(&first));
+
+        // Same-session bind without an intervening begin-binding transition
+        // is idempotent and keeps the generation.
+        router.bind_session("session-1").await.unwrap();
+        assert_eq!(router.session_binding.lease().unwrap(), first);
+
+        // The session request interval invalidates the live binding and
+        // every lease minted so far.
+        router.begin_session_binding().await;
+        assert!(router.session_binding.lease().is_none());
+        assert!(!router.session_binding.validate_lease(&first));
+
+        // Binding the same session id after the interval is a real bind with
+        // a new, strictly greater generation.
+        router.bind_session("session-1").await.unwrap();
+        let second = router.session_binding.lease().unwrap();
+        assert_eq!(second.session_id(), "session-1");
+        assert!(second.generation() > first.generation());
+        assert!(router.session_binding.validate_lease(&second));
+        assert!(!router.session_binding.validate_lease(&first));
+
+        // Rebind to a different session advances again and stales the lease.
+        router.bind_session("session-2").await.unwrap();
+        let third = router.session_binding.lease().unwrap();
+        assert!(third.generation() > second.generation());
+        assert!(!router.session_binding.validate_lease(&second));
+
+        router.begin_session_close("session-2").await.unwrap();
+        assert!(router.session_binding.lease().is_none());
+        assert!(!router.session_binding.validate_lease(&third));
+
+        router.bind_session("session-3").await.unwrap();
+        let fourth = router.session_binding.lease().unwrap();
+        router.cancel_all("test_cancel");
+        assert!(router.session_binding.lease().is_none());
+        assert!(!router.session_binding.validate_lease(&fourth));
+    }
+
+    #[tokio::test]
+    async fn async_completion_stays_retryable_session_not_bound_during_the_binding_interval() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(4);
+        let router = AcpClientExtensionRouter::new(event_tx).with_async_completion(completion_route(completion_tx));
+        router.enable_async_completion().unwrap();
+        router.bind_session("session-1").await.unwrap();
+
+        // Between begin-binding (session/new|load|resume request start) and
+        // the successful response, the route is unbound: completions remain
+        // retryable and are never dispatched to the consumer.
+        router.begin_session_binding().await;
+        let response = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(response.code.as_deref(), Some("session_not_bound"));
+        assert!(completion_rx.try_recv().is_err(), "unbound interval must not dispatch");
+
+        // After the successful bind, the same completion routes again.
+        router.bind_session("session-1").await.unwrap();
+        let response = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let in_flight = completion_rx.recv().await.unwrap();
+        assert_eq!(in_flight.kind, CommandEveAsyncCompletionDispatchKind::Apply);
+        in_flight
+            .reply
+            .send(CommandEveAsyncCompletionResult::Completed {
+                turn_id: "turn-after-bind".to_owned(),
+            })
+            .unwrap();
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn close_fence_blocks_a_deferred_completion_before_it_can_admit_a_turn() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(4);
+        let router = AcpClientExtensionRouter::new(event_tx).with_async_completion(completion_route(completion_tx));
+        router.enable_async_completion().unwrap();
+        router.bind_session("session-1").await.unwrap();
+
+        let response = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let deferred = completion_rx.recv().await.expect("routed completion");
+        assert_eq!(deferred.kind, CommandEveAsyncCompletionDispatchKind::Apply);
+
+        // `close_session` invokes this fence before its RPC. The dispatched
+        // completion has not reached the synchronous turn insertion yet, so
+        // it must be unable to cross the close boundary afterwards.
+        router.begin_session_close("session-1").await.unwrap();
+        assert!(router.session_binding.lease().is_none());
+        assert!(deferred.turn_gate.try_admit_turn().is_none());
+
+        deferred
+            .reply
+            .send(CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "session_not_bound".to_owned(),
+            })
+            .unwrap();
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(response.code.as_deref(), Some("session_not_bound"));
+
+        let post_close = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let post_close: AcpAsyncCompletionResponse =
+            serde_json::from_value(post_close.await.unwrap().unwrap()).unwrap();
+        assert_eq!(post_close.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(post_close.code.as_deref(), Some("session_not_bound"));
+        assert!(completion_rx.try_recv().is_err(), "close must prevent another dispatch");
     }
 
     #[tokio::test]
@@ -986,7 +1244,7 @@ mod tests {
         );
         assert_eq!(i32::from(disabled.await.unwrap().unwrap_err().code), -32601);
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
 
         let req = request("request-1", "session-1");
         let response_rx = dispatch(
@@ -1013,7 +1271,7 @@ mod tests {
         let (event_tx, _event_rx) = broadcast::channel(4);
         let router = AcpClientExtensionRouter::new(event_tx);
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
 
         for invalid in [
             serde_json::json!({
@@ -1059,7 +1317,7 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let router = AcpClientExtensionRouter::new(event_tx);
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
         let rx = dispatch(
             &router,
             COMMAND_EVE_READ_PREVIEW_EXT_METHOD,
@@ -1082,7 +1340,7 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let router = AcpClientExtensionRouter::new(event_tx);
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
         let value = serde_json::to_value(request("request-1", "session-1")).unwrap();
         let first = dispatch(&router, COMMAND_EVE_READ_PREVIEW_EXT_METHOD, value.clone());
         let _ = event_rx.recv().await.unwrap();
@@ -1098,14 +1356,14 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let router = AcpClientExtensionRouter::new(event_tx);
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
         let rebound = dispatch(
             &router,
             COMMAND_EVE_READ_PREVIEW_EXT_METHOD,
             serde_json::to_value(request("request-rebind", "session-1")).unwrap(),
         );
         let _ = event_rx.recv().await.unwrap();
-        router.bind_session("session-2").unwrap();
+        router.bind_session("session-2").await.unwrap();
         assert_eq!(router.bound_session_id().as_deref(), Some("session-2"));
         assert!(rebound.await.unwrap().is_err());
 
@@ -1115,11 +1373,11 @@ mod tests {
             serde_json::to_value(request("request-close", "session-2")).unwrap(),
         );
         let _ = event_rx.recv().await.unwrap();
-        router.unbind_session("session-2");
+        router.begin_session_close("session-2").await.unwrap();
         assert_eq!(router.bound_session_id(), None);
         assert!(closed.await.unwrap().is_err());
 
-        router.bind_session("session-3").unwrap();
+        router.bind_session("session-3").await.unwrap();
         let cancelled = dispatch(
             &router,
             COMMAND_EVE_READ_PREVIEW_EXT_METHOD,
@@ -1136,7 +1394,7 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let router = AcpClientExtensionRouter::with_timeout(event_tx, Duration::from_millis(5));
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
         let timed_out = dispatch(
             &router,
             COMMAND_EVE_READ_PREVIEW_EXT_METHOD,
@@ -1162,7 +1420,7 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let router = AcpClientExtensionRouter::new(event_tx);
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
         let mut secret_request = request("request-secret", "session-1");
         secret_request.count = Some(200);
         let rx = dispatch(
@@ -1192,7 +1450,7 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let router = AcpClientExtensionRouter::new(event_tx);
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
         let mut unicode_request = request("request-unicode", "session-1");
         unicode_request.count = Some(MAX_COUNT);
         let rx = dispatch(

@@ -7,13 +7,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
-    AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadTerminalResponse, AcpReadTerminalResponseRequest,
-    ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
-    CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SteerConversationRequest,
-    SteerConversationResponse, UpdateConversationArtifactRequest, UpdateConversationRequest, WarmupConversationRequest,
+    AcpAsyncCompletionReceiptListResponse, AcpReadPreviewResponse, AcpReadPreviewResponseRequest,
+    AcpReadTerminalResponse, AcpReadTerminalResponseRequest, ActiveCountResponse, ApiResponse, ApprovalCheckQuery,
+    ApprovalCheckResponse, CancelConversationRequest, CancelConversationResponse, CloneConversationRequest,
+    ConfirmRequest, ConfirmationListResponse, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationListResponse, ConversationResponse, CreateConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, SteerConversationRequest, SteerConversationResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WarmupConversationRequest,
 };
 use aionui_auth::{AuthenticationProvenance, CurrentUser, extract_project_runtime_attestation_from_headers};
 use aionui_common::ApiError;
@@ -154,6 +155,10 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         )
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
+        .route(
+            "/api/conversations/{id}/async-completion-receipts",
+            get(list_async_completion_receipts),
+        )
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
         .route("/api/conversations/{id}/warmup", post(warmup))
@@ -362,6 +367,19 @@ async fn list_artifacts(
     let result = state
         .service
         .list_artifacts(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn list_async_completion_receipts(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<AcpAsyncCompletionReceiptListResponse>>, ApiError> {
+    let result = state
+        .async_completion_receipts
+        .list(&user.id, &id)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))

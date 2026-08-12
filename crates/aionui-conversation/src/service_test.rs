@@ -11,7 +11,8 @@ use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallSt
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{
-    AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
+    AcpError, AcpSessionBinding, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind,
+    IWorkerTaskManager,
 };
 use aionui_auth::{
     LocalCapabilityVerifier, ProjectRuntimeAttestationClaims, ProjectRuntimeAttestationPurpose,
@@ -4489,6 +4490,7 @@ async fn project_bound_async_completion_revalidates_transient_context_and_uses_s
         .unwrap();
     transient.project_runtime_execution = None;
 
+    let admission = AcpSessionBinding::admission_for_test("session-async-completion").await;
     let outcome = svc
         .run_command_eve_async_completion_turn(
             ConversationAgentTurnRequest {
@@ -4501,6 +4503,7 @@ async fn project_bound_async_completion_revalidates_transient_context_and_uses_s
             },
             "turn_async_completion_1".into(),
             Some(transient.clone()),
+            &admission,
         )
         .await
         .unwrap();
@@ -4547,6 +4550,7 @@ async fn project_bound_async_completion_rejects_mismatched_transient_context_bef
         .unwrap()
         .project_binding_revision += 1;
 
+    let admission = AcpSessionBinding::admission_for_test("session-async-completion").await;
     let error = svc
         .run_command_eve_async_completion_turn(
             ConversationAgentTurnRequest {
@@ -4559,6 +4563,7 @@ async fn project_bound_async_completion_rejects_mismatched_transient_context_bef
             },
             "turn_async_completion_mismatch".into(),
             Some(transient),
+            &admission,
         )
         .await
         .unwrap_err();
@@ -7100,7 +7105,36 @@ async fn cancel_with_mismatched_turn_id_does_not_cancel_and_returns_current_runt
 
     let response = svc.cancel("user_1", &conv.id, "turn_stale", &task_mgr).await.unwrap();
 
+    assert_eq!(
+        response.outcome,
+        aionui_api_types::CancelConversationOutcome::TurnMismatch
+    );
     assert_eq!(response.runtime.turn_id.as_deref(), Some(send.turn_id.as_str()));
+    assert!(response.runtime.is_processing);
+    assert!(svc.runtime_state().is_claimed(&conv.id));
+}
+
+#[tokio::test]
+async fn cancel_with_matching_turn_but_no_agent_returns_distinct_outcome() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _turn_claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn-without-agent")
+        .unwrap();
+
+    let response = svc
+        .cancel("user_1", &conv.id, "turn-without-agent", &task_mgr)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.outcome,
+        aionui_api_types::CancelConversationOutcome::NoActiveAgent
+    );
+    assert_eq!(response.runtime.turn_id.as_deref(), Some("turn-without-agent"));
     assert!(response.runtime.is_processing);
     assert!(svc.runtime_state().is_claimed(&conv.id));
 }
@@ -7126,6 +7160,7 @@ async fn cancel_keeps_turn_claim_until_agent_terminal_event() {
         .await
         .unwrap();
 
+    assert_eq!(cancel.outcome, aionui_api_types::CancelConversationOutcome::Accepted);
     assert_eq!(cancel.runtime.turn_id.as_deref(), Some(send.turn_id.as_str()));
     assert!(cancel.runtime.is_processing);
     assert!(!cancel.runtime.can_send_message);

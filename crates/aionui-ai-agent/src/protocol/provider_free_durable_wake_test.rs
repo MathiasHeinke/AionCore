@@ -22,7 +22,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::acp::{AcpProtocol, PermissionRequest};
 use crate::protocol::events::AgentStreamEvent;
-use crate::{CommandEveAsyncCompletionResult, CommandEveAsyncCompletionRoute};
+use crate::{AcpSessionBinding, CommandEveAsyncCompletionResult, CommandEveAsyncCompletionRoute};
 
 const TRIGGER: &str = "TRIGGER_PROVIDER_FREE_DURABLE_WAKE";
 
@@ -131,6 +131,7 @@ async fn provider_free_durable_wake_cross_language_busy_retry_then_accepts() {
         conversation_id: "conversation-provider-free".to_owned(),
         sender: completion_tx,
         project_build_options: None,
+        session_binding: AcpSessionBinding::default(),
     };
     let protocol = AcpProtocol::connect_with_optional_async_completion(
         stdin,
@@ -282,6 +283,7 @@ async fn provider_free_restart_load_retries_prebind_then_delivers_once() {
         conversation_id: "conversation-restart".to_owned(),
         sender: completion_tx,
         project_build_options: None,
+        session_binding: AcpSessionBinding::default(),
     };
     let protocol = AcpProtocol::connect_with_optional_async_completion(
         restart_stdin,

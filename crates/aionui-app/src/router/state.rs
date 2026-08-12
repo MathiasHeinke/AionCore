@@ -12,7 +12,7 @@ use aionui_assistant::{
 };
 use aionui_auth::{extract_local_capability_from_headers, extract_token_from_ws_headers};
 use aionui_channel::ChannelRouterState;
-use aionui_conversation::{ConversationRouterState, ConversationService};
+use aionui_conversation::{AsyncCompletionReceiptService, ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -382,6 +382,10 @@ pub fn build_conversation_state(
         conversation_service.with_cron_service(Some(cron_service));
     }
     ConversationRouterState {
+        async_completion_receipts: AsyncCompletionReceiptService::new(
+            conversation_service.clone(),
+            services.async_completion_receipt_repo.clone(),
+        ),
         service: conversation_service,
         task_manager: services.worker_task_manager.clone(),
     }
