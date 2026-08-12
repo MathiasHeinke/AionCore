@@ -417,13 +417,27 @@ impl ConversationTurnOrchestrator {
 
             let mut recovery_outcome = attempt_result.outcome.clone();
             recovery_outcome.attempt = attempt_result.summary.clone();
-            let decision = TurnRecoveryPolicy::decide(
-                attempt_result.agent_type,
-                attempt_result.backend.as_deref(),
-                &recovery_outcome,
-                lifecycle,
-                replayed,
-            );
+            // Verified attachment prompts cross a one-shot admission barrier.
+            // Replaying after that barrier closes would send the same grounded
+            // turn without a live admission ticket, so only ordinary text
+            // turns are eligible for the generic ACP recovery replay.
+            let decision = if initial_send.verified_attachment_grounding.is_empty() {
+                TurnRecoveryPolicy::decide(
+                    attempt_result.agent_type,
+                    attempt_result.backend.as_deref(),
+                    &recovery_outcome,
+                    lifecycle,
+                    replayed,
+                )
+            } else {
+                info!(
+                    conversation_id = %conv_id,
+                    turn_id = %turn_id,
+                    error_code = ?attempt_result.outcome.terminal.code(),
+                    "grounded conversation turn auto replay blocked by one-shot prompt admission"
+                );
+                TurnRecoveryDecision::None
+            };
 
             match decision {
                 TurnRecoveryDecision::AutoReplayOnce { reason, .. } => {
