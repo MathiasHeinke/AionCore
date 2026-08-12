@@ -1232,7 +1232,7 @@ mod tests {
             Arc::new(StubTaskManager),
             "owner-test".to_owned(),
         );
-        consumer.admission_timeout = Duration::from_millis(10);
+        consumer.admission_timeout = Duration::from_secs(5);
         consumer.receipt_recovery_timeout = Duration::from_millis(50);
         let binding = AcpSessionBinding::bound_for_test("session-1").await;
         let (reply, receiver) = oneshot::channel();
@@ -1248,12 +1248,23 @@ mod tests {
             .await
             .expect("the receipt claim must open its SQLite transaction");
 
-        // The real SQLite transaction above holds the bounded admission. A
-        // close must wait only until the pre-turn deadline cancels the
-        // transaction, then invalidate the deferred route gate before any
-        // turn can start.
+        // Only after the real SQLite transaction reaches its barrier do we
+        // freeze Tokio time. This keeps pool acquisition on normal time while
+        // making expiry of the already-created admission timer deterministic.
+        tokio::time::pause();
+        let close = binding.close_for_test("session-1");
+        tokio::pin!(close);
         assert!(
-            tokio::time::timeout(Duration::from_millis(250), binding.close_for_test("session-1"))
+            futures_util::poll!(&mut close).is_pending(),
+            "close must enter the lifecycle transition and wait behind the held pre-turn admission"
+        );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        // Return recovery to real time. Otherwise Tokio's paused-time
+        // auto-advance can fire the separate 50 ms recovery bound before the
+        // released SQLite connection executes its first query.
+        tokio::time::resume();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut close)
                 .await
                 .expect("close must not wait for a stalled pre-turn SQLite transaction"),
             "close must drop the live binding"
