@@ -77,9 +77,13 @@ impl AcpSessionBindingTurnObservation {
     }
 }
 
-/// A very short-lived read permit over the exact current ACP binding. It is
-/// acquired only immediately before the synchronous active-turn insertion,
-/// never while database reads, receipt claim, or project revalidation await.
+/// A bounded read permit over the exact current ACP binding. The durable
+/// consumer acquires it before its first receipt-affecting operation and the
+/// conversation service releases it immediately after the synchronous
+/// active-turn insertion. Its owning pre-turn future is bounded and dropped
+/// on timeout, so a lifecycle writer either linearizes before the receipt
+/// claim or waits only for that bounded pre-turn interval.
+///
 /// It deliberately is not persisted: the durable receipt repository remains
 /// the sole cross-restart authority.
 pub struct AcpSessionBindingAdmission {
@@ -112,9 +116,10 @@ impl AcpSessionBindingAdmission {
 }
 
 /// The route-scoped, generation-bound authority carried by a durable
-/// completion after router validation. It holds no lock across I/O. The
-/// conversation service turns it into a short admission only immediately
-/// before it inserts the active turn.
+/// completion after router validation. It holds no lock itself; the durable
+/// consumer turns it into one bounded admission before its first receipt
+/// mutation and transfers that admission to the conversation service for the
+/// synchronous active-turn insertion.
 #[derive(Clone)]
 pub struct AcpSessionBindingTurnGate {
     binding: AcpSessionBinding,
@@ -143,9 +148,12 @@ impl AcpSessionBindingTurnGate {
         self.observation.wait_for_turn_claim().await;
     }
 
-    /// This is deliberately synchronous. Call it only immediately before the
-    /// runtime's synchronous turn insertion; no repository or network await
-    /// may occur while the returned admission is held.
+    /// Acquire the current route binding for one bounded durable completion.
+    /// The caller must hold the admission from its first receipt-affecting
+    /// operation through the synchronous active-turn insertion, then either
+    /// release it with [`AcpSessionBindingAdmission::release_after_turn_claim`]
+    /// or let its bounded pre-turn future drop it. This gives close/rebind a
+    /// real linearization point before any stale receipt mutation.
     pub fn try_admit_turn(&self) -> Option<AcpSessionBindingAdmission> {
         self.binding
             .try_acquire_admission_for(&self.lease, self.observation.clone())
@@ -254,10 +262,10 @@ impl AcpSessionBinding {
     }
 
     /// Acquire an admission only when the exact session and monotonically
-    /// minted generation carried by a dispatch are still live. The reader is
-    /// held only through the caller's synchronous active-turn insertion, so a
-    /// close/rebind either wins first (no turn) or waits for that insertion
-    /// (a pre-transition turn), never for stalled I/O.
+    /// minted generation carried by a dispatch are still live. The caller owns
+    /// it through its bounded pre-turn receipt work and synchronous active-turn
+    /// insertion, so a close/rebind either wins first (no receipt mutation) or
+    /// waits for that bounded pre-transition work.
     fn try_acquire_admission_for(
         &self,
         lease: &AcpSessionBindingLease,

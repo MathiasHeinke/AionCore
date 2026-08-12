@@ -2942,23 +2942,23 @@ impl ConversationService {
     /// Resume the canonical conversation from a verified in-process Hermes
     /// completion. `turn_id` was durably assigned by the completion receipt;
     /// project options originate from the already-attested task build and are
-    /// revalidated under a fresh native execution permit below. The optional
-    /// ACP admission holds the route-scoped session binding until the active
-    /// turn is synchronously inserted, then releases it before worker
-    /// execution so a rebind cannot race stale evidence into a new turn.
+    /// revalidated under a fresh native execution permit below. The caller
+    /// holds the ACP admission from the receipt claim through the active-turn
+    /// insertion; this method releases it immediately after that synchronous
+    /// insertion so a rebind cannot race stale evidence into a new turn.
     pub async fn run_command_eve_async_completion_turn(
         &self,
         request: ConversationAgentTurnRequest,
         turn_id: String,
         project_build_options: Option<BuildTaskOptions>,
-        turn_gate: &aionui_ai_agent::AcpSessionBindingTurnGate,
+        admission: &aionui_ai_agent::AcpSessionBindingAdmission,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
         if turn_id.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Agent turn_id must not be empty".into(),
             });
         }
-        self.run_agent_turn_with_transient_project_options(request, turn_id, project_build_options, Some(turn_gate))
+        self.run_agent_turn_with_transient_project_options(request, turn_id, project_build_options, Some(admission))
             .await
     }
 
@@ -2967,7 +2967,7 @@ impl ConversationService {
         request: ConversationAgentTurnRequest,
         turn_id: String,
         project_build_options: Option<BuildTaskOptions>,
-        turn_gate: Option<&aionui_ai_agent::AcpSessionBindingTurnGate>,
+        admission: Option<&aionui_ai_agent::AcpSessionBindingAdmission>,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
         if request.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
@@ -2996,15 +2996,6 @@ impl ConversationService {
             (None, None) => None,
         };
 
-        // The ACP gate is acquired only for this synchronous side effect. All
-        // lookup/revalidation I/O above happens without holding the session
-        // lifecycle reader, so close/rebind writers cannot be starved by DB.
-        let admission = turn_gate.and_then(|gate| gate.try_admit_turn());
-        if turn_gate.is_some() && admission.is_none() {
-            return Err(ConversationError::Busy {
-                reason: "ACP_SESSION_BINDING_INVALIDATED".into(),
-            });
-        }
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
         if let Some(admission) = admission.as_ref() {
             admission.release_after_turn_claim();

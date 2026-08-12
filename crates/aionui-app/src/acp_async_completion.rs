@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aionui_ai_agent::{
-    AcpSessionBindingTurnGate, CommandEveAsyncCompletionDispatch, CommandEveAsyncCompletionDispatchKind,
+    AcpSessionBindingAdmission, CommandEveAsyncCompletionDispatch, CommandEveAsyncCompletionDispatchKind,
     CommandEveAsyncCompletionResult, IWorkerTaskManager, types::BuildTaskOptions,
 };
 use aionui_common::AgentKillReason;
@@ -47,7 +47,7 @@ trait IAsyncCompletionTurnRunner: Send + Sync {
         request: ConversationAgentTurnRequest,
         turn_id: String,
         project_build_options: Option<BuildTaskOptions>,
-        turn_gate: &AcpSessionBindingTurnGate,
+        admission: &AcpSessionBindingAdmission,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError>;
 }
 
@@ -58,9 +58,9 @@ impl IAsyncCompletionTurnRunner for ConversationService {
         request: ConversationAgentTurnRequest,
         turn_id: String,
         project_build_options: Option<BuildTaskOptions>,
-        turn_gate: &AcpSessionBindingTurnGate,
+        admission: &AcpSessionBindingAdmission,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
-        self.run_command_eve_async_completion_turn(request, turn_id, project_build_options, turn_gate)
+        self.run_command_eve_async_completion_turn(request, turn_id, project_build_options, admission)
             .await
     }
 }
@@ -194,6 +194,13 @@ impl CommandEveAsyncCompletionConsumer {
             }
         };
         if let CommandEveAsyncCompletionDispatchKind::RejectSessionMismatch { bound_session_id } = &dispatch.kind {
+            // A terminal mismatch mutates the rejection receipt domain, so it
+            // needs the same live lease linearization as an ordinary claim.
+            // A close/rebind that wins first keeps Hermes retryable instead of
+            // recording a stale terminal rejection.
+            let Some(_admission) = dispatch.turn_gate.try_admit_turn() else {
+                return retryable("session_not_bound");
+            };
             return self
                 .reject_with_receipt(dispatch, bound_session_id, payload_sha256, "session_mismatch")
                 .await;
@@ -224,6 +231,16 @@ impl CommandEveAsyncCompletionConsumer {
             // update became visible. Keep the durable wake replayable.
             return retryable("session_not_bound");
         }
+
+        // This is the ordinary completion's durable linearization point. It
+        // immediately precedes the first receipt effect, so a queued dispatch
+        // cannot mutate state after close/rebind wins. The consumer owns this
+        // admission inside its bounded pre-turn future; timeout drops it
+        // before any receipt recovery runs.
+        let admission = match dispatch.turn_gate.try_admit_turn() {
+            Some(admission) => admission,
+            None => return retryable("session_not_bound"),
+        };
 
         let claim = match self
             .receipt_repo
@@ -309,7 +326,7 @@ impl CommandEveAsyncCompletionConsumer {
             },
             turn_id.clone(),
             dispatch.project_build_options.clone(),
-            &dispatch.turn_gate,
+            &admission,
         );
         let outcome = match tokio::time::timeout(self.turn_timeout, turn).await {
             Ok(outcome) => outcome,
@@ -1029,7 +1046,7 @@ mod tests {
             request: ConversationAgentTurnRequest,
             turn_id: String,
             _project_build_options: Option<BuildTaskOptions>,
-            _turn_gate: &AcpSessionBindingTurnGate,
+            _admission: &AcpSessionBindingAdmission,
         ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.result {
@@ -1231,12 +1248,12 @@ mod tests {
             .await
             .expect("the receipt claim must open its SQLite transaction");
 
-        // The real SQLite transaction above is still open, but it is no
-        // longer protected by a binding reader. A close therefore wins before
-        // the admission deadline and makes the deferred gate unable to insert
-        // a post-close turn.
+        // The real SQLite transaction above holds the bounded admission. A
+        // close must wait only until the pre-turn deadline cancels the
+        // transaction, then invalidate the deferred route gate before any
+        // turn can start.
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), binding.close_for_test("session-1"))
+            tokio::time::timeout(Duration::from_millis(250), binding.close_for_test("session-1"))
                 .await
                 .expect("close must not wait for a stalled pre-turn SQLite transaction"),
             "close must drop the live binding"
@@ -1267,6 +1284,83 @@ mod tests {
         .await
         .expect("the cancelled transaction must release the SQLite connection");
         assert_eq!(receipt_count, 0, "the dropped claim transaction must roll back");
+    }
+
+    #[tokio::test]
+    async fn closed_queued_session_mismatch_cannot_write_a_rejection_receipt() {
+        let repo = Arc::new(RecordingReceiptRepo::new(AsyncCompletionReceiptClaim::Conflict));
+        let (consumer, runner) = consumer_with(repo.clone(), StubTurnResult::Completed, Some("session-1")).await;
+        let binding = AcpSessionBinding::bound_for_test("session-1").await;
+        let (reply, receiver) = oneshot::channel();
+        let (mut queued, _unused_reply) = dispatch_for_binding("session-foreign", binding.clone(), reply, receiver);
+        queued.kind = CommandEveAsyncCompletionDispatchKind::RejectSessionMismatch {
+            bound_session_id: "session-1".to_owned(),
+        };
+
+        assert!(
+            binding.close_for_test("session-1").await,
+            "close must invalidate the queued lease"
+        );
+        assert_eq!(
+            consumer.consume(&queued).await,
+            CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "session_not_bound".to_owned(),
+            }
+        );
+        assert_eq!(
+            repo.claim_calls.load(Ordering::SeqCst),
+            0,
+            "closed work cannot claim a receipt"
+        );
+        assert!(
+            repo.recorded_rejections().is_empty(),
+            "closed work cannot write a rejection receipt"
+        );
+        assert!(
+            repo.recorded_acks().is_empty(),
+            "closed work cannot acknowledge a receipt"
+        );
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            0,
+            "closed work cannot start a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_queued_apply_cannot_claim_a_receipt() {
+        let repo = Arc::new(RecordingReceiptRepo::new(AsyncCompletionReceiptClaim::Claimed {
+            turn_id: "turn-closed-queued-apply".to_owned(),
+        }));
+        let (consumer, runner) = consumer_with(repo.clone(), StubTurnResult::Completed, Some("session-1")).await;
+        let binding = AcpSessionBinding::bound_for_test("session-1").await;
+        let (reply, receiver) = oneshot::channel();
+        let (queued, _unused_reply) = dispatch_for_binding("session-1", binding.clone(), reply, receiver);
+
+        assert!(
+            binding.close_for_test("session-1").await,
+            "close must invalidate the queued lease"
+        );
+        assert_eq!(
+            consumer.consume(&queued).await,
+            CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "session_not_bound".to_owned(),
+            }
+        );
+        assert_eq!(
+            repo.claim_calls.load(Ordering::SeqCst),
+            0,
+            "closed work cannot claim a receipt"
+        );
+        assert!(
+            repo.recorded_acks().is_empty(),
+            "closed work cannot acknowledge a receipt"
+        );
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            0,
+            "closed work cannot start a turn"
+        );
     }
 
     #[tokio::test]

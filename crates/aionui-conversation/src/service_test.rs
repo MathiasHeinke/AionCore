@@ -4490,6 +4490,7 @@ async fn project_bound_async_completion_revalidates_transient_context_and_uses_s
         .unwrap();
     transient.project_runtime_execution = None;
 
+    let admission = AcpSessionBinding::admission_for_test("session-async-completion").await;
     let outcome = svc
         .run_command_eve_async_completion_turn(
             ConversationAgentTurnRequest {
@@ -4502,7 +4503,7 @@ async fn project_bound_async_completion_revalidates_transient_context_and_uses_s
             },
             "turn_async_completion_1".into(),
             Some(transient.clone()),
-            &AcpSessionBinding::turn_gate_for_test("session-async-completion").await,
+            &admission,
         )
         .await
         .unwrap();
@@ -4549,6 +4550,7 @@ async fn project_bound_async_completion_rejects_mismatched_transient_context_bef
         .unwrap()
         .project_binding_revision += 1;
 
+    let admission = AcpSessionBinding::admission_for_test("session-async-completion").await;
     let error = svc
         .run_command_eve_async_completion_turn(
             ConversationAgentTurnRequest {
@@ -4561,7 +4563,7 @@ async fn project_bound_async_completion_rejects_mismatched_transient_context_bef
             },
             "turn_async_completion_mismatch".into(),
             Some(transient),
-            &AcpSessionBinding::turn_gate_for_test("session-async-completion").await,
+            &admission,
         )
         .await
         .unwrap_err();
