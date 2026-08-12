@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aionui_ai_agent::{
-    AcpSessionBindingAdmission, CommandEveAsyncCompletionDispatch, CommandEveAsyncCompletionDispatchKind,
+    AcpSessionBindingTurnGate, CommandEveAsyncCompletionDispatch, CommandEveAsyncCompletionDispatchKind,
     CommandEveAsyncCompletionResult, IWorkerTaskManager, types::BuildTaskOptions,
 };
 use aionui_common::AgentKillReason;
@@ -20,6 +20,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
 
 const ASYNC_COMPLETION_MAX_CONCURRENCY: usize = 4;
+const ASYNC_COMPLETION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const ASYNC_COMPLETION_TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ASYNC_COMPLETION_KILL_TIMEOUT: Duration = Duration::from_secs(20);
 #[async_trait::async_trait]
@@ -29,7 +30,7 @@ trait IAsyncCompletionTurnRunner: Send + Sync {
         request: ConversationAgentTurnRequest,
         turn_id: String,
         project_build_options: Option<BuildTaskOptions>,
-        admission: &AcpSessionBindingAdmission,
+        turn_gate: &AcpSessionBindingTurnGate,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError>;
 }
 
@@ -40,9 +41,9 @@ impl IAsyncCompletionTurnRunner for ConversationService {
         request: ConversationAgentTurnRequest,
         turn_id: String,
         project_build_options: Option<BuildTaskOptions>,
-        admission: &AcpSessionBindingAdmission,
+        turn_gate: &AcpSessionBindingTurnGate,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
-        self.run_command_eve_async_completion_turn(request, turn_id, project_build_options, admission)
+        self.run_command_eve_async_completion_turn(request, turn_id, project_build_options, turn_gate)
             .await
     }
 }
@@ -54,6 +55,7 @@ pub(crate) struct CommandEveAsyncCompletionConsumer {
     receipt_repo: Arc<dyn IAsyncCompletionReceiptRepository>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     owner_instance_id: String,
+    admission_timeout: Duration,
     turn_timeout: Duration,
     kill_timeout: Duration,
     max_concurrency: usize,
@@ -93,6 +95,7 @@ impl CommandEveAsyncCompletionConsumer {
             receipt_repo,
             task_manager,
             owner_instance_id,
+            admission_timeout: ASYNC_COMPLETION_ADMISSION_TIMEOUT,
             turn_timeout: ASYNC_COMPLETION_TURN_TIMEOUT,
             kill_timeout: ASYNC_COMPLETION_KILL_TIMEOUT,
             max_concurrency: ASYNC_COMPLETION_MAX_CONCURRENCY,
@@ -124,6 +127,32 @@ impl CommandEveAsyncCompletionConsumer {
     }
 
     async fn consume(&self, dispatch: &CommandEveAsyncCompletionDispatch) -> CommandEveAsyncCompletionResult {
+        let deadline = tokio::time::Instant::now() + self.admission_timeout;
+        let payload_sha256 = hex_sha256(dispatch.request.content.as_bytes());
+        let before_turn = self.consume_before_turn(dispatch, &payload_sha256);
+        tokio::pin!(before_turn);
+        let turn_claimed = dispatch.turn_gate.wait_for_turn_claim();
+        tokio::pin!(turn_claimed);
+
+        tokio::select! {
+            result = &mut before_turn => result,
+            _ = &mut turn_claimed => {
+                match tokio::time::timeout(self.turn_timeout, &mut before_turn).await {
+                    Ok(result) => result,
+                    Err(_) => self.resolve_post_turn_timeout(dispatch, &payload_sha256).await,
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                self.resolve_pre_turn_timeout(dispatch, &payload_sha256).await
+            }
+        }
+    }
+
+    async fn consume_before_turn(
+        &self,
+        dispatch: &CommandEveAsyncCompletionDispatch,
+        payload_sha256: &str,
+    ) -> CommandEveAsyncCompletionResult {
         let conversation = match self.conversation_repo.get(&dispatch.conversation_id).await {
             Ok(Some(conversation)) => conversation,
             Ok(None) => return rejected("conversation_not_found"),
@@ -132,10 +161,9 @@ impl CommandEveAsyncCompletionConsumer {
                 return retryable("conversation_lookup_failed");
             }
         };
-        let payload_sha256 = hex_sha256(dispatch.request.content.as_bytes());
         if let CommandEveAsyncCompletionDispatchKind::RejectSessionMismatch { bound_session_id } = &dispatch.kind {
             return self
-                .reject_with_receipt(dispatch, bound_session_id, &payload_sha256, "session_mismatch")
+                .reject_with_receipt(dispatch, bound_session_id, payload_sha256, "session_mismatch")
                 .await;
         }
         let proposed_turn_id = ConversationService::mint_turn_id();
@@ -171,7 +199,7 @@ impl CommandEveAsyncCompletionConsumer {
                 completion_id: &dispatch.request.completion_id,
                 conversation_id: &dispatch.conversation_id,
                 acp_session_id: &dispatch.request.session_id,
-                payload_sha256: &payload_sha256,
+                payload_sha256,
                 owner_instance_id: &self.owner_instance_id,
                 turn_id: &proposed_turn_id,
             })
@@ -187,12 +215,7 @@ impl CommandEveAsyncCompletionConsumer {
         let turn_id = match claim {
             AsyncCompletionReceiptClaim::AlreadyCompleted { turn_id } => {
                 if !self
-                    .record_ack(
-                        dispatch,
-                        &payload_sha256,
-                        AsyncCompletionAckStatus::AlreadyApplied,
-                        None,
-                    )
+                    .record_ack(dispatch, payload_sha256, AsyncCompletionAckStatus::AlreadyApplied, None)
                     .await
                 {
                     return retryable("ack_persistence_failed");
@@ -203,7 +226,7 @@ impl CommandEveAsyncCompletionConsumer {
                 if !self
                     .record_ack(
                         dispatch,
-                        &payload_sha256,
+                        payload_sha256,
                         AsyncCompletionAckStatus::Retryable,
                         Some("receipt_in_flight"),
                     )
@@ -222,7 +245,7 @@ impl CommandEveAsyncCompletionConsumer {
                 if !self
                     .record_ack(
                         dispatch,
-                        &payload_sha256,
+                        payload_sha256,
                         AsyncCompletionAckStatus::ExplicitUnknown,
                         Some("outcome_unknown_receipt"),
                     )
@@ -237,7 +260,7 @@ impl CommandEveAsyncCompletionConsumer {
                 // this attempt remains visible without poisoning the identity
                 // that legitimately owns the completion id.
                 return self
-                    .reject_with_receipt(dispatch, bound_session_id, &payload_sha256, "receipt_identity_conflict")
+                    .reject_with_receipt(dispatch, bound_session_id, payload_sha256, "receipt_identity_conflict")
                     .await;
             }
             AsyncCompletionReceiptClaim::Claimed { turn_id } => turn_id,
@@ -254,7 +277,7 @@ impl CommandEveAsyncCompletionConsumer {
             },
             turn_id.clone(),
             dispatch.project_build_options.clone(),
-            &dispatch.admission,
+            &dispatch.turn_gate,
         );
         let outcome = match tokio::time::timeout(self.turn_timeout, turn).await {
             Ok(outcome) => outcome,
@@ -275,12 +298,7 @@ impl CommandEveAsyncCompletionConsumer {
                     );
                 }
                 if !self
-                    .mark_unknown(
-                        dispatch,
-                        &payload_sha256,
-                        "turn_timeout",
-                        "outcome_unknown_turn_timeout",
-                    )
+                    .mark_unknown(dispatch, payload_sha256, "turn_timeout", "outcome_unknown_turn_timeout")
                     .await
                 {
                     return retryable("ack_persistence_failed");
@@ -290,6 +308,16 @@ impl CommandEveAsyncCompletionConsumer {
         };
 
         match outcome {
+            Err(ConversationError::Busy { reason }) if reason == "ACP_SESSION_BINDING_INVALIDATED" => {
+                self.resolve_claimed_without_turn(
+                    dispatch,
+                    payload_sha256,
+                    "session_not_bound",
+                    "binding_invalidated_before_turn",
+                    "outcome_unknown_binding_invalidated",
+                )
+                .await
+            }
             Err(ConversationError::Busy { reason: _ }) => {
                 let code = "conversation_busy";
                 match self
@@ -301,7 +329,7 @@ impl CommandEveAsyncCompletionConsumer {
                         if !self
                             .record_ack(
                                 dispatch,
-                                &payload_sha256,
+                                payload_sha256,
                                 AsyncCompletionAckStatus::Retryable,
                                 Some(code),
                             )
@@ -315,7 +343,7 @@ impl CommandEveAsyncCompletionConsumer {
                         if !self
                             .mark_unknown(
                                 dispatch,
-                                &payload_sha256,
+                                payload_sha256,
                                 "outcome_unknown_retry_transition",
                                 "outcome_unknown_retry_transition",
                             )
@@ -335,7 +363,7 @@ impl CommandEveAsyncCompletionConsumer {
                 {
                     Ok(true) => {
                         if !self
-                            .record_ack(dispatch, &payload_sha256, AsyncCompletionAckStatus::Accepted, None)
+                            .record_ack(dispatch, payload_sha256, AsyncCompletionAckStatus::Accepted, None)
                             .await
                         {
                             return retryable("ack_persistence_failed");
@@ -354,7 +382,7 @@ impl CommandEveAsyncCompletionConsumer {
                         if !self
                             .mark_unknown(
                                 dispatch,
-                                &payload_sha256,
+                                payload_sha256,
                                 "complete_transition_failed",
                                 "outcome_unknown_complete_transition",
                             )
@@ -368,7 +396,7 @@ impl CommandEveAsyncCompletionConsumer {
             }
             Ok(_) => {
                 if self
-                    .mark_unknown(dispatch, &payload_sha256, "turn_failed", "outcome_unknown_turn_failed")
+                    .mark_unknown(dispatch, payload_sha256, "turn_failed", "outcome_unknown_turn_failed")
                     .await
                 {
                     persisted_unknown("outcome_unknown_turn_failed")
@@ -379,7 +407,7 @@ impl CommandEveAsyncCompletionConsumer {
             Err(error) => {
                 warn!(error = %error, "ACP async completion turn failed");
                 if self
-                    .mark_unknown(dispatch, &payload_sha256, "turn_error", "outcome_unknown_turn_error")
+                    .mark_unknown(dispatch, payload_sha256, "turn_error", "outcome_unknown_turn_error")
                     .await
                 {
                     persisted_unknown("outcome_unknown_turn_error")
@@ -387,6 +415,101 @@ impl CommandEveAsyncCompletionConsumer {
                     retryable("ack_persistence_failed")
                 }
             }
+        }
+    }
+
+    async fn resolve_pre_turn_timeout(
+        &self,
+        dispatch: &CommandEveAsyncCompletionDispatch,
+        payload_sha256: &str,
+    ) -> CommandEveAsyncCompletionResult {
+        if dispatch.turn_gate.turn_claimed() {
+            return self.resolve_post_turn_timeout(dispatch, payload_sha256).await;
+        }
+        self.resolve_claimed_without_turn(
+            dispatch,
+            payload_sha256,
+            "admission_timeout_before_turn",
+            "admission_timeout_outcome_unknown",
+            "outcome_unknown_admission_timeout",
+        )
+        .await
+    }
+
+    /// Resolve a known-or-possible receipt claim that did not reach the
+    /// synchronous active-turn insertion. The conditional receipt transition
+    /// distinguishes a safely claimed row from a cancelled/no-op claim without
+    /// inventing a second ledger.
+    async fn resolve_claimed_without_turn(
+        &self,
+        dispatch: &CommandEveAsyncCompletionDispatch,
+        payload_sha256: &str,
+        retry_code: &str,
+        unknown_error_code: &str,
+        unknown_outcome_code: &str,
+    ) -> CommandEveAsyncCompletionResult {
+        match self
+            .receipt_repo
+            .mark_retryable(&dispatch.request.completion_id, &self.owner_instance_id, retry_code)
+            .await
+        {
+            Ok(true) => {
+                if self
+                    .record_ack(
+                        dispatch,
+                        payload_sha256,
+                        AsyncCompletionAckStatus::Retryable,
+                        Some(retry_code),
+                    )
+                    .await
+                {
+                    retryable(retry_code)
+                } else {
+                    retryable("ack_persistence_failed")
+                }
+            }
+            Ok(false) | Err(_) => {
+                // The claim may have committed as cancellation raced it; only
+                // the durable receipt can classify that side effect. Never
+                // manufacture a retry once the conditional transition fails.
+                if self
+                    .mark_unknown(dispatch, payload_sha256, unknown_error_code, unknown_outcome_code)
+                    .await
+                {
+                    persisted_unknown(unknown_outcome_code)
+                } else {
+                    retryable("ack_persistence_failed")
+                }
+            }
+        }
+    }
+
+    async fn resolve_post_turn_timeout(
+        &self,
+        dispatch: &CommandEveAsyncCompletionDispatch,
+        payload_sha256: &str,
+    ) -> CommandEveAsyncCompletionResult {
+        let cleanup = self
+            .task_manager
+            .kill_and_wait(&dispatch.conversation_id, Some(AgentKillReason::AgentErrorRecovery));
+        if tokio::time::timeout(self.kill_timeout, cleanup).await.is_err() {
+            warn!(
+                conversation_id = %dispatch.conversation_id,
+                "ACP async completion admission timed out while waiting for task termination"
+            );
+        }
+        if self
+            .mark_unknown(
+                dispatch,
+                payload_sha256,
+                "admission_timeout_after_turn",
+                "outcome_unknown_admission_timeout",
+            )
+            .await
+        {
+            persisted_unknown("outcome_unknown_admission_timeout")
+        } else {
+            retryable("ack_persistence_failed")
         }
     }
 
@@ -506,10 +629,10 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    use aionui_ai_agent::{AcpSessionBinding, AgentError, AgentInstance};
+    use aionui_ai_agent::{AcpSessionBinding, AcpSessionBindingTurnGate, AgentError, AgentInstance};
     use aionui_api_types::{
         AcpAsyncCompletionRequest, COMMAND_EVE_ASYNC_COMPLETION_VERSION, ConversationRuntimeStateKind,
         ConversationRuntimeSummary,
@@ -519,7 +642,7 @@ mod tests {
         AsyncCompletionReceiptRecord, DbError, SqliteAcpSessionRepository, SqliteConversationRepository,
         init_database_memory,
     };
-    use tokio::sync::oneshot;
+    use tokio::sync::{Barrier, oneshot};
 
     use super::*;
 
@@ -550,6 +673,7 @@ mod tests {
         rejections: Mutex<Vec<RecordedRejection>>,
         retryable_codes: Mutex<Vec<String>>,
         unknown_error_codes: Mutex<Vec<String>>,
+        claim_started: Option<Arc<Barrier>>,
     }
 
     impl RecordingReceiptRepo {
@@ -566,6 +690,7 @@ mod tests {
                 rejections: Mutex::new(Vec::new()),
                 retryable_codes: Mutex::new(Vec::new()),
                 unknown_error_codes: Mutex::new(Vec::new()),
+                claim_started: None,
             }
         }
 
@@ -583,6 +708,11 @@ mod tests {
                 .expect("unknown error recorder poisoned")
                 .clone()
         }
+
+        fn with_stalled_claim(mut self, claim_started: Arc<Barrier>) -> Self {
+            self.claim_started = Some(claim_started);
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -592,6 +722,10 @@ mod tests {
             _params: &ClaimAsyncCompletionReceiptParams<'_>,
         ) -> Result<AsyncCompletionReceiptClaim, DbError> {
             self.claim_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(claim_started) = &self.claim_started {
+                claim_started.wait().await;
+                std::future::pending::<()>().await;
+            }
             Ok(self.claim.clone())
         }
 
@@ -693,7 +827,7 @@ mod tests {
             request: ConversationAgentTurnRequest,
             turn_id: String,
             _project_build_options: Option<BuildTaskOptions>,
-            _admission: &AcpSessionBindingAdmission,
+            _turn_gate: &AcpSessionBindingTurnGate,
         ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.result {
@@ -824,7 +958,20 @@ mod tests {
         oneshot::Receiver<CommandEveAsyncCompletionResult>,
     ) {
         let (reply, receiver) = oneshot::channel();
-        let admission = AcpSessionBinding::admission_for_test(session_id).await;
+        let binding = AcpSessionBinding::bound_for_test(session_id).await;
+        dispatch_for_binding(session_id, binding, reply, receiver)
+    }
+
+    fn dispatch_for_binding(
+        session_id: &str,
+        binding: AcpSessionBinding,
+        reply: oneshot::Sender<CommandEveAsyncCompletionResult>,
+        receiver: oneshot::Receiver<CommandEveAsyncCompletionResult>,
+    ) -> (
+        CommandEveAsyncCompletionDispatch,
+        oneshot::Receiver<CommandEveAsyncCompletionResult>,
+    ) {
+        let lease = binding.lease().expect("test session lease");
         (
             CommandEveAsyncCompletionDispatch {
                 conversation_id: "conversation-1".to_owned(),
@@ -835,13 +982,61 @@ mod tests {
                     content: "Background work finished".to_owned(),
                 },
                 kind: CommandEveAsyncCompletionDispatchKind::Apply,
-                lease: admission.lease().clone(),
-                admission,
+                turn_gate: AcpSessionBindingTurnGate::new(binding, lease.clone()),
+                lease,
                 project_build_options: None,
                 reply,
             },
             receiver,
         )
+    }
+
+    #[tokio::test]
+    async fn stalled_preturn_claim_times_out_without_starving_close_or_starting_a_turn() {
+        let claim_started = Arc::new(Barrier::new(2));
+        let repo = Arc::new(
+            RecordingReceiptRepo::new(AsyncCompletionReceiptClaim::Claimed {
+                turn_id: "turn-stalled-claim".to_owned(),
+            })
+            .with_stalled_claim(Arc::clone(&claim_started)),
+        );
+        let (mut consumer, runner) = consumer_with(repo.clone(), StubTurnResult::Completed, Some("session-1")).await;
+        consumer.admission_timeout = Duration::from_millis(10);
+        let binding = AcpSessionBinding::bound_for_test("session-1").await;
+        let (reply, _receiver) = oneshot::channel();
+        let (completion, _unused_reply) = dispatch_for_binding("session-1", binding.clone(), reply, _receiver);
+
+        let consumer = Arc::new(consumer);
+        let completion_task = tokio::spawn({
+            let consumer = Arc::clone(&consumer);
+            async move { consumer.consume(&completion).await }
+        });
+        claim_started.wait().await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), binding.close_for_test("session-1"))
+                .await
+                .expect("close must not wait for a stalled pre-turn receipt claim"),
+            "close must drop the live binding"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), completion_task)
+                .await
+                .expect("pre-turn deadline must resolve the stalled claim")
+                .unwrap(),
+            CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "admission_timeout_before_turn".to_owned(),
+            }
+        );
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0, "no turn may start after close");
+        assert_eq!(repo.claim_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo.recorded_acks(),
+            vec![RecordedAck {
+                status: AsyncCompletionAckStatus::Retryable,
+                code: Some("admission_timeout_before_turn".to_owned()),
+            }]
+        );
     }
 
     #[test]

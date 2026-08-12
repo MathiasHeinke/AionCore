@@ -1,8 +1,8 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aionui_api_types::AcpAsyncCompletionRequest;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot};
 
 use crate::types::BuildTaskOptions;
 
@@ -44,17 +44,51 @@ struct AcpSessionBindingState {
     generation: u64,
 }
 
-/// A short-lived read permit over the current ACP binding. Holding this guard
-/// prevents `session/new|load|resume`, close, cancel and disconnect from
-/// changing the binding until the durable consumer has either rejected the
-/// wake or atomically admitted its turn. It deliberately is not persisted:
-/// the durable receipt repository remains the sole cross-restart authority.
+/// Transient observation shared between the bounded consumer and conversation
+/// service. It records only the in-memory active-turn linearization; durable
+/// completion state remains solely in the receipt repository.
+#[derive(Clone, Default)]
+struct AcpSessionBindingTurnObservation {
+    turn_claimed: Arc<AtomicBool>,
+    turn_claimed_notify: Arc<Notify>,
+}
+
+impl AcpSessionBindingTurnObservation {
+    pub fn turn_claimed(&self) -> bool {
+        self.turn_claimed.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_for_turn_claim(&self) {
+        loop {
+            if self.turn_claimed() {
+                return;
+            }
+            let notified = self.turn_claimed_notify.notified();
+            if self.turn_claimed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn mark_turn_claimed(&self) {
+        self.turn_claimed.store(true, Ordering::Release);
+        self.turn_claimed_notify.notify_waiters();
+    }
+}
+
+/// A very short-lived read permit over the exact current ACP binding. It is
+/// acquired only immediately before the synchronous active-turn insertion,
+/// never while database reads, receipt claim, or project revalidation await.
+/// It deliberately is not persisted: the durable receipt repository remains
+/// the sole cross-restart authority.
 pub struct AcpSessionBindingAdmission {
     lease: AcpSessionBindingLease,
     /// Held until the durable consumer has synchronously inserted the active
     /// turn.  The service then releases it immediately, rather than holding a
     /// session lifecycle transition for the duration of worker execution.
     barrier: Mutex<Option<OwnedRwLockReadGuard<()>>>,
+    observation: AcpSessionBindingTurnObservation,
 }
 
 impl AcpSessionBindingAdmission {
@@ -63,12 +97,58 @@ impl AcpSessionBindingAdmission {
     }
 
     /// Linearizes an already claimed completion with the conversation runtime
-    /// state.  This is deliberately idempotent: error paths and dispatch
-    /// drops still release the permit through `Drop`, while a successfully
-    /// admitted turn releases it immediately after insertion.
+    /// state. This is deliberately idempotent: error paths and dispatch drops
+    /// still release the permit through `Drop`, while a successfully admitted
+    /// turn releases it immediately after insertion.
     pub fn release_after_turn_claim(&self) {
+        self.observation.mark_turn_claimed();
+        self.release_barrier();
+    }
+
+    fn release_barrier(&self) {
         let barrier = self.barrier.lock().ok().and_then(|mut held| held.take());
         drop(barrier);
+    }
+}
+
+/// The route-scoped, generation-bound authority carried by a durable
+/// completion after router validation. It holds no lock across I/O. The
+/// conversation service turns it into a short admission only immediately
+/// before it inserts the active turn.
+#[derive(Clone)]
+pub struct AcpSessionBindingTurnGate {
+    binding: AcpSessionBinding,
+    lease: AcpSessionBindingLease,
+    observation: AcpSessionBindingTurnObservation,
+}
+
+impl AcpSessionBindingTurnGate {
+    pub fn new(binding: AcpSessionBinding, lease: AcpSessionBindingLease) -> Self {
+        Self {
+            binding,
+            lease,
+            observation: AcpSessionBindingTurnObservation::default(),
+        }
+    }
+
+    pub fn lease(&self) -> &AcpSessionBindingLease {
+        &self.lease
+    }
+
+    pub fn turn_claimed(&self) -> bool {
+        self.observation.turn_claimed()
+    }
+
+    pub async fn wait_for_turn_claim(&self) {
+        self.observation.wait_for_turn_claim().await;
+    }
+
+    /// This is deliberately synchronous. Call it only immediately before the
+    /// runtime's synchronous turn insertion; no repository or network await
+    /// may occur while the returned admission is held.
+    pub fn try_admit_turn(&self) -> Option<AcpSessionBindingAdmission> {
+        self.binding
+            .try_acquire_admission_for(&self.lease, self.observation.clone())
     }
 }
 
@@ -145,10 +225,9 @@ impl AcpSessionBinding {
             .unwrap_or(false)
     }
 
-    /// Atomically acquire the exact live binding for one durable completion.
-    /// A writer transition either wins first (so this returns `None` and the
-    /// router replies retryable) or waits until this admission has completed;
-    /// there is no validation-to-claim or validation-to-turn interstice.
+    /// Atomically acquire the live binding for a test or non-correlated caller.
+    /// Production durable work uses [`Self::try_acquire_admission_for`] with
+    /// the route's already-dispatched lease.
     pub fn try_acquire_admission(&self) -> Option<AcpSessionBindingAdmission> {
         if self.transition_pending.load(Ordering::Acquire) != 0 {
             return None;
@@ -170,6 +249,44 @@ impl AcpSessionBinding {
         lease.map(|lease| AcpSessionBindingAdmission {
             lease,
             barrier: Mutex::new(Some(barrier)),
+            observation: AcpSessionBindingTurnObservation::default(),
+        })
+    }
+
+    /// Acquire an admission only when the exact session and monotonically
+    /// minted generation carried by a dispatch are still live. The reader is
+    /// held only through the caller's synchronous active-turn insertion, so a
+    /// close/rebind either wins first (no turn) or waits for that insertion
+    /// (a pre-transition turn), never for stalled I/O.
+    fn try_acquire_admission_for(
+        &self,
+        lease: &AcpSessionBindingLease,
+        observation: AcpSessionBindingTurnObservation,
+    ) -> Option<AcpSessionBindingAdmission> {
+        if self.transition_pending.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        let barrier = Arc::clone(&self.admission_barrier).try_read_owned().ok()?;
+        if self.transition_pending.load(Ordering::Acquire) != 0 {
+            drop(barrier);
+            return None;
+        }
+        let matches = self
+            .state
+            .lock()
+            .map(|state| {
+                state.bound_session_id.as_deref() == Some(lease.session_id.as_str())
+                    && state.generation == lease.generation
+            })
+            .unwrap_or(false);
+        if !matches {
+            drop(barrier);
+            return None;
+        }
+        Some(AcpSessionBindingAdmission {
+            lease: lease.clone(),
+            barrier: Mutex::new(Some(barrier)),
+            observation,
         })
     }
 
@@ -189,17 +306,15 @@ impl AcpSessionBinding {
 
     /// Unbind a matching closed session, advancing the generation. Returns
     /// whether a live binding was dropped.
-    pub(crate) async fn unbind_matching(&self, session_id: &str) -> bool {
+    pub(crate) async fn unbind_matching(&self, session_id: &str) -> Result<bool, ()> {
         let _transition = self.transition().await;
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
+        let mut state = self.state.lock().map_err(|_| ())?;
         if state.bound_session_id.as_deref() != Some(session_id) {
-            return false;
+            return Ok(false);
         }
         Self::advance(&mut state);
         state.bound_session_id = None;
-        true
+        Ok(true)
     }
 
     /// Invalidate the binding and advance the generation. Driven at the
@@ -249,6 +364,32 @@ impl AcpSessionBinding {
         binding.try_acquire_admission().expect("test admission")
     }
 
+    /// Test-only positive binding fixture for cross-crate durable-completion
+    /// tests. Production bindings remain owned by the ACP extension router.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn bound_for_test(session_id: &str) -> Self {
+        let binding = Self::default();
+        binding.bind(session_id).await.expect("test session binding");
+        binding
+    }
+
+    /// Test-only deferred admission fixture which mirrors a routed durable
+    /// completion: it snapshots a positive binding but does not hold a reader
+    /// permit while the test performs simulated repository work.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn turn_gate_for_test(session_id: &str) -> AcpSessionBindingTurnGate {
+        let binding = Self::bound_for_test(session_id).await;
+        let lease = binding.lease().expect("test session lease");
+        AcpSessionBindingTurnGate::new(binding, lease)
+    }
+
+    /// Test-only close operation used to prove that an unbounded pre-turn
+    /// future cannot starve the lifecycle writer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn close_for_test(&self, session_id: &str) -> bool {
+        self.unbind_matching(session_id).await.expect("test session close")
+    }
+
     fn advance(state: &mut AcpSessionBindingState) {
         if let Some(generation) = state.generation.checked_add(1) {
             state.generation = generation;
@@ -284,13 +425,12 @@ pub struct CommandEveAsyncCompletionDispatch {
     pub conversation_id: String,
     pub request: AcpAsyncCompletionRequest,
     pub kind: CommandEveAsyncCompletionDispatchKind,
-    /// Admission permit minted by the router for the exact positive ACP
-    /// binding. It is held through the durable receipt transition and the
-    /// active-turn insertion, so a lifecycle rebind cannot interleave stale
-    /// evidence with either operation.
-    pub admission: AcpSessionBindingAdmission,
+    /// Route-scoped generation authority for a deferred, short turn admission.
+    /// It intentionally holds no reader permit across database lookup, receipt
+    /// claim, or project revalidation.
+    pub turn_gate: AcpSessionBindingTurnGate,
     /// Snapshot retained for receipt correlation and test fixtures. The live
-    /// authority is `admission`, not a separately rechecked callback.
+    /// authority is `turn_gate`, not a separately rechecked callback.
     pub lease: AcpSessionBindingLease,
     pub project_build_options: Option<BuildTaskOptions>,
     pub reply: oneshot::Sender<CommandEveAsyncCompletionResult>,
@@ -382,5 +522,27 @@ mod tests {
         assert_ne!(current, old_lease);
         assert!(!binding.validate_lease(&old_lease));
         assert!(binding.validate_lease(&current));
+    }
+
+    #[tokio::test]
+    async fn close_fence_invalidates_a_deferred_turn_gate_without_waiting_for_preturn_work() {
+        let binding = AcpSessionBinding::default();
+        binding.bind("session-1").await.unwrap();
+        let lease = binding.lease().expect("positive binding");
+        let turn_gate = super::AcpSessionBindingTurnGate::new(binding.clone(), lease);
+
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            binding.unbind_matching("session-1"),
+        )
+        .await
+        .expect("close must not wait for deferred pre-turn work")
+        .unwrap();
+
+        assert!(closed);
+        assert!(
+            turn_gate.try_admit_turn().is_none(),
+            "a close fence must win before a deferred completion inserts a turn"
+        );
     }
 }

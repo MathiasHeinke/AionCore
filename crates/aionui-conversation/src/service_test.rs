@@ -4502,7 +4502,7 @@ async fn project_bound_async_completion_revalidates_transient_context_and_uses_s
             },
             "turn_async_completion_1".into(),
             Some(transient.clone()),
-            &AcpSessionBinding::admission_for_test("session-async-completion").await,
+            &AcpSessionBinding::turn_gate_for_test("session-async-completion").await,
         )
         .await
         .unwrap();
@@ -4561,7 +4561,7 @@ async fn project_bound_async_completion_rejects_mismatched_transient_context_bef
             },
             "turn_async_completion_mismatch".into(),
             Some(transient),
-            &AcpSessionBinding::admission_for_test("session-async-completion").await,
+            &AcpSessionBinding::turn_gate_for_test("session-async-completion").await,
         )
         .await
         .unwrap_err();

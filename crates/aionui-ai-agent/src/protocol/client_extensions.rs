@@ -187,16 +187,22 @@ impl AcpClientExtensionRouter {
         cancel_pending_terminal(cancelled_terminal, "session_rebinding");
     }
 
-    /// Unbind a successfully closed session and cancel its outstanding reads.
-    pub(crate) async fn unbind_session(&self, session_id: &str) {
-        if !self.session_binding.unbind_matching(session_id).await {
-            return;
+    /// Fence a close before its RPC crosses the transport. The original
+    /// session id is retained by the caller for that RPC, while completion
+    /// admission is already fail-closed and every pre-close lease is stale.
+    /// A failed close leaves the route unbound; reopening must be a positive
+    /// `session/new|load|resume` bind, never restoration of an old lease.
+    pub(crate) async fn begin_session_close(&self, session_id: &str) -> Result<(), AcpError> {
+        if !self
+            .session_binding
+            .unbind_matching(session_id)
+            .await
+            .map_err(|_| local_binding_error())?
+        {
+            return Ok(());
         }
         let (cancelled, cancelled_terminal) = {
-            let Ok(mut state) = self.state.lock() else {
-                warn!("ACP client extension state unavailable while closing session");
-                return;
-            };
+            let mut state = self.state.lock().map_err(|_| local_binding_error())?;
             (
                 state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
                 state
@@ -208,6 +214,7 @@ impl AcpClientExtensionRouter {
         };
         cancel_pending(cancelled, "session_closed");
         cancel_pending_terminal(cancelled_terminal, "session_closed");
+        Ok(())
     }
 
     /// Cancel all pending requests before transport shutdown/disconnect.
@@ -440,11 +447,10 @@ impl AcpClientExtensionRouter {
             respond_async_completion_rejected(respond, "invalid_content");
             return;
         }
-        let Some(admission) = self.session_binding.try_acquire_admission() else {
+        let Some(lease) = self.session_binding.lease() else {
             respond_async_completion_retryable(respond, "session_not_bound");
             return;
         };
-        let lease = admission.lease().clone();
 
         let Some(route) = self.async_completion_route.clone() else {
             respond_async_completion_retryable(respond, "consumer_unavailable");
@@ -472,7 +478,7 @@ impl AcpClientExtensionRouter {
             conversation_id: route.conversation_id,
             request,
             kind,
-            admission,
+            turn_gate: crate::AcpSessionBindingTurnGate::new(self.session_binding.clone(), lease.clone()),
             lease,
             project_build_options: route.project_build_options,
             reply,
@@ -1130,7 +1136,7 @@ mod tests {
         assert!(third.generation() > second.generation());
         assert!(!router.session_binding.validate_lease(&second));
 
-        router.unbind_session("session-2").await;
+        router.begin_session_close("session-2").await.unwrap();
         assert!(router.session_binding.lease().is_none());
         assert!(!router.session_binding.validate_lease(&third));
 
@@ -1180,6 +1186,51 @@ mod tests {
             .unwrap();
         let response: AcpAsyncCompletionResponse = serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
         assert_eq!(response.status, AcpAsyncCompletionAckStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn close_fence_blocks_a_deferred_completion_before_it_can_admit_a_turn() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(4);
+        let router = AcpClientExtensionRouter::new(event_tx).with_async_completion(completion_route(completion_tx));
+        router.enable_async_completion().unwrap();
+        router.bind_session("session-1").await.unwrap();
+
+        let response = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let deferred = completion_rx.recv().await.expect("routed completion");
+        assert_eq!(deferred.kind, CommandEveAsyncCompletionDispatchKind::Apply);
+
+        // `close_session` invokes this fence before its RPC. The dispatched
+        // completion has not reached the synchronous turn insertion yet, so
+        // it must be unable to cross the close boundary afterwards.
+        router.begin_session_close("session-1").await.unwrap();
+        assert!(router.session_binding.lease().is_none());
+        assert!(deferred.turn_gate.try_admit_turn().is_none());
+
+        deferred
+            .reply
+            .send(CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "session_not_bound".to_owned(),
+            })
+            .unwrap();
+        let response: AcpAsyncCompletionResponse = serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
+        assert_eq!(response.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(response.code.as_deref(), Some("session_not_bound"));
+
+        let post_close = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let post_close: AcpAsyncCompletionResponse =
+            serde_json::from_value(post_close.await.unwrap().unwrap()).unwrap();
+        assert_eq!(post_close.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(post_close.code.as_deref(), Some("session_not_bound"));
+        assert!(completion_rx.try_recv().is_err(), "close must prevent another dispatch");
     }
 
     #[tokio::test]
@@ -1322,7 +1373,7 @@ mod tests {
             serde_json::to_value(request("request-close", "session-2")).unwrap(),
         );
         let _ = event_rx.recv().await.unwrap();
-        router.unbind_session("session-2").await;
+        router.begin_session_close("session-2").await.unwrap();
         assert_eq!(router.bound_session_id(), None);
         assert!(closed.await.unwrap().is_err());
 

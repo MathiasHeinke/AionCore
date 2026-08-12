@@ -300,8 +300,11 @@ impl AcpProtocol {
     /// Close an ACP session.
     pub async fn close_session(&self, req: CloseSessionRequest) -> Result<CloseSessionResponse, AcpError> {
         let session_id = req.session_id.0.clone();
+        // Fence durable completions before the close RPC is sent. The request
+        // still carries the original positive session id, but every new wake
+        // observes `session_not_bound` while the transport close is in flight.
+        self.client_extensions.begin_session_close(session_id.as_ref()).await?;
         let response = self.send_request(req, AGENT_METHOD_NAMES.session_close).await?;
-        self.client_extensions.unbind_session(session_id.as_ref()).await;
         Ok(response)
     }
 
@@ -870,6 +873,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    use crate::{AcpSessionBinding, CommandEveAsyncCompletionRoute};
+
     #[cfg(unix)]
     const MOCK_ACP_AGENT: &str = r#"
 import json
@@ -918,6 +923,58 @@ for line in sys.stdin:
         }), flush=True)
 "#;
 
+    /// A local ACP peer that sends a real agent-to-client completion request
+    /// while its `session/close` response is deliberately still in flight.
+    /// The marker records both wire messages, so the regression proves the
+    /// close request retained its original session id and the concurrent wake
+    /// was answered without entering the consumer channel.
+    #[cfg(unix)]
+    const CLOSE_RACE_MOCK_ACP_AGENT: &str = r#"
+import json
+import pathlib
+import sys
+
+marker = pathlib.Path(sys.argv[1])
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+    elif method == "session/new":
+        result = {"sessionId": "close-race-session"}
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+    elif method == "session/close":
+        completion_id = "close-race-completion"
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": completion_id,
+            "method": "_command_eve/async_completion",
+            "params": {
+                "version": "command-eve-async-completion/v1",
+                "completion_id": "completion-close-race",
+                "session_id": "close-race-session",
+                "content": "must not enter after close fence"
+            }
+        }), flush=True)
+
+        while True:
+            response_line = sys.stdin.readline()
+            if not response_line:
+                sys.exit(1)
+            response = json.loads(response_line)
+            if response.get("id") == completion_id:
+                marker.write_text(json.dumps({"close": message, "completion": response}))
+                break
+
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": {}}), flush=True)
+    elif request_id is not None:
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": None}), flush=True)
+"#;
+
     #[cfg(unix)]
     async fn connect_mock_agent(
         marker: Option<&std::path::Path>,
@@ -952,6 +1009,54 @@ for line in sys.stdin:
             .await
             .expect("connect mock ACP agent");
         (protocol, event_rx, child)
+    }
+
+    #[cfg(unix)]
+    async fn connect_close_race_mock_agent(
+        marker: &std::path::Path,
+    ) -> (
+        AcpProtocol,
+        mpsc::Receiver<crate::CommandEveAsyncCompletionDispatch>,
+        tokio::process::Child,
+    ) {
+        use std::process::Stdio;
+
+        let python = which::which("python3").expect("python3 is required for ACP lifecycle regression tests");
+        let mut child = tokio::process::Command::new(python)
+            .arg("-u")
+            .arg("-c")
+            .arg(CLOSE_RACE_MOCK_ACP_AGENT)
+            .arg(marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn close-race mock ACP agent");
+        let stdin = child.stdin.take().expect("mock stdin");
+        let stdout = child.stdout.take().expect("mock stdout");
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let (permission_tx, _permission_rx) = mpsc::channel(4);
+        let (notification_tx, _notification_rx) = mpsc::channel(4);
+        let (completion_tx, completion_rx) = mpsc::channel(4);
+        let protocol = AcpProtocol::connect_with_optional_async_completion(
+            stdin,
+            stdout,
+            event_tx,
+            permission_tx,
+            notification_tx,
+            Some(CommandEveAsyncCompletionRoute {
+                conversation_id: "conversation-close-race".to_owned(),
+                sender: completion_tx,
+                project_build_options: None,
+                session_binding: AcpSessionBinding::default(),
+            }),
+        )
+        .await
+        .expect("connect close-race mock ACP agent");
+        protocol
+            .enable_async_completion()
+            .expect("enable close-race durable completion route");
+        (protocol, completion_rx, child)
     }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
@@ -1048,6 +1153,50 @@ for line in sys.stdin:
             .close_session(CloseSessionRequest::new("resumed-session"))
             .await
             .expect("session/close");
+        assert_eq!(protocol.client_extensions.bound_session_id(), None);
+
+        drop(protocol);
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_session_fences_a_concurrent_completion_before_the_close_rpc_returns() {
+        let temp = tempfile::tempdir().expect("temporary close-race directory");
+        let marker = temp.path().join("close-race.json");
+        let (protocol, mut completion_rx, mut child) = connect_close_race_mock_agent(&marker).await;
+
+        let created = protocol
+            .new_session(NewSessionRequest::new(temp.path()))
+            .await
+            .expect("bind close-race session");
+        assert_eq!(created.session_id.0.as_ref(), "close-race-session");
+
+        // The peer injects the completion before it releases the close RPC.
+        // If the close fence were after transport, this would enter
+        // `completion_rx`; a retryable wire receipt proves it did not.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            protocol.close_session(CloseSessionRequest::new("close-race-session")),
+        )
+        .await
+        .expect("concurrent close must not deadlock")
+        .expect("session/close response");
+
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker).expect("close-race marker")).expect("valid marker JSON");
+        assert_eq!(wire["close"]["params"]["sessionId"], "close-race-session");
+        assert_eq!(wire["completion"]["result"]["status"], "retryable");
+        assert_eq!(wire["completion"]["result"]["code"], "session_not_bound");
+        assert!(
+            completion_rx.try_recv().is_err(),
+            "a completion arriving during close RPC must never reach turn admission"
+        );
         assert_eq!(protocol.client_extensions.bound_session_id(), None);
 
         drop(protocol);

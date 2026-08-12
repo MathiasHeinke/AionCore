@@ -509,7 +509,7 @@ mod tests {
             serde_json::to_value(request("request-close", "session-2")).unwrap(),
         );
         let _ = event_rx.recv().await.unwrap();
-        router.unbind_session("session-2").await;
+        router.begin_session_close("session-2").await.unwrap();
         assert!(closed.await.unwrap().is_err());
 
         router.bind_session("session-3").await.unwrap();
