@@ -2,7 +2,9 @@ use aionui_common::now_ms;
 use sqlx::{FromRow, SqlitePool};
 
 use super::async_completion_receipt::{
-    AsyncCompletionReceiptClaim, ClaimAsyncCompletionReceiptParams, IAsyncCompletionReceiptRepository,
+    AsyncCompletionAckStatus, AsyncCompletionReceiptClaim, AsyncCompletionReceiptRecord,
+    ClaimAsyncCompletionReceiptParams, IAsyncCompletionReceiptRepository, RecordAsyncCompletionAckParams,
+    RecordRejectedAsyncCompletionReceiptParams,
 };
 use crate::DbError;
 
@@ -191,6 +193,91 @@ impl IAsyncCompletionReceiptRepository for SqliteAsyncCompletionReceiptRepositor
         .await?;
         Ok(result.rows_affected() == 1)
     }
+
+    async fn record_ack(&self, params: &RecordAsyncCompletionAckParams<'_>) -> Result<bool, DbError> {
+        let now = now_ms();
+        let allowed_previous = match params.status {
+            AsyncCompletionAckStatus::Accepted => &["", "retryable", "accepted"][..],
+            AsyncCompletionAckStatus::AlreadyApplied => &["", "retryable", "accepted", "already_applied"][..],
+            AsyncCompletionAckStatus::Retryable => &["", "retryable"][..],
+            AsyncCompletionAckStatus::ExplicitUnknown => &["", "retryable", "explicit_unknown"][..],
+        };
+        let allowed_state = match params.status {
+            AsyncCompletionAckStatus::Accepted | AsyncCompletionAckStatus::AlreadyApplied => "completed",
+            AsyncCompletionAckStatus::Retryable => "processing_or_pending",
+            AsyncCompletionAckStatus::ExplicitUnknown => "unknown",
+        };
+        let result = sqlx::query(
+            "UPDATE command_eve_async_completion_receipts \
+             SET last_ack_status = ?, last_ack_code = ?, last_ack_at = ?, updated_at = ? \
+             WHERE completion_id = ? AND conversation_id = ? AND acp_session_id = ? AND payload_sha256 = ? \
+               AND ((? = 'processing_or_pending' AND state IN ('processing', 'pending')) OR state = ?) \
+               AND COALESCE(last_ack_status, '') IN (?, ?, ?, ?)",
+        )
+        .bind(params.status.as_str())
+        .bind(params.code)
+        .bind(now)
+        .bind(now)
+        .bind(params.completion_id)
+        .bind(params.conversation_id)
+        .bind(params.acp_session_id)
+        .bind(params.payload_sha256)
+        .bind(allowed_state)
+        .bind(allowed_state)
+        .bind(allowed_previous.first().copied().unwrap_or("__none__"))
+        .bind(allowed_previous.get(1).copied().unwrap_or("__none__"))
+        .bind(allowed_previous.get(2).copied().unwrap_or("__none__"))
+        .bind(allowed_previous.get(3).copied().unwrap_or("__none__"))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn record_rejected(&self, params: &RecordRejectedAsyncCompletionReceiptParams<'_>) -> Result<bool, DbError> {
+        let now = now_ms();
+        let recorded = sqlx::query(
+            "INSERT INTO command_eve_async_completion_rejections \
+             (conversation_id, bound_acp_session_id, requested_acp_session_id, completion_id, \
+              payload_sha256, code, attempt_count, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?) \
+             ON CONFLICT (conversation_id, bound_acp_session_id, requested_acp_session_id, \
+                          completion_id, payload_sha256, code) \
+             DO UPDATE SET attempt_count = attempt_count + 1, updated_at = excluded.updated_at",
+        )
+        .bind(params.conversation_id)
+        .bind(params.bound_acp_session_id)
+        .bind(params.requested_acp_session_id)
+        .bind(params.completion_id)
+        .bind(params.payload_sha256)
+        .bind(params.code)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(recorded.rows_affected() == 1)
+    }
+
+    async fn list_for_conversation(&self, conversation_id: &str) -> Result<Vec<AsyncCompletionReceiptRecord>, DbError> {
+        let rows = sqlx::query_as::<_, AsyncCompletionReceiptRecord>(
+            "SELECT 'execution:' || completion_id AS projection_id, completion_id, conversation_id, \
+                    acp_session_id, state, turn_id, attempt_count, last_error_code, \
+                    last_ack_status, last_ack_code, created_at, updated_at, completed_at, last_ack_at \
+             FROM command_eve_async_completion_receipts WHERE conversation_id = ? \
+             UNION ALL \
+             SELECT 'rejection:' || CAST(id AS TEXT) AS projection_id, completion_id, conversation_id, \
+                    bound_acp_session_id AS acp_session_id, 'rejected' AS state, NULL AS turn_id, \
+                    attempt_count, code AS last_error_code, 'rejected' AS last_ack_status, \
+                    code AS last_ack_code, created_at, updated_at, NULL AS completed_at, updated_at AS last_ack_at \
+             FROM command_eve_async_completion_rejections WHERE conversation_id = ? \
+             ORDER BY updated_at DESC, projection_id ASC \
+             LIMIT 100",
+        )
+        .bind(conversation_id)
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -313,5 +400,186 @@ mod tests {
             repo.claim(&conflicting).await.unwrap(),
             AsyncCompletionReceiptClaim::Conflict
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_outcomes_are_persistent_and_conversation_scoped() {
+        let repo = setup().await;
+        let claim = claim_params("completion-ack", "owner-1", "turn-ack");
+        assert!(matches!(
+            repo.claim(&claim).await.unwrap(),
+            AsyncCompletionReceiptClaim::Claimed { .. }
+        ));
+        assert!(
+            repo.mark_retryable("completion-ack", "owner-1", "conversation_busy")
+                .await
+                .unwrap()
+        );
+        assert!(
+            repo.record_ack(&RecordAsyncCompletionAckParams {
+                completion_id: "completion-ack",
+                conversation_id: "conversation-1",
+                acp_session_id: "session-1",
+                payload_sha256: "payload-1",
+                status: AsyncCompletionAckStatus::Retryable,
+                code: Some("conversation_busy"),
+            })
+            .await
+            .unwrap()
+        );
+
+        let rows = repo.list_for_conversation("conversation-1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].completion_id, "completion-ack");
+        assert_eq!(rows[0].state, "pending");
+        assert_eq!(rows[0].last_ack_status.as_deref(), Some("retryable"));
+        assert_eq!(rows[0].last_ack_code.as_deref(), Some("conversation_busy"));
+        assert!(rows[0].last_ack_at.is_some());
+        assert!(
+            repo.list_for_conversation("conversation-foreign")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_updates_are_identity_scoped_and_monotone() {
+        let repo = setup().await;
+        let claim = claim_params("completion-monotone", "owner-1", "turn-monotone");
+        assert!(matches!(
+            repo.claim(&claim).await.unwrap(),
+            AsyncCompletionReceiptClaim::Claimed { .. }
+        ));
+        assert!(
+            repo.mark_completed("completion-monotone", "owner-1", "turn-monotone")
+                .await
+                .unwrap()
+        );
+
+        let accepted = RecordAsyncCompletionAckParams {
+            completion_id: "completion-monotone",
+            conversation_id: "conversation-1",
+            acp_session_id: "session-1",
+            payload_sha256: "payload-1",
+            status: AsyncCompletionAckStatus::Accepted,
+            code: None,
+        };
+        assert!(repo.record_ack(&accepted).await.unwrap());
+        assert!(
+            repo.record_ack(&RecordAsyncCompletionAckParams {
+                status: AsyncCompletionAckStatus::AlreadyApplied,
+                ..accepted
+            })
+            .await
+            .unwrap()
+        );
+        assert!(!repo.record_ack(&accepted).await.unwrap());
+        assert!(
+            !repo
+                .record_ack(&RecordAsyncCompletionAckParams {
+                    conversation_id: "conversation-foreign",
+                    status: AsyncCompletionAckStatus::AlreadyApplied,
+                    ..accepted
+                })
+                .await
+                .unwrap()
+        );
+
+        let rows = repo.list_for_conversation("conversation-1").await.unwrap();
+        assert_eq!(rows[0].last_ack_status.as_deref(), Some("already_applied"));
+    }
+
+    #[tokio::test]
+    async fn rejected_receipts_are_real_idempotent_and_never_poison_foreign_identity() {
+        let repo = setup().await;
+        let rejected = RecordRejectedAsyncCompletionReceiptParams {
+            completion_id: "completion-rejected",
+            conversation_id: "conversation-1",
+            bound_acp_session_id: "session-1",
+            requested_acp_session_id: "foreign-session",
+            payload_sha256: "rejected-payload",
+            code: "session_mismatch",
+        };
+        assert!(repo.record_rejected(&rejected).await.unwrap());
+        assert!(repo.record_rejected(&rejected).await.unwrap());
+
+        // A rejection event has a separate identity domain and therefore
+        // cannot reserve the completion id used by a later legitimate wake.
+        assert_eq!(
+            repo.claim(&claim_params("completion-rejected", "owner-1", "turn-legitimate"))
+                .await
+                .unwrap(),
+            AsyncCompletionReceiptClaim::Claimed {
+                turn_id: "turn-legitimate".to_owned()
+            }
+        );
+
+        let rows = repo.list_for_conversation("conversation-1").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let rejection = rows
+            .iter()
+            .find(|row| row.state == "rejected")
+            .expect("rejection projection");
+        assert!(rejection.projection_id.starts_with("rejection:"));
+        assert_eq!(rejection.completion_id, "completion-rejected");
+        assert_eq!(rejection.acp_session_id, "session-1");
+        assert_eq!(rejection.turn_id, None);
+        assert_eq!(rejection.attempt_count, 2);
+        assert_eq!(rejection.last_error_code.as_deref(), Some("session_mismatch"));
+        assert_eq!(rejection.last_ack_status.as_deref(), Some("rejected"));
+        assert_eq!(rejection.last_ack_code.as_deref(), Some("session_mismatch"));
+
+        let stored_identity: (String, String) = sqlx::query_as(
+            "SELECT bound_acp_session_id, requested_acp_session_id \
+             FROM command_eve_async_completion_rejections \
+             WHERE completion_id = ?",
+        )
+        .bind("completion-rejected")
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_identity.0, "session-1");
+        assert_eq!(stored_identity.1, "foreign-session");
+
+        let legitimate = rows
+            .iter()
+            .find(|row| row.state == "processing")
+            .expect("legitimate execution receipt");
+        assert_eq!(legitimate.projection_id, "execution:completion-rejected");
+        assert_eq!(legitimate.turn_id.as_deref(), Some("turn-legitimate"));
+    }
+
+    #[tokio::test]
+    async fn explicit_unknown_ack_is_persisted_for_the_matching_unknown_receipt() {
+        let repo = setup().await;
+        let claim = claim_params("completion-unknown", "owner-1", "turn-unknown");
+        assert!(matches!(
+            repo.claim(&claim).await.unwrap(),
+            AsyncCompletionReceiptClaim::Claimed { .. }
+        ));
+        assert!(
+            repo.mark_unknown("completion-unknown", "owner-1", "turn_timeout")
+                .await
+                .unwrap()
+        );
+        assert!(
+            repo.record_ack(&RecordAsyncCompletionAckParams {
+                completion_id: "completion-unknown",
+                conversation_id: "conversation-1",
+                acp_session_id: "session-1",
+                payload_sha256: "payload-1",
+                status: AsyncCompletionAckStatus::ExplicitUnknown,
+                code: Some("outcome_unknown_turn_timeout"),
+            })
+            .await
+            .unwrap()
+        );
+
+        let rows = repo.list_for_conversation("conversation-1").await.unwrap();
+        assert_eq!(rows[0].state, "unknown");
+        assert_eq!(rows[0].last_error_code.as_deref(), Some("turn_timeout"));
+        assert_eq!(rows[0].last_ack_status.as_deref(), Some("explicit_unknown"));
+        assert_eq!(rows[0].last_ack_code.as_deref(), Some("outcome_unknown_turn_timeout"));
     }
 }

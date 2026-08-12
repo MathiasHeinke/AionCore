@@ -169,6 +169,7 @@ pub struct SteerConversationResponse {
 
 /// Version marker for Hermes' durable async-completion ACP extension.
 pub const COMMAND_EVE_ASYNC_COMPLETION_VERSION: &str = "command-eve-async-completion/v1";
+pub const COMMAND_EVE_ASYNC_COMPLETION_RECEIPTS_VERSION: &str = "command-eve-async-completion-receipts/v1";
 
 /// Agent-to-client payload emitted after one Hermes background unit reaches a
 /// terminal result. The host binds it to the canonical conversation; the
@@ -201,6 +202,67 @@ pub struct AcpAsyncCompletionResponse {
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+}
+
+/// Durable host-side state of one Hermes async-completion receipt.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpAsyncCompletionReceiptState {
+    Processing,
+    Pending,
+    Completed,
+    Rejected,
+    ExplicitUnknown,
+}
+
+/// Last acknowledgement returned across the committed Hermes↔AionCore v1
+/// completion extension. `explicit_unknown` is encoded on that wire as a
+/// rejected response plus an `outcome_unknown_*` code, but must remain
+/// distinguishable in the durable renderer projection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpAsyncCompletionReceiptOutcome {
+    Accepted,
+    AlreadyApplied,
+    Retryable,
+    Rejected,
+    ExplicitUnknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpAsyncCompletionReceiptResponse {
+    /// Stable identity of this projection row. Execution receipts and
+    /// pre-claim rejection events occupy separate identity domains.
+    pub projection_id: String,
+    pub completion_id: String,
+    pub acp_session_id: String,
+    pub state: AcpAsyncCompletionReceiptState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub attempt_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<AcpAsyncCompletionReceiptOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome_code: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcpAsyncCompletionReceiptListResponse {
+    pub version: String,
+    pub conversation_id: String,
+    pub reconstructed_from: String,
+    pub generated_at: i64,
+    pub receipts: Vec<AcpAsyncCompletionReceiptResponse>,
 }
 
 /// Version marker for the bounded Hermes `read_preview` ACP extension.
@@ -334,8 +396,17 @@ pub struct CancelConversationRequest {
 }
 
 /// Response for `POST /api/conversations/:id/cancel`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelConversationOutcome {
+    Accepted,
+    TurnMismatch,
+    NoActiveAgent,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelConversationResponse {
+    pub outcome: CancelConversationOutcome,
     pub runtime: ConversationRuntimeSummary,
 }
 
@@ -1281,6 +1352,36 @@ mod tests {
             code: None,
         };
         assert_eq!(serde_json::to_value(response).unwrap()["status"], "already_applied");
+    }
+
+    #[test]
+    fn async_completion_receipt_projection_keeps_unknown_distinct() {
+        let response = AcpAsyncCompletionReceiptListResponse {
+            version: COMMAND_EVE_ASYNC_COMPLETION_RECEIPTS_VERSION.to_owned(),
+            conversation_id: "conversation-1".to_owned(),
+            reconstructed_from: "persistent_receipts".to_owned(),
+            generated_at: 4_000,
+            receipts: vec![AcpAsyncCompletionReceiptResponse {
+                projection_id: "execution:completion-1".to_owned(),
+                completion_id: "completion-1".to_owned(),
+                acp_session_id: "session-1".to_owned(),
+                state: AcpAsyncCompletionReceiptState::ExplicitUnknown,
+                turn_id: Some("turn-1".to_owned()),
+                attempt_count: 2,
+                last_error_code: Some("turn_timeout".to_owned()),
+                last_outcome: Some(AcpAsyncCompletionReceiptOutcome::ExplicitUnknown),
+                last_outcome_code: Some("outcome_unknown_turn_timeout".to_owned()),
+                created_at: 1_000,
+                updated_at: 3_000,
+                completed_at: None,
+                last_outcome_at: Some(3_000),
+            }],
+        };
+
+        let raw = serde_json::to_value(response).unwrap();
+        assert_eq!(raw["version"], COMMAND_EVE_ASYNC_COMPLETION_RECEIPTS_VERSION);
+        assert_eq!(raw["receipts"][0]["state"], "explicit_unknown");
+        assert_eq!(raw["receipts"][0]["last_outcome"], "explicit_unknown");
     }
 
     #[test]

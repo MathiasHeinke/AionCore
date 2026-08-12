@@ -3,6 +3,7 @@
 //! Conversation and message CRUD with streaming relay and event emission.
 mod acp_error_recovery;
 mod agent_health_policy;
+mod async_completion_receipts;
 mod convert;
 pub mod error;
 pub(crate) mod message_cursor;
@@ -28,6 +29,7 @@ mod turn_continuation_policy;
 mod turn_orchestrator;
 mod turn_recovery_policy;
 
+pub use async_completion_receipts::AsyncCompletionReceiptService;
 pub use error::ConversationError;
 pub use response_middleware::{
     CronCommand, CronCommandResult, CronCreateParams, CronUpdateParams, ICronService, MessageMiddleware,

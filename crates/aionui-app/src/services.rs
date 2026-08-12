@@ -41,6 +41,7 @@ pub struct AppServices {
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    pub async_completion_receipt_repo: Arc<dyn IAsyncCompletionReceiptRepository>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -247,13 +248,13 @@ impl AppServices {
             task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
             project_runtime_attestation_verifier: project_runtime_attestation_verifier.clone(),
         });
-        let receipt_repo: Arc<dyn IAsyncCompletionReceiptRepository> =
+        let async_completion_receipt_repo: Arc<dyn IAsyncCompletionReceiptRepository> =
             Arc::new(SqliteAsyncCompletionReceiptRepository::new(database.pool().clone()));
         CommandEveAsyncCompletionConsumer::new(
             conversation_service.clone(),
             conversation_repo.clone(),
             acp_session_repo.clone(),
-            receipt_repo,
+            async_completion_receipt_repo.clone(),
             worker_task_manager.clone(),
             ConversationService::mint_msg_id(),
         )
@@ -271,6 +272,7 @@ impl AppServices {
             worker_task_manager,
             conversation_runtime_state,
             conversation_service,
+            async_completion_receipt_repo,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,

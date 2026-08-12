@@ -19,9 +19,9 @@ use aionui_runtime::{
 };
 use tracing::{debug, info, warn};
 
-use crate::CommandEveAsyncCompletionRoute;
 use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
 use crate::types::BuildTaskOptions;
+use crate::{AcpSessionBinding, CommandEveAsyncCompletionRoute};
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -179,6 +179,7 @@ pub(super) async fn build(
             conversation_id: ctx.conversation_id.clone(),
             sender,
             project_build_options,
+            session_binding: AcpSessionBinding::default(),
         });
     let (agent, domain_rx, notification_rx) =
         AcpAgentManager::build_with_async_completion(params, skill_mgr, &catalog_tx, async_completion_route).await?;

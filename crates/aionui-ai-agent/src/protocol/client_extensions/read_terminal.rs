@@ -52,7 +52,7 @@ impl AcpClientExtensionRouter {
             let pending = state.pending_terminal.get(&response.request_id).ok_or_else(|| {
                 AgentError::conflict("ACP read_terminal request is unknown, expired, or already answered")
             })?;
-            if state.bound_session_id.as_deref() != Some(response.session_id.as_str())
+            if self.session_binding.bound_session_id().as_deref() != Some(response.session_id.as_str())
                 || pending.session_id != response.session_id
             {
                 return Err(AgentError::conflict("ACP read_terminal session binding mismatch"));
@@ -128,7 +128,7 @@ impl AcpClientExtensionRouter {
                     return;
                 }
             };
-            if state.bound_session_id.as_deref() != Some(request.session_id.as_str()) {
+            if self.session_binding.bound_session_id().as_deref() != Some(request.session_id.as_str()) {
                 reject_terminal_request(respond, "session_mismatch");
                 return;
             }
@@ -353,7 +353,7 @@ mod tests {
         assert_eq!(i32::from(disabled.await.unwrap().unwrap_err().code), -32601);
 
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
         let req = request("request-1", "session-1");
         let response_rx = dispatch(
             &router,
@@ -379,7 +379,7 @@ mod tests {
         let (event_tx, _event_rx) = broadcast::channel(4);
         let router = AcpClientExtensionRouter::new(event_tx);
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
 
         for invalid in [
             serde_json::json!({
@@ -432,7 +432,7 @@ mod tests {
         let router = AcpClientExtensionRouter::new(event_tx);
         enable(&router);
         router.enable_read_preview().unwrap();
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
 
         let value = serde_json::to_value(request("request-1", "session-1")).unwrap();
         let first = dispatch(&router, COMMAND_EVE_READ_TERMINAL_EXT_METHOD, value.clone());
@@ -492,7 +492,7 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let router = AcpClientExtensionRouter::with_timeout(event_tx, Duration::from_millis(5));
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
 
         let rebound = dispatch(
             &router,
@@ -500,7 +500,7 @@ mod tests {
             serde_json::to_value(request("request-rebind", "session-1")).unwrap(),
         );
         let _ = event_rx.recv().await.unwrap();
-        router.bind_session("session-2").unwrap();
+        router.bind_session("session-2").await.unwrap();
         assert!(rebound.await.unwrap().is_err());
 
         let closed = dispatch(
@@ -509,10 +509,10 @@ mod tests {
             serde_json::to_value(request("request-close", "session-2")).unwrap(),
         );
         let _ = event_rx.recv().await.unwrap();
-        router.unbind_session("session-2");
+        router.unbind_session("session-2").await;
         assert!(closed.await.unwrap().is_err());
 
-        router.bind_session("session-3").unwrap();
+        router.bind_session("session-3").await.unwrap();
         let timed_out = dispatch(
             &router,
             COMMAND_EVE_READ_TERMINAL_EXT_METHOD,
@@ -547,7 +547,7 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let router = AcpClientExtensionRouter::new(event_tx);
         enable(&router);
-        router.bind_session("session-1").unwrap();
+        router.bind_session("session-1").await.unwrap();
         let rx = dispatch(
             &router,
             COMMAND_EVE_READ_TERMINAL_EXT_METHOD,

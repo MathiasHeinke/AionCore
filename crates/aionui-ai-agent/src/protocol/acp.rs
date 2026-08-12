@@ -249,8 +249,15 @@ impl AcpProtocol {
 
     /// Create a new ACP session.
     pub async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, AcpError> {
+        // Invalidate the previous binding up front: while the request is in
+        // flight the route is unbound (completions stay retryable), and a
+        // failed request leaves it unbound instead of trusting the old
+        // session.
+        self.client_extensions.begin_session_binding().await;
         let response = self.send_request(req, AGENT_METHOD_NAMES.session_new).await?;
-        self.client_extensions.bind_session(response.session_id.0.as_ref())?;
+        self.client_extensions
+            .bind_session(response.session_id.0.as_ref())
+            .await?;
         Ok(response)
     }
 
@@ -269,9 +276,10 @@ impl AcpProtocol {
     /// and never calls this method, so it is unaffected by the guard.
     pub async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, AcpError> {
         let session_id = req.session_id.0.clone();
+        self.client_extensions.begin_session_binding().await;
         let _guard = ReplaySuppressionGuard::new(&self.replay_suppression);
         let response = self.send_request(req, AGENT_METHOD_NAMES.session_load).await?;
-        self.client_extensions.bind_session(session_id.as_ref())?;
+        self.client_extensions.bind_session(session_id.as_ref()).await?;
         Ok(response)
     }
 
@@ -283,8 +291,9 @@ impl AcpProtocol {
     /// Resume an existing ACP session.
     pub async fn resume_session(&self, req: ResumeSessionRequest) -> Result<ResumeSessionResponse, AcpError> {
         let session_id = req.session_id.0.clone();
+        self.client_extensions.begin_session_binding().await;
         let response = self.send_request(req, AGENT_METHOD_NAMES.session_resume).await?;
-        self.client_extensions.bind_session(session_id.as_ref())?;
+        self.client_extensions.bind_session(session_id.as_ref()).await?;
         Ok(response)
     }
 
@@ -292,7 +301,7 @@ impl AcpProtocol {
     pub async fn close_session(&self, req: CloseSessionRequest) -> Result<CloseSessionResponse, AcpError> {
         let session_id = req.session_id.0.clone();
         let response = self.send_request(req, AGENT_METHOD_NAMES.session_close).await?;
-        self.client_extensions.unbind_session(session_id.as_ref());
+        self.client_extensions.unbind_session(session_id.as_ref()).await;
         Ok(response)
     }
 
@@ -338,13 +347,20 @@ impl AcpProtocol {
         self.send_request(req, AGENT_METHOD_NAMES.session_prompt).await
     }
 
-    /// Cancel the current prompt in a session (fire-and-forget notification).
-    pub fn cancel(&self, notification: CancelNotification) {
-        if !self.is_connected() {
-            return;
-        }
+    /// Submit a cancellation notification to the live ACP transport. This is
+    /// only a local transport admission receipt, never terminal worker proof.
+    /// A disconnected or closed outbound channel returns an error so callers
+    /// cannot truthfully report cancellation as accepted.
+    pub fn cancel(&self, notification: CancelNotification) -> Result<(), AcpError> {
+        self.ensure_connected()?;
         log_client_notify(AGENT_METHOD_NAMES.session_cancel, &json_str(&notification));
-        let _ = self.connection.send_notification(notification);
+        self.connection
+            .send_notification(notification)
+            .map_err(|error| AcpError::AgentInternal {
+                message: "ACP cancel notification transport failed".to_owned(),
+                code: i32::from(error.code),
+                data: error.data,
+            })
     }
 
     /// Set the session mode.

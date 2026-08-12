@@ -38,7 +38,9 @@ pub use assistant::{
     IAssistantPreferenceRepository, IAssistantRepository,
 };
 pub use async_completion_receipt::{
-    AsyncCompletionReceiptClaim, ClaimAsyncCompletionReceiptParams, IAsyncCompletionReceiptRepository,
+    AsyncCompletionAckStatus, AsyncCompletionReceiptClaim, AsyncCompletionReceiptRecord,
+    ClaimAsyncCompletionReceiptParams, IAsyncCompletionReceiptRepository, RecordAsyncCompletionAckParams,
+    RecordRejectedAsyncCompletionReceiptParams,
 };
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;

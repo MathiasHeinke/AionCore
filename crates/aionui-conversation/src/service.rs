@@ -21,14 +21,15 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::{ConversationRuntimeStateService, SteerRequestRegistration};
 use aionui_api_types::{
     AcpReadPreviewResponse, AcpReadPreviewResponseRequest, AcpReadTerminalResponse, AcpReadTerminalResponseRequest,
-    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
-    ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
-    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, SteerConversationRequest, SteerConversationResponse, TeamSessionBinding,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationOutcome,
+    CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, ProjectRuntimeWorkspaceRequest,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
+    SteerConversationRequest, SteerConversationResponse, TeamSessionBinding, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -2934,26 +2935,30 @@ impl ConversationService {
         request: ConversationAgentTurnRequest,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
         let turn_id = Self::mint_turn_id();
-        self.run_agent_turn_with_transient_project_options(request, turn_id, None)
+        self.run_agent_turn_with_transient_project_options(request, turn_id, None, None)
             .await
     }
 
     /// Resume the canonical conversation from a verified in-process Hermes
     /// completion. `turn_id` was durably assigned by the completion receipt;
     /// project options originate from the already-attested task build and are
-    /// revalidated under a fresh native execution permit below.
+    /// revalidated under a fresh native execution permit below. The optional
+    /// ACP admission holds the route-scoped session binding until the active
+    /// turn is synchronously inserted, then releases it before worker
+    /// execution so a rebind cannot race stale evidence into a new turn.
     pub async fn run_command_eve_async_completion_turn(
         &self,
         request: ConversationAgentTurnRequest,
         turn_id: String,
         project_build_options: Option<BuildTaskOptions>,
+        admission: &aionui_ai_agent::AcpSessionBindingAdmission,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
         if turn_id.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Agent turn_id must not be empty".into(),
             });
         }
-        self.run_agent_turn_with_transient_project_options(request, turn_id, project_build_options)
+        self.run_agent_turn_with_transient_project_options(request, turn_id, project_build_options, Some(admission))
             .await
     }
 
@@ -2962,6 +2967,7 @@ impl ConversationService {
         request: ConversationAgentTurnRequest,
         turn_id: String,
         project_build_options: Option<BuildTaskOptions>,
+        admission: Option<&aionui_ai_agent::AcpSessionBindingAdmission>,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
         if request.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
@@ -2991,6 +2997,9 @@ impl ConversationService {
         };
 
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
+        if let Some(admission) = admission.as_ref() {
+            admission.release_after_turn_claim();
+        }
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(ConversationAgentTurnStarted {
                 conversation_id: request.conversation_id.clone(),
@@ -3345,6 +3354,7 @@ impl ConversationService {
                 "cancel ignored because turn id mismatched"
             );
             return Ok(CancelConversationResponse {
+                outcome: CancelConversationOutcome::TurnMismatch,
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
         }
@@ -3355,6 +3365,7 @@ impl ConversationService {
                 turn_id, "No active agent to cancel; returning runtime summary"
             );
             return Ok(CancelConversationResponse {
+                outcome: CancelConversationOutcome::NoActiveAgent,
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
         };
@@ -3392,6 +3403,7 @@ impl ConversationService {
 
         info!(conversation_id, turn_id, "Stream cancel acknowledged");
         Ok(CancelConversationResponse {
+            outcome: CancelConversationOutcome::Accepted,
             runtime: self.runtime_summary_for(conversation_id).await,
         })
     }
