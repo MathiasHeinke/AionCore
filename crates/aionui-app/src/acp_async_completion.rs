@@ -1252,21 +1252,21 @@ mod tests {
         // freeze Tokio time. This keeps pool acquisition on normal time while
         // making expiry of the already-created admission timer deterministic.
         tokio::time::pause();
-        let close_task = tokio::spawn({
-            let binding = binding.clone();
-            async move { binding.close_for_test("session-1").await }
-        });
-        tokio::task::yield_now().await;
+        let close = binding.close_for_test("session-1");
+        tokio::pin!(close);
+        assert!(
+            futures_util::poll!(&mut close).is_pending(),
+            "close must enter the lifecycle transition and wait behind the held pre-turn admission"
+        );
         tokio::time::advance(Duration::from_secs(6)).await;
         // Return recovery to real time. Otherwise Tokio's paused-time
         // auto-advance can fire the separate 50 ms recovery bound before the
         // released SQLite connection executes its first query.
         tokio::time::resume();
         assert!(
-            tokio::time::timeout(Duration::from_millis(250), close_task)
+            tokio::time::timeout(Duration::from_millis(250), &mut close)
                 .await
-                .expect("close must not wait for a stalled pre-turn SQLite transaction")
-                .expect("close task must not panic"),
+                .expect("close must not wait for a stalled pre-turn SQLite transaction"),
             "close must drop the live binding"
         );
         assert!(
