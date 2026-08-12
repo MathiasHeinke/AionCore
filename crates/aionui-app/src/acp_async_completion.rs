@@ -11,8 +11,8 @@ use aionui_conversation::{
     ConversationService,
 };
 use aionui_db::{
-    AsyncCompletionAckStatus, AsyncCompletionReceiptClaim, ClaimAsyncCompletionReceiptParams, IAcpSessionRepository,
-    IAsyncCompletionReceiptRepository, IConversationRepository, RecordAsyncCompletionAckParams,
+    AsyncCompletionAckStatus, AsyncCompletionReceiptClaim, ClaimAsyncCompletionReceiptParams, DbError,
+    IAcpSessionRepository, IAsyncCompletionReceiptRepository, IConversationRepository, RecordAsyncCompletionAckParams,
     RecordRejectedAsyncCompletionReceiptParams,
 };
 use sha2::{Digest, Sha256};
@@ -23,6 +23,23 @@ const ASYNC_COMPLETION_MAX_CONCURRENCY: usize = 4;
 const ASYNC_COMPLETION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const ASYNC_COMPLETION_TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ASYNC_COMPLETION_KILL_TIMEOUT: Duration = Duration::from_secs(20);
+const ASYNC_COMPLETION_RECEIPT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outcome of the bounded pre-turn window. The `Pin<Box<...>>` owning the
+/// pre-turn future lives only inside that window, so every timeout path drops
+/// a suspended receipt transaction before durable recovery starts.
+enum CompletionWindowOutcome {
+    Completed(CommandEveAsyncCompletionResult),
+    PreTurnTimedOut,
+    PostTurnTimedOut,
+}
+
+enum PreTurnSelection {
+    Completed(CommandEveAsyncCompletionResult),
+    TurnClaimed,
+    DeadlineElapsed,
+}
+
 #[async_trait::async_trait]
 trait IAsyncCompletionTurnRunner: Send + Sync {
     async fn run(
@@ -58,6 +75,7 @@ pub(crate) struct CommandEveAsyncCompletionConsumer {
     admission_timeout: Duration,
     turn_timeout: Duration,
     kill_timeout: Duration,
+    receipt_recovery_timeout: Duration,
     max_concurrency: usize,
 }
 
@@ -98,6 +116,7 @@ impl CommandEveAsyncCompletionConsumer {
             admission_timeout: ASYNC_COMPLETION_ADMISSION_TIMEOUT,
             turn_timeout: ASYNC_COMPLETION_TURN_TIMEOUT,
             kill_timeout: ASYNC_COMPLETION_KILL_TIMEOUT,
+            receipt_recovery_timeout: ASYNC_COMPLETION_RECEIPT_RECOVERY_TIMEOUT,
             max_concurrency: ASYNC_COMPLETION_MAX_CONCURRENCY,
         }
     }
@@ -129,21 +148,34 @@ impl CommandEveAsyncCompletionConsumer {
     async fn consume(&self, dispatch: &CommandEveAsyncCompletionDispatch) -> CommandEveAsyncCompletionResult {
         let deadline = tokio::time::Instant::now() + self.admission_timeout;
         let payload_sha256 = hex_sha256(dispatch.request.content.as_bytes());
-        let before_turn = self.consume_before_turn(dispatch, &payload_sha256);
-        tokio::pin!(before_turn);
-        let turn_claimed = dispatch.turn_gate.wait_for_turn_claim();
-        tokio::pin!(turn_claimed);
+        let window_outcome = {
+            // Keep the owning box scoped to this block. In particular, the
+            // admission-deadline branch destroys a pending `claim()` future
+            // (and any SQLite transaction it owns) before calling a receipt
+            // recovery method below.
+            let mut before_turn = Box::pin(self.consume_before_turn(dispatch, &payload_sha256));
+            let mut turn_claimed = Box::pin(dispatch.turn_gate.wait_for_turn_claim());
+            let selection = tokio::select! {
+                result = &mut before_turn => PreTurnSelection::Completed(result),
+                _ = &mut turn_claimed => PreTurnSelection::TurnClaimed,
+                _ = tokio::time::sleep_until(deadline) => PreTurnSelection::DeadlineElapsed,
+            };
 
-        tokio::select! {
-            result = &mut before_turn => result,
-            _ = &mut turn_claimed => {
-                match tokio::time::timeout(self.turn_timeout, &mut before_turn).await {
-                    Ok(result) => result,
-                    Err(_) => self.resolve_post_turn_timeout(dispatch, &payload_sha256).await,
-                }
+            match selection {
+                PreTurnSelection::Completed(result) => CompletionWindowOutcome::Completed(result),
+                PreTurnSelection::TurnClaimed => match tokio::time::timeout(self.turn_timeout, before_turn).await {
+                    Ok(result) => CompletionWindowOutcome::Completed(result),
+                    Err(_) => CompletionWindowOutcome::PostTurnTimedOut,
+                },
+                PreTurnSelection::DeadlineElapsed => CompletionWindowOutcome::PreTurnTimedOut,
             }
-            _ = tokio::time::sleep_until(deadline) => {
-                self.resolve_pre_turn_timeout(dispatch, &payload_sha256).await
+        };
+
+        match window_outcome {
+            CompletionWindowOutcome::Completed(result) => result,
+            CompletionWindowOutcome::PreTurnTimedOut => self.resolve_pre_turn_timeout(dispatch, &payload_sha256).await,
+            CompletionWindowOutcome::PostTurnTimedOut => {
+                self.resolve_post_turn_timeout(dispatch, &payload_sha256).await
             }
         }
     }
@@ -449,38 +481,60 @@ impl CommandEveAsyncCompletionConsumer {
         unknown_outcome_code: &str,
     ) -> CommandEveAsyncCompletionResult {
         match self
-            .receipt_repo
-            .mark_retryable(&dispatch.request.completion_id, &self.owner_instance_id, retry_code)
+            .wait_for_receipt_recovery(
+                self.receipt_repo
+                    .mark_retryable(&dispatch.request.completion_id, &self.owner_instance_id, retry_code),
+                "mark_retryable",
+            )
             .await
         {
-            Ok(true) => {
-                if self
-                    .record_ack(
-                        dispatch,
-                        payload_sha256,
-                        AsyncCompletionAckStatus::Retryable,
-                        Some(retry_code),
+            Ok(true) => match self
+                .record_recovery_ack(
+                    dispatch,
+                    payload_sha256,
+                    AsyncCompletionAckStatus::Retryable,
+                    Some(retry_code),
+                )
+                .await
+            {
+                Ok(true) => retryable(retry_code),
+                Ok(false) => retryable("receipt_recovery_unavailable"),
+                Err(code) => retryable(code),
+            },
+            Ok(false) => {
+                // The claim may have committed as cancellation raced it; only
+                // the durable receipt can classify that side effect. A
+                // terminal unknown is valid only after both the transition
+                // and its exact acknowledgement are durable.
+                match self
+                    .wait_for_receipt_recovery(
+                        self.receipt_repo.mark_unknown(
+                            &dispatch.request.completion_id,
+                            &self.owner_instance_id,
+                            unknown_error_code,
+                        ),
+                        "mark_unknown",
                     )
                     .await
                 {
-                    retryable(retry_code)
-                } else {
-                    retryable("ack_persistence_failed")
+                    Ok(true) => match self
+                        .record_recovery_ack(
+                            dispatch,
+                            payload_sha256,
+                            AsyncCompletionAckStatus::ExplicitUnknown,
+                            Some(unknown_outcome_code),
+                        )
+                        .await
+                    {
+                        Ok(true) => persisted_unknown(unknown_outcome_code),
+                        Ok(false) => retryable("receipt_recovery_unavailable"),
+                        Err(code) => retryable(code),
+                    },
+                    Ok(false) => retryable("receipt_recovery_unavailable"),
+                    Err(code) => retryable(code),
                 }
             }
-            Ok(false) | Err(_) => {
-                // The claim may have committed as cancellation raced it; only
-                // the durable receipt can classify that side effect. Never
-                // manufacture a retry once the conditional transition fails.
-                if self
-                    .mark_unknown(dispatch, payload_sha256, unknown_error_code, unknown_outcome_code)
-                    .await
-                {
-                    persisted_unknown(unknown_outcome_code)
-                } else {
-                    retryable("ack_persistence_failed")
-                }
-            }
+            Err(code) => retryable(code),
         }
     }
 
@@ -498,19 +552,70 @@ impl CommandEveAsyncCompletionConsumer {
                 "ACP async completion admission timed out while waiting for task termination"
             );
         }
-        if self
-            .mark_unknown(
-                dispatch,
-                payload_sha256,
-                "admission_timeout_after_turn",
-                "outcome_unknown_admission_timeout",
+        match self
+            .wait_for_receipt_recovery(
+                self.receipt_repo.mark_unknown(
+                    &dispatch.request.completion_id,
+                    &self.owner_instance_id,
+                    "admission_timeout_after_turn",
+                ),
+                "mark_unknown",
             )
             .await
         {
-            persisted_unknown("outcome_unknown_admission_timeout")
-        } else {
-            retryable("ack_persistence_failed")
+            Ok(true) => match self
+                .record_recovery_ack(
+                    dispatch,
+                    payload_sha256,
+                    AsyncCompletionAckStatus::ExplicitUnknown,
+                    Some("outcome_unknown_admission_timeout"),
+                )
+                .await
+            {
+                Ok(true) => persisted_unknown("outcome_unknown_admission_timeout"),
+                Ok(false) => retryable("receipt_recovery_unavailable"),
+                Err(code) => retryable(code),
+            },
+            Ok(false) => retryable("receipt_recovery_unavailable"),
+            Err(code) => retryable(code),
         }
+    }
+
+    async fn wait_for_receipt_recovery<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, DbError>>,
+        operation_name: &'static str,
+    ) -> Result<T, &'static str> {
+        match tokio::time::timeout(self.receipt_recovery_timeout, operation).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                warn!(error = %error, operation_name, "ACP async completion receipt recovery failed");
+                Err("receipt_recovery_failed")
+            }
+            Err(_) => {
+                warn!(operation_name, "ACP async completion receipt recovery timed out");
+                Err("receipt_recovery_timeout")
+            }
+        }
+    }
+
+    async fn record_recovery_ack(
+        &self,
+        dispatch: &CommandEveAsyncCompletionDispatch,
+        payload_sha256: &str,
+        status: AsyncCompletionAckStatus,
+        code: Option<&str>,
+    ) -> Result<bool, &'static str> {
+        let params = RecordAsyncCompletionAckParams {
+            completion_id: &dispatch.request.completion_id,
+            conversation_id: &dispatch.conversation_id,
+            acp_session_id: &dispatch.request.session_id,
+            payload_sha256,
+            status,
+            code,
+        };
+        self.wait_for_receipt_recovery(self.receipt_repo.record_ack(&params), "record_ack")
+            .await
     }
 
     async fn mark_unknown(
@@ -639,8 +744,8 @@ mod tests {
     };
     use aionui_common::TimestampMs;
     use aionui_db::{
-        AsyncCompletionReceiptRecord, DbError, SqliteAcpSessionRepository, SqliteConversationRepository,
-        init_database_memory,
+        AsyncCompletionReceiptRecord, DbError, SqliteAcpSessionRepository, SqliteAsyncCompletionReceiptRepository,
+        SqliteConversationRepository, SqlitePool, init_database_memory,
     };
     use tokio::sync::{Barrier, oneshot};
 
@@ -673,7 +778,7 @@ mod tests {
         rejections: Mutex<Vec<RecordedRejection>>,
         retryable_codes: Mutex<Vec<String>>,
         unknown_error_codes: Mutex<Vec<String>>,
-        claim_started: Option<Arc<Barrier>>,
+        stall_retryable: bool,
     }
 
     impl RecordingReceiptRepo {
@@ -690,7 +795,7 @@ mod tests {
                 rejections: Mutex::new(Vec::new()),
                 retryable_codes: Mutex::new(Vec::new()),
                 unknown_error_codes: Mutex::new(Vec::new()),
-                claim_started: None,
+                stall_retryable: false,
             }
         }
 
@@ -709,8 +814,8 @@ mod tests {
                 .clone()
         }
 
-        fn with_stalled_claim(mut self, claim_started: Arc<Barrier>) -> Self {
-            self.claim_started = Some(claim_started);
+        fn with_stalled_retryable(mut self) -> Self {
+            self.stall_retryable = true;
             self
         }
     }
@@ -722,10 +827,6 @@ mod tests {
             _params: &ClaimAsyncCompletionReceiptParams<'_>,
         ) -> Result<AsyncCompletionReceiptClaim, DbError> {
             self.claim_calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(claim_started) = &self.claim_started {
-                claim_started.wait().await;
-                std::future::pending::<()>().await;
-            }
             Ok(self.claim.clone())
         }
 
@@ -739,6 +840,9 @@ mod tests {
                 .lock()
                 .expect("retryable recorder poisoned")
                 .push(error_code.to_owned());
+            if self.stall_retryable {
+                std::future::pending::<()>().await;
+            }
             Ok(self.mark_retryable_applied)
         }
 
@@ -794,6 +898,104 @@ mod tests {
             _conversation_id: &str,
         ) -> Result<Vec<AsyncCompletionReceiptRecord>, DbError> {
             Ok(Vec::new())
+        }
+    }
+
+    /// Holds a real SQLite transaction open after the same receipt insert
+    /// performed by the production repository. The single-connection memory
+    /// pool makes a recovery query block until cancellation drops this future.
+    ///
+    /// It is intentionally test-only: production continues to use the native
+    /// `SqliteAsyncCompletionReceiptRepository` as its sole receipt authority.
+    struct TransactionalStalledClaimRepo {
+        pool: SqlitePool,
+        claim_started: Arc<Barrier>,
+    }
+
+    impl TransactionalStalledClaimRepo {
+        fn delegate(&self) -> SqliteAsyncCompletionReceiptRepository {
+            SqliteAsyncCompletionReceiptRepository::new(self.pool.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IAsyncCompletionReceiptRepository for TransactionalStalledClaimRepo {
+        async fn claim(
+            &self,
+            params: &ClaimAsyncCompletionReceiptParams<'_>,
+        ) -> Result<AsyncCompletionReceiptClaim, DbError> {
+            let mut transaction = self.pool.begin().await?;
+            sqlx::query(
+                "INSERT INTO command_eve_async_completion_receipts \
+                 (completion_id, conversation_id, acp_session_id, payload_sha256, state, \
+                  owner_instance_id, turn_id, attempt_count, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, 'processing', ?, ?, 1, 1, 1)",
+            )
+            .bind(params.completion_id)
+            .bind(params.conversation_id)
+            .bind(params.acp_session_id)
+            .bind(params.payload_sha256)
+            .bind(params.owner_instance_id)
+            .bind(params.turn_id)
+            .execute(&mut *transaction)
+            .await?;
+            self.claim_started.wait().await;
+
+            // Cancellation must drop `transaction` here. Keeping the future
+            // pending exercises the exact SQLite self-block the deadline path
+            // used to risk, rather than a pure in-memory stub.
+            std::future::pending::<Result<AsyncCompletionReceiptClaim, DbError>>().await
+        }
+
+        async fn mark_retryable(
+            &self,
+            completion_id: &str,
+            owner_instance_id: &str,
+            error_code: &str,
+        ) -> Result<bool, DbError> {
+            self.delegate()
+                .mark_retryable(completion_id, owner_instance_id, error_code)
+                .await
+        }
+
+        async fn mark_completed(
+            &self,
+            completion_id: &str,
+            owner_instance_id: &str,
+            turn_id: &str,
+        ) -> Result<bool, DbError> {
+            self.delegate()
+                .mark_completed(completion_id, owner_instance_id, turn_id)
+                .await
+        }
+
+        async fn mark_unknown(
+            &self,
+            completion_id: &str,
+            owner_instance_id: &str,
+            error_code: &str,
+        ) -> Result<bool, DbError> {
+            self.delegate()
+                .mark_unknown(completion_id, owner_instance_id, error_code)
+                .await
+        }
+
+        async fn record_ack(&self, params: &RecordAsyncCompletionAckParams<'_>) -> Result<bool, DbError> {
+            self.delegate().record_ack(params).await
+        }
+
+        async fn record_rejected(
+            &self,
+            params: &RecordRejectedAsyncCompletionReceiptParams<'_>,
+        ) -> Result<bool, DbError> {
+            self.delegate().record_rejected(params).await
+        }
+
+        async fn list_for_conversation(
+            &self,
+            conversation_id: &str,
+        ) -> Result<Vec<AsyncCompletionReceiptRecord>, DbError> {
+            self.delegate().list_for_conversation(conversation_id).await
         }
     }
 
@@ -909,24 +1111,21 @@ mod tests {
         }
     }
 
-    async fn consumer_with(
-        receipt_repo: Arc<RecordingReceiptRepo>,
-        turn_result: StubTurnResult,
-        bound_session_id: Option<&str>,
-    ) -> (CommandEveAsyncCompletionConsumer, Arc<StubTurnRunner>) {
+    async fn test_pool(bound_session_id: Option<&str>) -> SqlitePool {
         let db = init_database_memory().await.expect("memory database");
+        let pool = db.pool().clone();
         sqlx::query(
             "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
              VALUES ('user-1', 'async-consumer-test', 'none', 1, 1)",
         )
-        .execute(db.pool())
+        .execute(&pool)
         .await
         .expect("insert user");
         sqlx::query(
             "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at) \
              VALUES ('conversation-1', 'user-1', 'test', 'acp', '{}', 'pending', 1, 1)",
         )
-        .execute(db.pool())
+        .execute(&pool)
         .await
         .expect("insert conversation");
         sqlx::query(
@@ -935,15 +1134,23 @@ mod tests {
              VALUES ('conversation-1', 'builtin', 'hermes', ?, 'idle', '{}', 1)",
         )
         .bind(bound_session_id)
-        .execute(db.pool())
+        .execute(&pool)
         .await
         .expect("insert ACP session");
+        pool
+    }
 
+    async fn consumer_with(
+        receipt_repo: Arc<RecordingReceiptRepo>,
+        turn_result: StubTurnResult,
+        bound_session_id: Option<&str>,
+    ) -> (CommandEveAsyncCompletionConsumer, Arc<StubTurnRunner>) {
+        let pool = test_pool(bound_session_id).await;
         let turn_runner = Arc::new(StubTurnRunner::new(turn_result));
         let consumer = CommandEveAsyncCompletionConsumer::with_turn_runner(
             turn_runner.clone(),
-            Arc::new(SqliteConversationRepository::new(db.pool().clone())),
-            Arc::new(SqliteAcpSessionRepository::new(db.pool().clone())),
+            Arc::new(SqliteConversationRepository::new(pool.clone())),
+            Arc::new(SqliteAcpSessionRepository::new(pool)),
             receipt_repo,
             Arc::new(StubTaskManager),
             "owner-test".to_owned(),
@@ -992,19 +1199,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_preturn_claim_times_out_without_starving_close_or_starting_a_turn() {
+    async fn timed_out_preturn_drops_real_sqlite_claim_before_bounded_recovery() {
         let claim_started = Arc::new(Barrier::new(2));
-        let repo = Arc::new(
-            RecordingReceiptRepo::new(AsyncCompletionReceiptClaim::Claimed {
-                turn_id: "turn-stalled-claim".to_owned(),
-            })
-            .with_stalled_claim(Arc::clone(&claim_started)),
+        let pool = test_pool(Some("session-1")).await;
+        let repo = Arc::new(TransactionalStalledClaimRepo {
+            pool: pool.clone(),
+            claim_started: Arc::clone(&claim_started),
+        });
+        let turn_runner = Arc::new(StubTurnRunner::new(StubTurnResult::Completed));
+        let mut consumer = CommandEveAsyncCompletionConsumer::with_turn_runner(
+            turn_runner.clone(),
+            Arc::new(SqliteConversationRepository::new(pool.clone())),
+            Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
+            repo,
+            Arc::new(StubTaskManager),
+            "owner-test".to_owned(),
         );
-        let (mut consumer, runner) = consumer_with(repo.clone(), StubTurnResult::Completed, Some("session-1")).await;
         consumer.admission_timeout = Duration::from_millis(10);
+        consumer.receipt_recovery_timeout = Duration::from_millis(50);
         let binding = AcpSessionBinding::bound_for_test("session-1").await;
-        let (reply, _receiver) = oneshot::channel();
-        let (completion, _unused_reply) = dispatch_for_binding("session-1", binding.clone(), reply, _receiver);
+        let (reply, receiver) = oneshot::channel();
+        let (completion, _unused_reply) = dispatch_for_binding("session-1", binding.clone(), reply, receiver);
 
         let consumer = Arc::new(consumer);
         let completion_task = tokio::spawn({
@@ -1013,29 +1228,57 @@ mod tests {
         });
         claim_started.wait().await;
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), binding.close_for_test("session-1"))
-                .await
-                .expect("close must not wait for a stalled pre-turn receipt claim"),
-            "close must drop the live binding"
-        );
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), completion_task)
                 .await
                 .expect("pre-turn deadline must resolve the stalled claim")
                 .unwrap(),
             CommandEveAsyncCompletionResult::RetryableBusy {
-                code: "admission_timeout_before_turn".to_owned(),
+                code: "receipt_recovery_unavailable".to_owned(),
             }
         );
-        assert_eq!(runner.calls.load(Ordering::SeqCst), 0, "no turn may start after close");
-        assert_eq!(repo.claim_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            repo.recorded_acks(),
-            vec![RecordedAck {
-                status: AsyncCompletionAckStatus::Retryable,
-                code: Some("admission_timeout_before_turn".to_owned()),
-            }]
+            turn_runner.calls.load(Ordering::SeqCst),
+            0,
+            "no turn may start after close"
+        );
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM command_eve_async_completion_receipts WHERE completion_id = 'completion-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the cancelled transaction must release the SQLite connection");
+        assert_eq!(receipt_count, 0, "the dropped claim transaction must roll back");
+    }
+
+    #[tokio::test]
+    async fn receipt_recovery_timeout_is_fail_closed() {
+        let repo = Arc::new(
+            RecordingReceiptRepo::new(AsyncCompletionReceiptClaim::Claimed {
+                turn_id: "turn-recovery-timeout".to_owned(),
+            })
+            .with_stalled_retryable(),
+        );
+        let (mut consumer, _) = consumer_with(repo, StubTurnResult::Completed, Some("session-1")).await;
+        consumer.receipt_recovery_timeout = Duration::from_millis(1);
+        let (completion, _receiver) = dispatch("session-1").await;
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                consumer.resolve_claimed_without_turn(
+                    &completion,
+                    &hex_sha256(completion.request.content.as_bytes()),
+                    "test_retry",
+                    "test_unknown",
+                    "test_unknown_outcome",
+                ),
+            )
+            .await
+            .expect("receipt recovery must have a deadline"),
+            CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "receipt_recovery_timeout".to_owned(),
+            }
         );
     }
 
