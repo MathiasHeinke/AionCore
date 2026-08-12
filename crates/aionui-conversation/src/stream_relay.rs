@@ -1872,9 +1872,13 @@ mod tests {
 
         let mut ws_rx = bus.subscribe();
         let rx = tx.subscribe();
-        // Deliberately project session info before Start. A reconnecting or
-        // late-mounted renderer must be able to bind this event from its own
-        // canonical session_id instead of depending on transient Start state.
+        // Start is the sole live session/turn authority. SessionInfo may carry
+        // desktop metadata only after that positive binding exists; it never
+        // self-binds a reconnecting renderer.
+        tx.send(AgentStreamEvent::Start(StartEventData {
+            session_id: Some("hermes-session-real".into()),
+        }))
+        .unwrap();
         tx.send(AgentStreamEvent::AcpSessionInfo(json!({
             "sessionId": "hermes-session-real",
             "updatedAt": "2026-08-08T06:45:00Z",
@@ -1882,10 +1886,6 @@ mod tests {
                 "commandEveDesktop": desktop_envelope.clone()
             }
         })))
-        .unwrap();
-        tx.send(AgentStreamEvent::Start(StartEventData {
-            session_id: Some("hermes-session-real".into()),
-        }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
 
@@ -1902,6 +1902,7 @@ mod tests {
             .find(|event| event.name == "message.stream" && event.data["type"] == "start")
             .expect("Start must be projected to message.stream");
         assert_eq!(start.data["conversation_id"], "conv-desktop-real");
+        assert_eq!(start.data["turn_id"], "turn-desktop-real");
         assert_eq!(start.data["data"]["session_id"], "hermes-session-real");
 
         let desktop = ws_events
@@ -1916,6 +1917,18 @@ mod tests {
         assert!(desktop.data["data"].get("sessionUpdate").is_none());
         assert!(desktop.data["data"].get("session_update").is_none());
         assert_eq!(desktop.data["data"]["_meta"]["commandEveDesktop"], desktop_envelope);
+        let start_index = ws_events
+            .iter()
+            .position(|event| event.name == "message.stream" && event.data["type"] == "start")
+            .expect("Start index");
+        let desktop_index = ws_events
+            .iter()
+            .position(|event| event.name == "message.stream" && event.data["type"] == "acp_session_info")
+            .expect("SessionInfo index");
+        assert!(
+            start_index < desktop_index,
+            "Start authority must precede desktop metadata"
+        );
     }
 
     #[tokio::test]

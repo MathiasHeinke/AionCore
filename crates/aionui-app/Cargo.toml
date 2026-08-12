@@ -78,4 +78,5 @@ tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
