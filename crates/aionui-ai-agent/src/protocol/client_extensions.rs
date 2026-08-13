@@ -243,6 +243,37 @@ impl AcpClientExtensionRouter {
         Ok(())
     }
 
+    /// Fence ordinary cancellation before its notification crosses the
+    /// transport. Unlike shutdown, cancellation keeps the route reusable, but
+    /// only a later positively acknowledged session bind may reopen it.
+    pub(crate) async fn begin_session_cancel(&self) -> Result<(), AcpError> {
+        let cancelled_session = self.session_binding.bound_session_id();
+        self.session_binding
+            .invalidate()
+            .await
+            .map_err(|_| local_binding_error())?;
+        if let Some(cancelled_session) = cancelled_session {
+            reject_command_eve_prompt_admissions_for_session(
+                &cancelled_session,
+                "ATTACHMENT_PROMPT_FINALIZE_PEER_ACK_UNAVAILABLE",
+            );
+        }
+        let (cancelled, cancelled_terminal) = {
+            let mut state = self.state.lock().map_err(|_| local_binding_error())?;
+            (
+                state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
+                state
+                    .pending_terminal
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        cancel_pending(cancelled, "session_cancelled");
+        cancel_pending_terminal(cancelled_terminal, "session_cancelled");
+        Ok(())
+    }
+
     /// Cancel all pending requests before transport shutdown/disconnect.
     pub(crate) fn cancel_all(&self, reason: &'static str) {
         let cancelled_session = self.session_binding.bound_session_id();
@@ -1438,6 +1469,72 @@ mod tests {
         assert_eq!(post_close.status, AcpAsyncCompletionAckStatus::Retryable);
         assert_eq!(post_close.code.as_deref(), Some("session_not_bound"));
         assert!(completion_rx.try_recv().is_err(), "close must prevent another dispatch");
+    }
+
+    #[tokio::test]
+    async fn cancel_fence_stales_queued_work_until_a_fresh_positive_bind() {
+        let (event_tx, _) = broadcast::channel(4);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(4);
+        let router = AcpClientExtensionRouter::new(event_tx).with_async_completion(completion_route(completion_tx));
+        router.enable_async_completion().unwrap();
+        router.bind_session("session-1").await.unwrap();
+        let pre_cancel_lease = router.session_binding.lease().unwrap();
+
+        let queued_response = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let queued = completion_rx.recv().await.expect("queued completion");
+        assert_eq!(queued.kind, CommandEveAsyncCompletionDispatchKind::Apply);
+
+        router.begin_session_cancel().await.unwrap();
+        assert!(router.session_binding.lease().is_none());
+        assert!(queued.turn_gate.try_admit_turn().is_none());
+        queued
+            .reply
+            .send(CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "session_not_bound".to_owned(),
+            })
+            .unwrap();
+        let queued_response: AcpAsyncCompletionResponse =
+            serde_json::from_value(queued_response.await.unwrap().unwrap()).unwrap();
+        assert_eq!(queued_response.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(queued_response.code.as_deref(), Some("session_not_bound"));
+
+        let post_cancel = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let post_cancel: AcpAsyncCompletionResponse =
+            serde_json::from_value(post_cancel.await.unwrap().unwrap()).unwrap();
+        assert_eq!(post_cancel.status, AcpAsyncCompletionAckStatus::Retryable);
+        assert_eq!(post_cancel.code.as_deref(), Some("session_not_bound"));
+        assert!(completion_rx.try_recv().is_err(), "post-cancel work must not dispatch");
+
+        router.bind_session("session-1").await.unwrap();
+        let rebound_lease = router.session_binding.lease().unwrap();
+        assert!(rebound_lease.generation() > pre_cancel_lease.generation());
+        assert!(queued.turn_gate.try_admit_turn().is_none());
+
+        let rebound_response = dispatch(
+            &router,
+            COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
+            serde_json::to_value(completion_request("session-1")).unwrap(),
+        );
+        let rebound = completion_rx.recv().await.expect("completion after positive rebind");
+        assert!(rebound.lease.generation() > pre_cancel_lease.generation());
+        assert!(rebound.turn_gate.try_admit_turn().is_some());
+        rebound
+            .reply
+            .send(CommandEveAsyncCompletionResult::Completed {
+                turn_id: "turn-after-cancel-rebind".to_owned(),
+            })
+            .unwrap();
+        let rebound_response: AcpAsyncCompletionResponse =
+            serde_json::from_value(rebound_response.await.unwrap().unwrap()).unwrap();
+        assert_eq!(rebound_response.status, AcpAsyncCompletionAckStatus::Accepted);
     }
 
     #[tokio::test]

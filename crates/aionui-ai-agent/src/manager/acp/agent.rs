@@ -1522,7 +1522,8 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
             Self::require_cancel_transport(session.session_id(), self.protocol.is_connected())?.to_owned()
         };
         self.protocol
-            .cancel(CancelNotification::new(SessionId::new(session_id.as_str())))
+            .cancel_session(CancelNotification::new(SessionId::new(session_id.as_str())))
+            .await
             .map_err(AgentError::from)?;
         self.permission_router.cancel_all();
 

@@ -366,6 +366,15 @@ impl AcpProtocol {
             })
     }
 
+    /// Fence durable client-extension work before submitting an ordinary
+    /// cancellation notification. Transport failures stay visible and leave
+    /// the route unbound until a later successful session bind.
+    pub async fn cancel_session(&self, notification: CancelNotification) -> Result<(), AcpError> {
+        self.ensure_connected()?;
+        self.client_extensions.begin_session_cancel().await?;
+        self.cancel(notification)
+    }
+
     /// Set the session mode.
     pub async fn set_mode(&self, req: SetSessionModeRequest) -> Result<SetSessionModeResponse, AcpError> {
         self.send_request(req, AGENT_METHOD_NAMES.session_set_mode).await

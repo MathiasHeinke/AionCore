@@ -1375,6 +1375,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_queued_apply_cannot_mutate_a_receipt_or_start_a_turn() {
+        let repo = Arc::new(RecordingReceiptRepo::new(AsyncCompletionReceiptClaim::Claimed {
+            turn_id: "turn-cancelled-queued-apply".to_owned(),
+        }));
+        let (consumer, runner) = consumer_with(repo.clone(), StubTurnResult::Completed, Some("session-1")).await;
+        let binding = AcpSessionBinding::bound_for_test("session-1").await;
+        let (reply, receiver) = oneshot::channel();
+        let (queued, _unused_reply) = dispatch_for_binding("session-1", binding.clone(), reply, receiver);
+
+        binding.cancel_for_test().await;
+        assert_eq!(
+            consumer.consume(&queued).await,
+            CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "session_not_bound".to_owned(),
+            }
+        );
+        assert_eq!(
+            repo.claim_calls.load(Ordering::SeqCst),
+            0,
+            "cancelled work cannot claim a receipt"
+        );
+        assert!(
+            repo.recorded_rejections().is_empty(),
+            "cancelled work cannot write a rejection receipt"
+        );
+        assert!(
+            repo.recorded_acks().is_empty(),
+            "cancelled work cannot acknowledge a receipt"
+        );
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            0,
+            "cancelled work cannot start a turn"
+        );
+    }
+
+    #[tokio::test]
     async fn receipt_recovery_timeout_is_fail_closed() {
         let repo = Arc::new(
             RecordingReceiptRepo::new(AsyncCompletionReceiptClaim::Claimed {

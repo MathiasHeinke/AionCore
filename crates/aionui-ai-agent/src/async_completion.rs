@@ -398,6 +398,13 @@ impl AcpSessionBinding {
         self.unbind_matching(session_id).await.expect("test session close")
     }
 
+    /// Test-only ordinary-cancel transition for cross-crate durable consumer
+    /// regressions. Production transitions remain router-owned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn cancel_for_test(&self) {
+        self.invalidate().await.expect("test session cancel")
+    }
+
     fn advance(state: &mut AcpSessionBindingState) {
         if let Some(generation) = state.generation.checked_add(1) {
             state.generation = generation;
