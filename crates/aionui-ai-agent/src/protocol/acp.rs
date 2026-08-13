@@ -1391,7 +1391,7 @@ for line in sys.stdin:
         assert_eq!(wire["post-cancel-completion"]["result"]["status"], "retryable");
         assert_eq!(wire["post-cancel-completion"]["result"]["code"], "session_not_bound");
         assert_eq!(wire["post-rebind-completion"]["result"]["status"], "accepted");
-        assert_eq!(wire["post-rebind-completion"]["result"]["turnId"], "turn-post-rebind");
+        assert_eq!(wire["post-rebind-completion"]["result"]["turn_id"], "turn-post-rebind");
 
         drop(protocol);
         if tokio::time::timeout(Duration::from_secs(2), child.wait())
