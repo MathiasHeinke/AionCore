@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentSendError, AgentSessionKind, IWorkerTaskManager};
+use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData, VerifiedAttachmentGrounding};
+use aionui_ai_agent::{
+    AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager, forget_command_eve_prompt_admission,
+    reject_command_eve_prompt_admission,
+};
 use aionui_common::{AgentType, ConversationStatus, ErrorChain, now_ms};
 use aionui_db::models::ConversationRow;
 use tokio::sync::oneshot;
@@ -30,6 +33,7 @@ pub(crate) struct TurnStartInput {
     pub user_id: String,
     pub conversation: ConversationRow,
     pub request: SendMessageRequest,
+    pub verified_attachment_grounding: Vec<VerifiedAttachmentGrounding>,
     pub build_options: BuildTaskOptions,
     pub stored_workspace: String,
     pub turn_id: String,
@@ -62,6 +66,7 @@ struct TurnAttemptInput {
     allowed_skill_names: Vec<String>,
     continuation_count: usize,
     defer_clean_terminal_errors: bool,
+    ready_agent_only: bool,
 }
 
 struct TurnAttemptResult {
@@ -97,13 +102,19 @@ impl ConversationTurnOrchestrator {
             "Agent task build started"
         );
 
-        let agent = match self
-            .task_manager
-            .get_or_build_task(&input.conv_id, input.build_options)
-            .await
-        {
+        let agent_result = if input.ready_agent_only {
+            self.task_manager
+                .get_task(&input.conv_id)
+                .ok_or_else(|| AgentError::conflict("ATTACHMENT_PROMPT_RUNTIME_NOT_READY"))
+        } else {
+            self.task_manager
+                .get_or_build_task(&input.conv_id, input.build_options)
+                .await
+        };
+        let agent = match agent_result {
             Ok(agent) => agent,
             Err(err) => {
+                reject_command_eve_prompt_admission(&input.turn_id, "ATTACHMENT_PROMPT_ADMISSION_AGENT_BUILD_FAILED");
                 let top_level_code = agent_error_top_level_code(&err);
                 let send_error = redact_project_send_error(
                     AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref()),
@@ -169,6 +180,7 @@ impl ConversationTurnOrchestrator {
             .maybe_persist_workspace(&input.conv_id, &input.stored_workspace, agent.workspace())
             .await
         {
+            reject_command_eve_prompt_admission(&input.turn_id, "ATTACHMENT_PROMPT_ADMISSION_WORKSPACE_PERSIST_FAILED");
             let top_level_code = err.error_code();
             let send_error = AgentSendError::from_agent_error(err.to_agent_error());
             error!(
@@ -241,6 +253,10 @@ impl ConversationTurnOrchestrator {
 
             tokio::spawn(async move {
                 if let Err(e) = send_agent.send_message(current_send).await {
+                    reject_command_eve_prompt_admission(
+                        &turn_id_for_send,
+                        "ATTACHMENT_PROMPT_ADMISSION_AGENT_SEND_FAILED",
+                    );
                     let e = redact_project_send_error(e, send_project_runtime_workspace_path.as_deref());
                     let failure_message = availability_failure_message(&e);
                     record_agent_session_failure(
@@ -303,6 +319,7 @@ impl ConversationTurnOrchestrator {
                             msg_id: next_turn_msg_id.clone(),
                             turn_id: Some(input.turn_id.clone()),
                             files: vec![],
+                            verified_attachment_grounding: vec![],
                             inject_skills: vec![],
                         },
                         next_turn_msg_id,
@@ -340,6 +357,7 @@ impl ConversationTurnOrchestrator {
             msg_id: first_turn_msg_id.clone(),
             turn_id: Some(turn_id.clone()),
             files: input.request.files,
+            verified_attachment_grounding: input.verified_attachment_grounding,
             inject_skills: input.request.inject_skills,
         };
         let mut replayed = false;
@@ -361,6 +379,7 @@ impl ConversationTurnOrchestrator {
                     allowed_skill_names: allowed_skill_names.clone(),
                     continuation_count: 0,
                     defer_clean_terminal_errors: !replayed,
+                    ready_agent_only: !replayed && !initial_send.verified_attachment_grounding.is_empty(),
                 })
                 .await
             {
@@ -398,13 +417,27 @@ impl ConversationTurnOrchestrator {
 
             let mut recovery_outcome = attempt_result.outcome.clone();
             recovery_outcome.attempt = attempt_result.summary.clone();
-            let decision = TurnRecoveryPolicy::decide(
-                attempt_result.agent_type,
-                attempt_result.backend.as_deref(),
-                &recovery_outcome,
-                lifecycle,
-                replayed,
-            );
+            // Verified attachment prompts cross a one-shot admission barrier.
+            // Replaying after that barrier closes would send the same grounded
+            // turn without a live admission ticket, so only ordinary text
+            // turns are eligible for the generic ACP recovery replay.
+            let decision = if initial_send.verified_attachment_grounding.is_empty() {
+                TurnRecoveryPolicy::decide(
+                    attempt_result.agent_type,
+                    attempt_result.backend.as_deref(),
+                    &recovery_outcome,
+                    lifecycle,
+                    replayed,
+                )
+            } else {
+                info!(
+                    conversation_id = %conv_id,
+                    turn_id = %turn_id,
+                    error_code = ?attempt_result.outcome.terminal.code(),
+                    "grounded conversation turn auto replay blocked by one-shot prompt admission"
+                );
+                TurnRecoveryDecision::None
+            };
 
             match decision {
                 TurnRecoveryDecision::AutoReplayOnce { reason, .. } => {
@@ -467,6 +500,7 @@ impl ConversationTurnOrchestrator {
         self.service
             .complete_released_turn(&conv_id, &turn_id, was_deleting)
             .await;
+        forget_command_eve_prompt_admission(&turn_id);
 
         ConversationTurnResult {
             status: if final_failed {

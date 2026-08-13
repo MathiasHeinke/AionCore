@@ -143,6 +143,13 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a message. Returns `DbError::NotFound` if ID is missing.
     async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), DbError>;
 
+    /// Deletes one message scoped to its conversation. Grounded prompt
+    /// admission uses this to roll back a provisional user row when the final
+    /// ACP response was not delivered.
+    async fn delete_message(&self, _conv_id: &str, _message_id: &str) -> Result<(), DbError> {
+        Err(DbError::Conflict("MESSAGE_DELETE_UNSUPPORTED".to_owned()))
+    }
+
     /// Deletes all messages belonging to a conversation.
     async fn delete_messages_by_conversation(&self, conv_id: &str) -> Result<(), DbError>;
 
@@ -154,8 +161,8 @@ pub trait IConversationRepository: Send + Sync {
         msg_type: &str,
     ) -> Result<Option<MessageRow>, DbError>;
 
-    /// Lists stale assistant-side runtime messages that were left in a
-    /// non-terminal state by a previous process.
+    /// Lists stale assistant-side runtime messages plus hidden provisional
+    /// grounded user rows left in a non-terminal state by a previous process.
     async fn list_stale_runtime_messages(&self) -> Result<Vec<MessageRow>, DbError> {
         Ok(Vec::new())
     }

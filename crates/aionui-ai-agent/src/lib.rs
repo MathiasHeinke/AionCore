@@ -12,6 +12,7 @@ pub(crate) mod idle_scanner;
 pub mod manager;
 pub(crate) mod persistence;
 pub mod project_runtime_fence;
+pub mod prompt_admission;
 pub mod protocol;
 pub mod registry;
 pub mod routes;
@@ -41,6 +42,10 @@ pub use error::AgentError;
 pub use factory::{AgentFactoryDeps, build_agent_factory};
 pub use idle_scanner::start_idle_scanner;
 pub use persistence::AcpSessionSyncService;
+pub use prompt_admission::{
+    CommandEvePromptAdmissionClaim, CommandEvePromptAdmissionTicket, forget_command_eve_prompt_admission,
+    register_command_eve_prompt_admission, reject_command_eve_prompt_admission,
+};
 pub use protocol::error::AcpError;
 pub use protocol::events::AgentStreamEvent;
 pub use protocol::send_error::AgentSendError;

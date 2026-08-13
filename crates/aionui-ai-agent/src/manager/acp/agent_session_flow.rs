@@ -1,6 +1,7 @@
 use crate::error::AgentError;
 use crate::manager::acp::AcpAgentManager;
 use crate::manager::acp::mode_normalize::agent_metadata_uses_meta_resume;
+use crate::prompt_admission::command_eve_prompt_admission_for_turn;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{
     AgentStreamEvent, AvailableCommandsEventData, ErrorEventData, SessionAssignedEventData, StartEventData, TipType,
@@ -14,6 +15,7 @@ use agent_client_protocol::schema::{
 };
 use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -28,10 +30,47 @@ const UNRENDERED_STDERR_SETTLE_WINDOW: std::time::Duration = std::time::Duration
 const UNRENDERED_STDERR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 fn build_prompt_content_blocks(data: &SendMessageData) -> Result<Vec<ContentBlock>, AgentError> {
+    let grounding_by_path: HashMap<&str, _> = data
+        .verified_attachment_grounding
+        .iter()
+        .map(|grounding| (grounding.grounding_path.as_str(), grounding))
+        .collect();
+    let grounded_source_paths: HashSet<&str> = data
+        .verified_attachment_grounding
+        .iter()
+        .map(|grounding| grounding.source_path.as_str())
+        .collect();
+    if data
+        .files
+        .iter()
+        .any(|file| is_visual_source_path(Path::new(file)) && !grounded_source_paths.contains(file.as_str()))
+    {
+        return Err(AgentError::bad_request("ATTACHMENT_GROUNDING_REQUIRED"));
+    }
     let mut blocks = Vec::with_capacity(data.files.len() + 1);
     blocks.push(ContentBlock::from(data.content.clone()));
 
     for file in &data.files {
+        // The verified text is the only model-visible visual lane. Never let
+        // Hermes reopen the raw source as a ResourceLink after byte verification.
+        if grounded_source_paths.contains(file.as_str()) {
+            continue;
+        }
+        if let Some(grounding) = grounding_by_path.get(file.as_str()) {
+            // AionUI already includes the exact prepared context in the user
+            // string so Hermes' native string history keeps it across rebuilds
+            // and restarts. Inject only for native callers that did not.
+            if !data.content.contains(&grounding.grounding_text) {
+                blocks.push(ContentBlock::from(format!(
+                    "[[COMMAND_EVE_VERIFIED_ATTACHMENT_GROUNDING source_sha256={} grounding_sha256={} grounding_bytes={}]]\n{}\n[[/COMMAND_EVE_VERIFIED_ATTACHMENT_GROUNDING]]",
+                    grounding.source_sha256,
+                    grounding.grounding_sha256,
+                    grounding.grounding_bytes,
+                    grounding.grounding_text
+                )));
+            }
+            continue;
+        }
         let path = Path::new(file);
         if !path.is_absolute() {
             return Err(AgentError::bad_request(
@@ -53,6 +92,15 @@ fn build_prompt_content_blocks(data: &SendMessageData) -> Result<Vec<ContentBloc
         blocks.push(ContentBlock::ResourceLink(ResourceLink::new(name, uri.to_string())));
     }
     Ok(blocks)
+}
+
+fn is_visual_source_path(path: &Path) -> bool {
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    [
+        "pdf", "png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "ico", "tif", "tiff", "avif",
+    ]
+    .iter()
+    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
 }
 
 #[derive(Debug)]
@@ -328,9 +376,33 @@ impl AcpAgentManager {
         // earlier turn cannot override a later benign empty turn.
         self.process.clear_stderr().await;
 
+        let mut prompt_request = PromptRequest::new(SessionId::new(sid), prompt);
+        if !data.verified_attachment_grounding.is_empty() {
+            if self.backend() != Some("hermes") {
+                return Err(AcpSendFailure::from(AgentError::bad_request(
+                    "ATTACHMENT_GROUNDING_HERMES_REQUIRED",
+                )));
+            }
+            let turn_id = data.turn_id.as_deref().ok_or_else(|| {
+                AcpSendFailure::from(AgentError::bad_request("ATTACHMENT_PROMPT_ADMISSION_TURN_REQUIRED"))
+            })?;
+            let admission = command_eve_prompt_admission_for_turn(turn_id)
+                .ok_or_else(|| AcpSendFailure::from(AgentError::conflict("ATTACHMENT_PROMPT_ADMISSION_REQUIRED")))?;
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "commandEvePromptAdmission".into(),
+                serde_json::to_value(admission).map_err(|error| {
+                    AcpSendFailure::from(AgentError::internal(format!(
+                        "ATTACHMENT_PROMPT_ADMISSION_ENCODING_FAILED: {error}"
+                    )))
+                })?,
+            );
+            prompt_request = prompt_request.meta(meta);
+        }
+
         let prompt_response = self
             .protocol
-            .prompt(PromptRequest::new(SessionId::new(sid), prompt))
+            .prompt(prompt_request)
             .await
             .map_err(AcpSendFailure::from)?;
 
@@ -585,9 +657,9 @@ mod tests {
     fn prompt_blocks_forward_files_as_ordered_resource_links() {
         let directory = tempdir().unwrap();
         let first_path = directory.path().join("first.txt");
-        let second_path = directory.path().join("second.pdf");
+        let second_path = directory.path().join("second.md");
         fs::write(&first_path, "first").unwrap();
-        fs::write(&second_path, "%PDF-1.4\n%%EOF\n").unwrap();
+        fs::write(&second_path, "second").unwrap();
         let data = SendMessageData {
             content: "Read both attachments.".into(),
             msg_id: "msg-files".into(),
@@ -596,6 +668,7 @@ mod tests {
                 first_path.to_string_lossy().into_owned(),
                 second_path.to_string_lossy().into_owned(),
             ],
+            verified_attachment_grounding: Vec::new(),
             inject_skills: Vec::new(),
         };
 
@@ -610,7 +683,7 @@ mod tests {
         assert!(matches!(
             &blocks[2],
             ContentBlock::ResourceLink(link)
-                if link.name == "second.pdf" && link.uri == Url::from_file_path(&second_path).unwrap().to_string()
+                if link.name == "second.md" && link.uri == Url::from_file_path(&second_path).unwrap().to_string()
         ));
     }
 
@@ -621,10 +694,98 @@ mod tests {
             msg_id: "msg-text".into(),
             turn_id: None,
             files: Vec::new(),
+            verified_attachment_grounding: Vec::new(),
             inject_skills: Vec::new(),
         };
         let blocks = build_prompt_content_blocks(&data).unwrap();
         assert!(matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text.text == "Hello"));
+    }
+
+    #[test]
+    fn prompt_blocks_embed_verified_sidecar_instead_of_forwarding_it_as_a_resource_link() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("brief.pdf");
+        let grounding_path = directory.path().join("document.md");
+        fs::write(&source_path, "%PDF-1.4\n%%EOF\n").unwrap();
+        fs::write(&grounding_path, "## PDF p. 1\nVerified evidence.\n").unwrap();
+        let data = SendMessageData {
+            content: "Summarize the document.".into(),
+            msg_id: "msg-grounded".into(),
+            turn_id: Some("turn-grounded".into()),
+            files: vec![
+                source_path.to_string_lossy().into_owned(),
+                grounding_path.to_string_lossy().into_owned(),
+            ],
+            verified_attachment_grounding: vec![crate::types::VerifiedAttachmentGrounding {
+                source_path: source_path.to_string_lossy().into_owned(),
+                source_sha256: "a".repeat(64),
+                source_bytes: 15,
+                grounding_path: grounding_path.to_string_lossy().into_owned(),
+                grounding_sha256: "b".repeat(64),
+                grounding_bytes: 31,
+                grounding_text: "## PDF p. 1\nVerified evidence.\n".into(),
+            }],
+            inject_skills: Vec::new(),
+        };
+
+        let blocks = build_prompt_content_blocks(&data).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[1], ContentBlock::Text(text)
+            if text.text.contains("COMMAND_EVE_VERIFIED_ATTACHMENT_GROUNDING")
+                && text.text.contains("Verified evidence.")));
+    }
+
+    #[test]
+    fn prompt_blocks_reject_raw_visuals_without_verified_coverage() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("raw.png");
+        fs::write(&source_path, "raw").unwrap();
+        let data = SendMessageData {
+            content: "Describe this.".into(),
+            msg_id: "msg-raw".into(),
+            turn_id: Some("turn-raw".into()),
+            files: vec![source_path.to_string_lossy().into_owned()],
+            verified_attachment_grounding: Vec::new(),
+            inject_skills: Vec::new(),
+        };
+
+        assert!(
+            build_prompt_content_blocks(&data)
+                .unwrap_err()
+                .to_string()
+                .contains("ATTACHMENT_GROUNDING_REQUIRED")
+        );
+    }
+
+    #[test]
+    fn prompt_blocks_do_not_duplicate_grounding_already_in_string_history() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("brief.pdf");
+        let grounding_path = directory.path().join("document.md");
+        fs::write(&source_path, "%PDF-1.4\n%%EOF\n").unwrap();
+        fs::write(&grounding_path, "Verified evidence.").unwrap();
+        let data = SendMessageData {
+            content: "Summarize.\nVerified evidence.".into(),
+            msg_id: "msg-grounded-history".into(),
+            turn_id: Some("turn-grounded-history".into()),
+            files: vec![
+                source_path.to_string_lossy().into_owned(),
+                grounding_path.to_string_lossy().into_owned(),
+            ],
+            verified_attachment_grounding: vec![crate::types::VerifiedAttachmentGrounding {
+                source_path: source_path.to_string_lossy().into_owned(),
+                source_sha256: "a".repeat(64),
+                source_bytes: 15,
+                grounding_path: grounding_path.to_string_lossy().into_owned(),
+                grounding_sha256: "b".repeat(64),
+                grounding_bytes: 18,
+                grounding_text: "Verified evidence.".into(),
+            }],
+            inject_skills: Vec::new(),
+        };
+
+        let blocks = build_prompt_content_blocks(&data).unwrap();
+        assert!(matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text.text == data.content));
     }
 
     /// `open_session_resume` reads `session.agent_capabilities().load_session`

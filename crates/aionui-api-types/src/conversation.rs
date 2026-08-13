@@ -121,6 +121,12 @@ pub struct SendMessageRequest {
     pub content: String,
     #[serde(default)]
     pub files: Vec<String>,
+    /// Optional fail-closed grounding contract for attachment-bearing Command
+    /// EVE turns. The server verifies every byte before persisting the user
+    /// message and returns a receipt for the exact evidence handed to the
+    /// agent. Legacy/text-only callers omit this field unchanged.
+    #[serde(default)]
+    pub attachment_grounding: Option<AttachmentGroundingRequest>,
     #[serde(default)]
     pub inject_skills: Vec<String>,
     #[serde(default)]
@@ -145,6 +151,56 @@ pub struct SendMessageResponse {
     pub msg_id: String,
     pub turn_id: String,
     pub runtime: ConversationRuntimeSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_grounding_receipt: Option<AttachmentGroundingReceipt>,
+}
+
+pub const ATTACHMENT_GROUNDING_REQUEST_VERSION: &str = "command-eve-attachment-grounding/v1";
+pub const ATTACHMENT_GROUNDING_RECEIPT_VERSION: &str = "command-eve-attachment-grounding-receipt/v1";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentGroundingKind {
+    Pdf,
+    Image,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentGroundingExpectation {
+    pub kind: AttachmentGroundingKind,
+    pub source_path: String,
+    pub source_sha256: String,
+    pub source_bytes: u64,
+    pub grounding_path: String,
+    pub grounding_sha256: String,
+    pub grounding_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentGroundingRequest {
+    pub version: String,
+    pub entries: Vec<AttachmentGroundingExpectation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentGroundingReceiptEntry {
+    pub kind: AttachmentGroundingKind,
+    pub source_path: String,
+    pub source_sha256: String,
+    pub source_bytes: u64,
+    pub grounding_path: String,
+    pub grounding_sha256: String,
+    pub grounding_bytes: u64,
+    pub grounding_embedded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentGroundingReceipt {
+    pub version: String,
+    pub status: String,
+    pub entries: Vec<AttachmentGroundingReceiptEntry>,
 }
 
 /// Body for `POST /api/conversations/:id/steer`.

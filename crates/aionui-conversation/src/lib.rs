@@ -4,6 +4,7 @@
 mod acp_error_recovery;
 mod agent_health_policy;
 mod async_completion_receipts;
+mod attachment_grounding;
 mod convert;
 pub mod error;
 pub(crate) mod message_cursor;

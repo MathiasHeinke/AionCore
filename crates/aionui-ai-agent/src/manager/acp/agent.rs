@@ -1276,7 +1276,7 @@ impl AcpAgentManager {
     /// 2. Sid present but CLI has not opened it (fresh task) → `open_session_resume`
     /// 3. Already opened → noop, return the existing sid
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]
-    async fn ensure_session_opened(&self) -> Result<String, AgentError> {
+    pub(crate) async fn ensure_session_opened(&self) -> Result<String, AgentError> {
         debug!("Ensuring ACP session is opened");
         let _lock = self.session_lock.lock().await;
         self.ensure_protocol_connected_for_operation("ensure_session_opened")?;

@@ -7,6 +7,13 @@ use std::sync::{
 use std::time::Duration;
 
 use aionui_ai_agent::agent_task::{AgentInstance, ConfirmationPrincipalContext, IAgentTask, IMockAgent};
+use aionui_ai_agent::prompt_admission::{
+    CommandEvePromptAdmissionClaimResult, CommandEvePromptAdmissionDecision,
+    CommandEvePromptAdmissionFinalizeClaimResult, CommandEvePromptAdmissionPeerAckClaimResult,
+    acknowledge_command_eve_prompt_admission, admit_command_eve_prompt_admission, claim_command_eve_prompt_admission,
+    command_eve_prompt_admission_for_turn, complete_command_eve_prompt_admission_commit,
+    finalize_command_eve_prompt_admission, mark_command_eve_prompt_finalize_response,
+};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
@@ -24,14 +31,15 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
+    ATTACHMENT_GROUNDING_REQUEST_VERSION, AttachmentGroundingExpectation, AttachmentGroundingKind,
+    AttachmentGroundingRequest, CloneConversationRequest, CreateConversationRequest, ListConversationsQuery,
+    ProjectBindingExpectation, ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest,
+    SteerConversationRequest, UpdateConversationRequest, WebSocketMessage,
+};
+use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentErrorOwnership, AgentModeResponse, ConfigOptionConfirmation,
     ConversationArtifactKind, ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry,
     ModelInfoPayload, SetConfigOptionRequest, SetConfigOptionResponse,
-};
-use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ProjectBindingExpectation,
-    ProjectRuntimeWorkspaceRequest, SearchMessagesQuery, SendMessageRequest, SteerConversationRequest,
-    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
@@ -779,6 +787,16 @@ impl IConversationRepository for MockRepo {
         Ok(())
     }
 
+    async fn delete_message(&self, conv_id: &str, message_id: &str) -> Result<(), aionui_db::DbError> {
+        let mut messages = self.messages.lock().unwrap();
+        let before = messages.len();
+        messages.retain(|message| !(message.conversation_id == conv_id && message.id == message_id));
+        if messages.len() == before {
+            return Err(aionui_db::DbError::NotFound(format!("Message {message_id}")));
+        }
+        Ok(())
+    }
+
     async fn delete_messages_by_conversation(&self, conv_id: &str) -> Result<(), aionui_db::DbError> {
         self.messages
             .lock()
@@ -809,9 +827,22 @@ impl IConversationRepository for MockRepo {
         Ok(messages
             .iter()
             .filter(|message| {
-                message.position.as_deref() == Some("left")
+                let stale_assistant = message.position.as_deref() == Some("left")
                     && matches!(message.status.as_deref(), Some("work" | "pending"))
-                    && matches!(message.r#type.as_str(), "text" | "thinking")
+                    && matches!(message.r#type.as_str(), "text" | "thinking");
+                let provisional_grounding = message.position.as_deref() == Some("right")
+                    && message.status.as_deref() == Some("pending")
+                    && message.r#type == "text"
+                    && message.hidden
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("command_eve_prompt_admission").cloned())
+                        .is_some_and(|marker| {
+                            marker.get("version").and_then(|value| value.as_str())
+                                == Some("command-eve-prompt-admission/v1")
+                                && marker.get("state").and_then(|value| value.as_str()) == Some("provisional")
+                        });
+                stale_assistant || provisional_grounding
             })
             .cloned()
             .collect())
@@ -3209,7 +3240,6 @@ async fn list_artifacts_includes_legacy_cron_trigger_messages() {
     })
     .await
     .unwrap();
-
     let artifacts = svc.list_artifacts("user_1", &conv.id).await.unwrap();
 
     assert_eq!(artifacts.len(), 1);
@@ -3279,6 +3309,11 @@ struct MockAgent {
     block_steer: bool,
     steer_started: Arc<Notify>,
     steer_release: Arc<Notify>,
+    admission_started: Option<Arc<Notify>>,
+    admission_release: Option<Arc<Notify>>,
+    peer_ack_started: Option<Arc<Notify>>,
+    peer_ack_release: Option<Arc<Notify>>,
+    finalize_delivery_succeeds: bool,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
     allow_direct_confirm: bool,
@@ -3323,6 +3358,11 @@ impl MockAgent {
             block_steer: false,
             steer_started: Arc::new(Notify::new()),
             steer_release: Arc::new(Notify::new()),
+            admission_started: None,
+            admission_release: None,
+            peer_ack_started: None,
+            peer_ack_release: None,
+            finalize_delivery_succeeds: true,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -3347,6 +3387,11 @@ impl MockAgent {
             block_steer: false,
             steer_started: Arc::new(Notify::new()),
             steer_release: Arc::new(Notify::new()),
+            admission_started: None,
+            admission_release: None,
+            peer_ack_started: None,
+            peer_ack_release: None,
+            finalize_delivery_succeeds: true,
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -3371,6 +3416,11 @@ impl MockAgent {
             block_steer: false,
             steer_started: Arc::new(Notify::new()),
             steer_release: Arc::new(Notify::new()),
+            admission_started: None,
+            admission_release: None,
+            peer_ack_started: None,
+            peer_ack_release: None,
+            finalize_delivery_succeeds: true,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: true,
@@ -3406,6 +3456,23 @@ impl MockAgent {
         self.block_steer = true;
         self
     }
+
+    fn with_blocking_admission(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.admission_started = Some(started);
+        self.admission_release = Some(release);
+        self
+    }
+
+    fn with_finalize_delivery_failure(mut self) -> Self {
+        self.finalize_delivery_succeeds = false;
+        self
+    }
+
+    fn with_blocking_peer_ack(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.peer_ack_started = Some(started);
+        self.peer_ack_release = Some(release);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -3428,7 +3495,92 @@ impl IAgentTask for MockAgent {
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.event_tx.subscribe()
     }
-    async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+    async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        if !data.verified_attachment_grounding.is_empty() {
+            let turn_id = data.turn_id.as_deref().expect("grounded mock turn id");
+            let request = command_eve_prompt_admission_for_turn(turn_id).expect("registered grounded admission");
+            let request_id = request.request_id.clone();
+            admit_command_eve_prompt_admission(&request, "mock-session")
+                .expect("mock Hermes accepted the exact grounded prompt");
+            match claim_command_eve_prompt_admission(&request, "mock-session")
+                .expect("exact grounded admission request")
+            {
+                CommandEvePromptAdmissionClaimResult::AwaitingDecision(decision) => match decision.await {
+                    Ok(CommandEvePromptAdmissionDecision::Accepted) => {
+                        complete_command_eve_prompt_admission_commit(&request_id, "mock-session", true);
+                        if let (Some(started), Some(release)) = (&self.admission_started, &self.admission_release) {
+                            started.notify_one();
+                            release.notified().await;
+                        }
+                        match finalize_command_eve_prompt_admission(&request, "mock-session")
+                            .expect("mock Hermes consumed the commit response")
+                        {
+                            CommandEvePromptAdmissionFinalizeClaimResult::AwaitingDecision(decision_rx) => {
+                                match decision_rx.await {
+                                    Ok(CommandEvePromptAdmissionDecision::Accepted) => {
+                                        if self.finalize_delivery_succeeds {
+                                            mark_command_eve_prompt_finalize_response(
+                                                &request_id,
+                                                "mock-session",
+                                                true,
+                                            )
+                                            .expect("mock finalize response queued");
+                                            if let (Some(started), Some(release)) =
+                                                (&self.peer_ack_started, &self.peer_ack_release)
+                                            {
+                                                started.notify_one();
+                                                release.notified().await;
+                                            }
+                                            let peer_ack =
+                                                acknowledge_command_eve_prompt_admission(&request, "mock-session")
+                                                    .map_err(|code| {
+                                                        AgentSendError::from_agent_error(AgentError::bad_gateway(code))
+                                                    })?;
+                                            match peer_ack {
+                                                CommandEvePromptAdmissionPeerAckClaimResult::AwaitingDecision(
+                                                    peer_ack_decision,
+                                                ) => {
+                                                    let accepted = matches!(
+                                                        peer_ack_decision.await,
+                                                        Ok(CommandEvePromptAdmissionDecision::Accepted)
+                                                    );
+                                                    if !accepted {
+                                                        return Err(AgentSendError::from_agent_error(
+                                                            AgentError::bad_gateway(
+                                                                "ATTACHMENT_PROMPT_PEER_ACK_REJECTED",
+                                                            ),
+                                                        ));
+                                                    }
+                                                }
+                                                CommandEvePromptAdmissionPeerAckClaimResult::AlreadyAccepted => {}
+                                            }
+                                        } else {
+                                            let _ = mark_command_eve_prompt_finalize_response(
+                                                &request_id,
+                                                "mock-session",
+                                                false,
+                                            );
+                                        }
+                                    }
+                                    Ok(CommandEvePromptAdmissionDecision::Rejected) | Err(_) => {
+                                        return Err(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                                            "ATTACHMENT_PROMPT_FINALIZE_REJECTED",
+                                        )));
+                                    }
+                                }
+                            }
+                            CommandEvePromptAdmissionFinalizeClaimResult::AlreadyAccepted => {}
+                        }
+                    }
+                    Ok(CommandEvePromptAdmissionDecision::Rejected) | Err(_) => {
+                        return Err(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                            "ATTACHMENT_PROMPT_ADMISSION_REJECTED",
+                        )));
+                    }
+                },
+                CommandEvePromptAdmissionClaimResult::AlreadyAccepted => {}
+            }
+        }
         // Emit finish event so the relay task completes
         let _ = self.event_tx.send(AgentStreamEvent::Finish(
             aionui_ai_agent::protocol::events::FinishEventData::default(),
@@ -3932,6 +4084,7 @@ impl IWorkerTaskManager for MockTaskManager {
 struct SlowBuildTaskManager {
     delay: Duration,
     built: AtomicBool,
+    agent: Mutex<Option<AgentInstance>>,
 }
 
 impl SlowBuildTaskManager {
@@ -3939,6 +4092,7 @@ impl SlowBuildTaskManager {
         Self {
             delay,
             built: AtomicBool::new(false),
+            agent: Mutex::new(None),
         }
     }
 
@@ -3950,7 +4104,7 @@ impl SlowBuildTaskManager {
 #[async_trait::async_trait]
 impl IWorkerTaskManager for SlowBuildTaskManager {
     fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
-        None
+        self.agent.lock().unwrap().clone()
     }
 
     async fn get_or_build_task(
@@ -3958,9 +4112,14 @@ impl IWorkerTaskManager for SlowBuildTaskManager {
         conversation_id: &str,
         _options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
+        if let Some(agent) = self.agent.lock().unwrap().clone() {
+            return Ok(agent);
+        }
         tokio::time::sleep(self.delay).await;
         self.built.store(true, Ordering::SeqCst);
-        Ok(AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id))))
+        let agent = AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id)));
+        *self.agent.lock().unwrap() = Some(agent.clone());
+        Ok(agent)
     }
 
     fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
@@ -4224,6 +4383,315 @@ async fn send_message_returns_accepted() {
     assert_eq!(response.msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
     assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
     assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+}
+
+fn grounded_pdf_request() -> (tempfile::TempDir, SendMessageRequest) {
+    let directory = tempfile::TempDir::new().unwrap();
+    let source = directory.path().join("brief.pdf");
+    let sidecar = directory.path().join("document.md");
+    let source_bytes = b"%PDF-1.4\n%%EOF\n";
+    let sidecar_bytes = b"## PDF p. 1\nVerified evidence.\n";
+    std::fs::write(&source, source_bytes).unwrap();
+    std::fs::write(&sidecar, sidecar_bytes).unwrap();
+    let source_path = source.to_string_lossy().into_owned();
+    let grounding_path = sidecar.to_string_lossy().into_owned();
+    let mut request = make_send_req();
+    request.files = vec![source_path.clone(), grounding_path.clone()];
+    request.attachment_grounding = Some(AttachmentGroundingRequest {
+        version: ATTACHMENT_GROUNDING_REQUEST_VERSION.into(),
+        entries: vec![AttachmentGroundingExpectation {
+            kind: AttachmentGroundingKind::Pdf,
+            source_path,
+            source_sha256: format!("{:x}", Sha256::digest(source_bytes)),
+            source_bytes: source_bytes.len() as u64,
+            grounding_path,
+            grounding_sha256: format!("{:x}", Sha256::digest(sidecar_bytes)),
+            grounding_bytes: sidecar_bytes.len() as u64,
+        }],
+    });
+    (directory, request)
+}
+
+#[tokio::test(start_paused = true)]
+async fn grounded_send_starts_admission_only_after_cold_runtime_readiness() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr_impl = Arc::new(SlowBuildTaskManager::new(Duration::from_secs(31)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr_impl.clone();
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("hermes"))
+        .await
+        .unwrap();
+    let (_directory, request) = grounded_pdf_request();
+    let send_service = svc.clone();
+    let conversation_id = conv.id.clone();
+    let send = tokio::spawn(async move {
+        send_service
+            .send_message("user_1", &conversation_id, request, &task_mgr)
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(30) + Duration::from_millis(1)).await;
+    assert!(!send.is_finished(), "readiness must not consume the admission budget");
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let response = send.await.unwrap().unwrap();
+    assert!(response.attachment_grounding_receipt.is_some());
+    wait_for_turn_released(&svc, &conv.id).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborting_grounded_cold_readiness_leaves_no_turn_or_transcript_side_effect() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr_impl = Arc::new(SlowBuildTaskManager::new(Duration::from_secs(31)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr_impl.clone();
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("hermes"))
+        .await
+        .unwrap();
+    broadcaster.take_events();
+    let (_directory, request) = grounded_pdf_request();
+    let send_service = svc.clone();
+    let conversation_id = conv.id.clone();
+    let send = tokio::spawn(async move {
+        send_service
+            .send_message("user_1", &conversation_id, request, &task_mgr)
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    send.abort();
+    let _ = send.await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    assert!(!task_mgr_impl.was_built());
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(broadcaster.take_events().is_empty());
+}
+
+#[tokio::test]
+async fn attachment_grounding_is_verified_before_persistence_and_receipted_on_success() {
+    let (svc, broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr_impl = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr_impl.clone();
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("hermes"))
+        .await
+        .unwrap();
+    broadcaster.take_events();
+
+    let directory = tempfile::TempDir::new().unwrap();
+    let source = directory.path().join("brief.pdf");
+    let sidecar = directory.path().join("document.md");
+    let source_bytes = b"%PDF-1.4\n%%EOF\n";
+    let sidecar_bytes = b"## PDF p. 1\nVerified evidence.\n";
+    std::fs::write(&source, source_bytes).unwrap();
+    std::fs::write(&sidecar, sidecar_bytes).unwrap();
+    let source_path = source.to_string_lossy().into_owned();
+    let grounding_path = sidecar.to_string_lossy().into_owned();
+    let source_sha256 = format!("{:x}", Sha256::digest(source_bytes));
+    let grounding_sha256 = format!("{:x}", Sha256::digest(sidecar_bytes));
+
+    let mut request = make_send_req();
+    request.files = vec![source_path.clone(), grounding_path.clone()];
+    request.attachment_grounding = Some(AttachmentGroundingRequest {
+        version: ATTACHMENT_GROUNDING_REQUEST_VERSION.into(),
+        entries: vec![AttachmentGroundingExpectation {
+            kind: AttachmentGroundingKind::Pdf,
+            source_path: source_path.clone(),
+            source_sha256: "0".repeat(64),
+            source_bytes: source_bytes.len() as u64,
+            grounding_path: grounding_path.clone(),
+            grounding_sha256: grounding_sha256.clone(),
+            grounding_bytes: sidecar_bytes.len() as u64,
+        }],
+    });
+
+    let mismatch = svc
+        .send_message("user_1", &conv.id, request.clone(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(mismatch, ConversationError::BadRequest { reason } if reason == "ATTACHMENT_GROUNDING_MISMATCH"));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert!(broadcaster.take_events().is_empty());
+
+    request.attachment_grounding.as_mut().unwrap().entries[0].source_sha256 = source_sha256.clone();
+    let failing_task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(FailingBuildTaskManager::new("stubbed build failure"));
+    let build_error = svc
+        .send_message("user_1", &conv.id, request.clone(), &failing_task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(build_error, ConversationError::BadGateway { .. }));
+    wait_for_turn_released(&svc, &conv.id).await;
+    assert!(
+        repo_messages_asc(&repo, &conv.id, 10)
+            .await
+            .iter()
+            .all(|message| message.position.as_deref() != Some("right")),
+        "a pre-admission build failure must not persist the user attachment turn"
+    );
+    broadcaster.take_events();
+
+    let admission_started = Arc::new(Notify::new());
+    let admission_release = Arc::new(Notify::new());
+    task_mgr_impl.insert_agent(
+        &conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id).with_blocking_admission(
+            Arc::clone(&admission_started),
+            Arc::clone(&admission_release),
+        ))),
+    );
+    let send_service = svc.clone();
+    let send_conversation_id = conv.id.clone();
+    let send_task_mgr = Arc::clone(&task_mgr);
+    let send = tokio::spawn(async move {
+        send_service
+            .send_message("user_1", &send_conversation_id, request, &send_task_mgr)
+            .await
+    });
+    admission_started.notified().await;
+    assert!(
+        repo_messages_asc(&repo, &conv.id, 10)
+            .await
+            .iter()
+            .all(|message| message.position.as_deref() != Some("right")),
+        "the final user row must not exist before Hermes acknowledges commit with phase=finalize"
+    );
+    admission_release.notify_one();
+    let response = send.await.unwrap().unwrap();
+    let receipt = response.attachment_grounding_receipt.expect("accepted receipt");
+    assert_eq!(receipt.status, "accepted");
+    assert_eq!(receipt.entries.len(), 1);
+    assert_eq!(receipt.entries[0].source_sha256, source_sha256);
+    assert_eq!(receipt.entries[0].grounding_sha256, grounding_sha256);
+    assert!(receipt.entries[0].grounding_embedded);
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let messages = repo_messages_asc(&repo, &conv.id, 10).await;
+    let user_messages = messages
+        .iter()
+        .filter(|message| message.position.as_deref() == Some("right"))
+        .collect::<Vec<_>>();
+    assert_eq!(user_messages.len(), 1);
+    assert!(user_messages[0].content.contains("attachment_grounding_receipt"));
+    assert!(!user_messages[0].content.contains("command_eve_prompt_admission"));
+    assert_eq!(user_messages[0].status.as_deref(), Some("finish"));
+    assert!(!user_messages[0].hidden);
+}
+
+#[tokio::test]
+async fn finalize_delivery_failure_hides_grounded_row_and_allows_retry() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr_impl = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr_impl.clone();
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("hermes"))
+        .await
+        .unwrap();
+    broadcaster.take_events();
+    let (directory, request) = grounded_pdf_request();
+    let workspace = directory.path().to_string_lossy().into_owned();
+
+    let mut failing_agent = MockAgent::new(&conv.id).with_finalize_delivery_failure();
+    failing_agent.workspace_override = Some(workspace.clone());
+    task_mgr_impl.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(failing_agent)));
+    let error = svc
+        .send_message("user_1", &conv.id, request.clone(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::BadGateway { .. }));
+    wait_for_turn_released(&svc, &conv.id).await;
+    assert!(
+        repo_messages_asc(&repo, &conv.id, 10)
+            .await
+            .iter()
+            .all(|message| message.position.as_deref() != Some("right")),
+        "a failed finalize response must remove the provisional user row"
+    );
+    assert!(
+        broadcaster
+            .take_events()
+            .iter()
+            .all(|event| event.name != "message.userCreated")
+    );
+
+    let mut retry_agent = MockAgent::new(&conv.id);
+    retry_agent.workspace_override = Some(workspace);
+    task_mgr_impl.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(retry_agent)));
+    let retry = svc.send_message("user_1", &conv.id, request, &task_mgr).await.unwrap();
+    assert!(retry.attachment_grounding_receipt.is_some());
+    wait_for_turn_released(&svc, &conv.id).await;
+    let rows = repo_messages_asc(&repo, &conv.id, 10).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|message| message.position.as_deref() == Some("right") && !message.hidden)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn aborted_grounded_send_keeps_only_hidden_provisional_state_until_restart_cleanup() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr_impl = Arc::new(MockTaskManager::new());
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr_impl.clone();
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("hermes"))
+        .await
+        .unwrap();
+    broadcaster.take_events();
+    let (directory, request) = grounded_pdf_request();
+    let peer_ack_started = Arc::new(Notify::new());
+    let peer_ack_release = Arc::new(Notify::new());
+    let mut agent =
+        MockAgent::new(&conv.id).with_blocking_peer_ack(Arc::clone(&peer_ack_started), Arc::clone(&peer_ack_release));
+    agent.workspace_override = Some(directory.path().to_string_lossy().into_owned());
+    task_mgr_impl.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
+
+    let send_service = svc.clone();
+    let send_conversation_id = conv.id.clone();
+    let send_task_mgr = Arc::clone(&task_mgr);
+    let send = tokio::spawn(async move {
+        send_service
+            .send_message("user_1", &send_conversation_id, request, &send_task_mgr)
+            .await
+    });
+    peer_ack_started.notified().await;
+
+    let provisional_rows = repo_messages_asc(&repo, &conv.id, 10).await;
+    let provisional = provisional_rows
+        .iter()
+        .find(|message| message.position.as_deref() == Some("right"))
+        .expect("finalize barrier must persist one provisional user row");
+    assert_eq!(provisional.status.as_deref(), Some("pending"));
+    assert!(provisional.hidden);
+    assert!(provisional.content.contains("\"state\":\"provisional\""));
+    assert!(!provisional.content.contains("attachment_grounding_receipt"));
+    assert!(
+        broadcaster
+            .take_events()
+            .iter()
+            .all(|event| event.name != "message.userCreated")
+    );
+
+    send.abort();
+    assert!(send.await.unwrap_err().is_cancelled());
+    peer_ack_release.notify_one();
+    wait_for_turn_released(&svc, &conv.id).await;
+    svc.recover_stale_runtime_state_on_startup().await;
+
+    assert!(
+        repo_messages_asc(&repo, &conv.id, 10)
+            .await
+            .iter()
+            .all(|message| message.id != provisional.id),
+        "restart recovery must delete the stale provisional prompt before it can become transcript truth"
+    );
 }
 
 #[tokio::test]
@@ -4574,6 +5042,43 @@ async fn project_bound_async_completion_rejects_mismatched_transient_context_bef
     ));
     assert!(!svc.runtime_state().is_claimed(&conv.id));
     assert_eq!(task_mgr.build_count(), 0);
+}
+
+#[tokio::test]
+async fn run_agent_turn_rejects_raw_visuals_before_started_callback_or_runtime_claim() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_count_for_turn = Arc::clone(&callback_count);
+    broadcaster.take_events();
+
+    let error = svc
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "internal image turn".into(),
+            files: vec!["/tmp/raw.png".into()],
+            inject_skills: Vec::new(),
+            on_started: Some(Arc::new(move |_| {
+                let callback_count = Arc::clone(&callback_count_for_turn);
+                Box::pin(async move {
+                    callback_count.fetch_add(1, Ordering::SeqCst);
+                })
+            })),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConversationError::BadRequest { reason } if reason == "ATTACHMENT_GROUNDING_REQUIRED"
+    ));
+    assert_eq!(callback_count.load(Ordering::SeqCst), 0);
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.active_count(), 0);
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(broadcaster.take_events().is_empty());
 }
 
 #[tokio::test]
@@ -5800,6 +6305,7 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
                 content: "hello".into(),
                 hidden: false,
                 files: vec![],
+                attachment_grounding: None,
                 inject_skills: vec![],
                 runtime_workspace: None,
             },
@@ -6094,6 +6600,28 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
     })
     .await
     .unwrap();
+    repo.insert_message(&MessageRow {
+        id: "provisional-grounded".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("provisional-grounded".into()),
+        r#type: "text".into(),
+        content: json!({
+            "content": "must not survive restart",
+            "command_eve_prompt_admission": {
+                "version": "command-eve-prompt-admission/v1",
+                "state": "provisional",
+                "turn_id": "turn-provisional",
+                "receipt_sha256": "a".repeat(64),
+            }
+        })
+        .to_string(),
+        position: Some("right".into()),
+        status: Some("pending".into()),
+        hidden: true,
+        created_at: 3,
+    })
+    .await
+    .unwrap();
 
     svc.recover_stale_runtime_state_on_startup().await;
 
@@ -6115,6 +6643,7 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
     let empty = messages.iter().find(|message| message.id == "empty-stale").unwrap();
     assert_eq!(empty.status.as_deref(), Some("finish"));
     assert!(empty.hidden);
+    assert!(messages.iter().all(|message| message.id != "provisional-grounded"));
 
     assert!(
         messages.iter().all(|message| message.r#type != "tips"),
