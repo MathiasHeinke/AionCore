@@ -1084,6 +1084,7 @@ import json
 import sys
 
 pending = None
+pending_prompt = None
 
 def lifecycle_name(method):
     return method.split("/")[1]
@@ -1117,10 +1118,24 @@ for line in sys.stdin:
         }), flush=True)
     elif method == "session/prompt":
         assert pending is not None
+        assert pending_prompt is None
+        pending_prompt = request_id
         print(json.dumps({
-            "jsonrpc": "2.0", "id": request_id,
-            "result": {"stopReason": "end_turn"}
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {
+                "sessionId": "lifecycle-barrier",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{
+                        "name": "entered-prompt",
+                        "description": "deterministic competing prompt barrier"
+                    }]
+                }
+            }
         }), flush=True)
+    elif method == "_lifecycle_release":
+        assert pending is not None
+        assert pending_prompt is not None
         lifecycle_id, lifecycle_method, mode, params = pending
         if mode == "failure":
             print(json.dumps({
@@ -1130,7 +1145,12 @@ for line in sys.stdin:
         else:
             result = {"sessionId": "lifecycle-new"} if lifecycle_method == "session/new" else {}
             print(json.dumps({"jsonrpc": "2.0", "id": lifecycle_id, "result": result}), flush=True)
+        print(json.dumps({
+            "jsonrpc": "2.0", "id": pending_prompt,
+            "result": {"stopReason": "end_turn"}
+        }), flush=True)
         pending = None
+        pending_prompt = None
     elif request_id is not None:
         print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": None}), flush=True)
 "#;
@@ -1254,6 +1274,11 @@ for line in sys.stdin:
 
     fn lifecycle_meta(mode: &str) -> serde_json::Map<String, serde_json::Value> {
         serde_json::from_value(serde_json::json!({ "lifecycle_test": mode })).expect("lifecycle metadata")
+    }
+
+    fn release_lifecycle_terminal(protocol: &AcpProtocol) {
+        let params = serde_json::value::to_raw_value(&serde_json::json!({})).expect("lifecycle release params");
+        protocol.ext_notify(ExtNotification::new("lifecycle_release", params.into()));
     }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
@@ -1415,7 +1440,7 @@ for line in sys.stdin:
         let lifecycle_protocol = Arc::clone(&protocol);
         let close = tokio::spawn(async move {
             lifecycle_protocol
-                .close_session(CloseSessionRequest::new("lifecycle-close"))
+                .close_session(CloseSessionRequest::new("lifecycle-close").meta(lifecycle_meta("success")))
                 .await
         });
         wait_for_lifecycle_barrier(&mut notification_rx, "entered-close").await;
@@ -1432,6 +1457,15 @@ for line in sys.stdin:
                 ))
                 .await
         });
+        wait_for_lifecycle_barrier(&mut notification_rx, "entered-prompt").await;
+        assert!(!close.is_finished(), "close must remain pending before fixture release");
+        assert!(
+            !prompt.is_finished(),
+            "competing prompt must remain pending before close terminal"
+        );
+        assert_eq!(protocol.client_extensions.session_binding_generation(), None);
+        assert_eq!(protocol.client_extensions.bound_session_id(), None);
+        release_lifecycle_terminal(&protocol);
         close.await.expect("close task").expect("close response");
         prompt.await.expect("prompt task").expect("prompt response");
         assert_eq!(protocol.client_extensions.bound_session_id(), None);
@@ -1503,6 +1537,19 @@ for line in sys.stdin:
                         ))
                         .await
                 });
+
+                wait_for_lifecycle_barrier(&mut notification_rx, "entered-prompt").await;
+                assert!(
+                    !lifecycle.is_finished(),
+                    "lifecycle must remain pending before fixture release"
+                );
+                assert!(
+                    !prompt.is_finished(),
+                    "competing prompt must remain pending before lifecycle terminal"
+                );
+                assert_eq!(protocol.client_extensions.session_binding_generation(), None);
+                assert_eq!(protocol.client_extensions.bound_session_id(), None);
+                release_lifecycle_terminal(&protocol);
 
                 let lifecycle_result = lifecycle.await.expect("lifecycle task");
                 prompt.await.expect("prompt task").expect("prompt response");
