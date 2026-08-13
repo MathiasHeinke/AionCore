@@ -30,7 +30,7 @@ use agent_client_protocol::schema::{
     CloseSessionResponse, ExtResponse, ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse,
     PromptResponse, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     ResumeSessionResponse, SelectedPermissionOutcome, SessionNotification, SetSessionConfigOptionResponse,
-    SetSessionModeResponse, SetSessionModelResponse,
+    SetSessionModeResponse, SetSessionModelResponse, StopReason,
 };
 use agent_client_protocol::{
     Agent, AgentRequest, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
@@ -356,8 +356,15 @@ impl AcpProtocol {
     /// the durable completion route unbound.
     pub async fn prompt_and_bind_on_ack(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
         let session_id = req.session_id.0.clone();
+        let binding_generation = self.client_extensions.session_binding_generation();
         let response = self.prompt(req).await?;
-        self.client_extensions.bind_session(session_id.as_ref()).await?;
+        if response.stop_reason != StopReason::Cancelled
+            && let Some(binding_generation) = binding_generation
+        {
+            self.client_extensions
+                .bind_session_if_generation(session_id.as_ref(), binding_generation)
+                .await?;
+        }
         Ok(response)
     }
 
@@ -957,6 +964,7 @@ import sys
 import time
 
 marker = pathlib.Path(sys.argv[1])
+pending_cancelled_prompt = None
 
 for line in sys.stdin:
     message = json.loads(line)
@@ -981,8 +989,26 @@ for line in sys.stdin:
                 "content": "must remain retryable before a positive prompt acknowledgement"
             }
         }), flush=True)
+        if pending_cancelled_prompt is not None:
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "id": pending_cancelled_prompt,
+                "result": {"stopReason": "cancelled"}
+            }), flush=True)
+            pending_cancelled_prompt = None
     elif method == "session/prompt":
         text = message["params"]["prompt"][0]["text"]
+        if text == "ordinary-in-flight-before-cancel":
+            responses = {}
+            if marker.exists():
+                try:
+                    responses = json.loads(marker.read_text())
+                except json.JSONDecodeError:
+                    pass
+            responses["in-flight-prompt"] = {"received": True}
+            marker.write_text(json.dumps(responses))
+            pending_cancelled_prompt = request_id
+            continue
         print(json.dumps({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -1392,6 +1418,149 @@ for line in sys.stdin:
         assert_eq!(wire["post-cancel-completion"]["result"]["code"], "session_not_bound");
         assert_eq!(wire["post-rebind-completion"]["result"]["status"], "accepted");
         assert_eq!(wire["post-rebind-completion"]["result"]["turn_id"], "turn-post-rebind");
+
+        drop(protocol);
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_flight_prompt_cancel_cannot_rebind_until_a_fresh_prompt_is_acknowledged() {
+        let temp = tempfile::tempdir().expect("temporary in-flight cancel directory");
+        let marker = temp.path().join("in-flight-cancel.json");
+        let (protocol, mut completion_rx, mut child) = connect_close_race_mock_agent(&marker).await;
+
+        let created = protocol
+            .new_session(NewSessionRequest::new(temp.path()))
+            .await
+            .expect("bind in-flight cancel session");
+        let session_id = created.session_id.0.clone();
+
+        protocol
+            .prompt(PromptRequest::new(
+                session_id.clone(),
+                vec![agent_client_protocol::schema::ContentBlock::from("queue-before-cancel")],
+            ))
+            .await
+            .expect("queue completion before in-flight prompt");
+        let stale = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .expect("pre-cancel completion timeout")
+            .expect("pre-cancel completion");
+        let stale_generation = stale.lease.generation();
+        let stale_turn_gate = stale.turn_gate.clone();
+
+        let in_flight_prompt = protocol.prompt_and_bind_on_ack(PromptRequest::new(
+            session_id.clone(),
+            vec![agent_client_protocol::schema::ContentBlock::from(
+                "ordinary-in-flight-before-cancel",
+            )],
+        ));
+        let cancel_after_transport_receipt = async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let received = std::fs::read(&marker)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .is_some_and(|wire| wire["in-flight-prompt"]["received"] == true);
+                    if received {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("mock must receive prompt before cancellation");
+            protocol
+                .cancel_session(CancelNotification::new(session_id.clone()))
+                .await
+                .expect("cancel in-flight prompt")
+        };
+        let (cancelled_response, ()) = tokio::join!(in_flight_prompt, cancel_after_transport_receipt);
+        let cancelled_response = cancelled_response.expect("cancelled prompt response");
+        assert_eq!(cancelled_response.stop_reason, StopReason::Cancelled);
+        assert_eq!(protocol.client_extensions.bound_session_id(), None);
+        assert!(stale_turn_gate.try_admit_turn().is_none());
+        stale
+            .reply
+            .send(crate::CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "session_not_bound".to_owned(),
+            })
+            .expect("stale completion reply");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let retryable = std::fs::read(&marker)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .is_some_and(|wire| {
+                        wire["post-cancel-completion"]["result"]["status"] == "retryable"
+                            && wire["post-cancel-completion"]["result"]["code"] == "session_not_bound"
+                    });
+                if retryable {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("in-flight cancelled completion must remain retryable");
+        assert!(
+            completion_rx.try_recv().is_err(),
+            "cancelled prompt must not dispatch completion work"
+        );
+
+        let next_response = protocol
+            .prompt_and_bind_on_ack(PromptRequest::new(
+                session_id.clone(),
+                vec![agent_client_protocol::schema::ContentBlock::from(
+                    "ordinary-after-cancel",
+                )],
+            ))
+            .await
+            .expect("fresh ordinary prompt acknowledgement");
+        assert_eq!(next_response.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            protocol.client_extensions.bound_session_id().as_deref(),
+            Some("close-race-session")
+        );
+        assert!(stale_turn_gate.try_admit_turn().is_none());
+
+        let fresh = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .expect("fresh completion timeout")
+            .expect("fresh completion");
+        assert!(fresh.lease.generation() > stale_generation);
+        assert!(fresh.turn_gate.try_admit_turn().is_some());
+        fresh
+            .reply
+            .send(crate::CommandEveAsyncCompletionResult::Completed {
+                turn_id: "turn-after-in-flight-cancel".to_owned(),
+            })
+            .expect("fresh completion reply");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let accepted = std::fs::read(&marker)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .is_some_and(|wire| {
+                        wire["post-rebind-completion"]["result"]["status"] == "accepted"
+                            && wire["post-rebind-completion"]["result"]["turn_id"] == "turn-after-in-flight-cancel"
+                    });
+                if accepted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fresh completion accepted wire receipt");
 
         drop(protocol);
         if tokio::time::timeout(Duration::from_secs(2), child.wait())

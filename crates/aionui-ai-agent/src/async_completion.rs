@@ -165,7 +165,14 @@ impl AcpSessionBindingTurnGate {
 /// fail-closed state while more than one lifecycle request is queued.
 struct AcpSessionBindingTransition {
     pending: Arc<AtomicUsize>,
+    had_preexisting_transition: bool,
     _barrier: OwnedRwLockWriteGuard<()>,
+}
+
+impl AcpSessionBindingTransition {
+    fn had_preexisting_transition(&self) -> bool {
+        self.had_preexisting_transition
+    }
 }
 
 impl Drop for AcpSessionBindingTransition {
@@ -193,6 +200,16 @@ pub struct AcpSessionBinding {
 }
 
 impl AcpSessionBinding {
+    /// Snapshot the current lifecycle generation for an operation that may
+    /// later restore a positive binding. `None` means a lifecycle transition
+    /// already has precedence, so the later operation must stay fail-closed.
+    pub(crate) fn lifecycle_generation(&self) -> Option<u64> {
+        if self.transition_pending.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        self.state.lock().ok().map(|state| state.generation)
+    }
+
     /// Snapshot the live binding as a lease, or `None` while the route is
     /// unbound (pre-bind, mid request interval, after close/cancel).
     pub fn lease(&self) -> Option<AcpSessionBindingLease> {
@@ -312,6 +329,31 @@ impl AcpSessionBinding {
         Ok(true)
     }
 
+    /// Bind only when no lifecycle transition has superseded the operation's
+    /// starting generation. `None` means cancel/close/rebind/shutdown won the
+    /// race; `Some(false)` is an idempotent same-session acknowledgement and
+    /// `Some(true)` is a new positive binding.
+    pub(crate) async fn bind_if_generation(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+    ) -> Result<Option<bool>, ()> {
+        let transition = self.transition().await;
+        if transition.had_preexisting_transition() {
+            return Ok(None);
+        }
+        let mut state = self.state.lock().map_err(|_| ())?;
+        if state.generation != expected_generation {
+            return Ok(None);
+        }
+        if state.bound_session_id.as_deref() == Some(session_id) {
+            return Ok(Some(false));
+        }
+        state.generation = state.generation.checked_add(1).ok_or(())?;
+        state.bound_session_id = Some(session_id.to_owned());
+        Ok(Some(true))
+    }
+
     /// Unbind a matching closed session, advancing the generation. Returns
     /// whether a live binding was dropped.
     pub(crate) async fn unbind_matching(&self, session_id: &str) -> Result<bool, ()> {
@@ -343,10 +385,11 @@ impl AcpSessionBinding {
     /// soon as this method is entered; an existing admission linearizes before
     /// the transition and keeps the read permit until receipt/turn admission.
     async fn transition(&self) -> AcpSessionBindingTransition {
-        self.transition_pending.fetch_add(1, Ordering::Release);
+        let had_preexisting_transition = self.transition_pending.fetch_add(1, Ordering::AcqRel) != 0;
         let barrier = Arc::clone(&self.admission_barrier).write_owned().await;
         AcpSessionBindingTransition {
             pending: Arc::clone(&self.transition_pending),
+            had_preexisting_transition,
             _barrier: barrier,
         }
     }

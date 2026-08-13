@@ -175,6 +175,51 @@ impl AcpClientExtensionRouter {
         Ok(())
     }
 
+    pub(crate) fn session_binding_generation(&self) -> Option<u64> {
+        self.session_binding.lifecycle_generation()
+    }
+
+    /// Restore a prompt's positive session binding only if no lifecycle
+    /// transition superseded the generation captured before transport send.
+    pub(crate) async fn bind_session_if_generation(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+    ) -> Result<bool, AcpError> {
+        validate_identifier(session_id).map_err(|_| local_binding_error())?;
+        let previous_session = self.session_binding.bound_session_id();
+        match self
+            .session_binding
+            .bind_if_generation(session_id, expected_generation)
+            .await
+        {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => return Ok(true),
+            Ok(None) => return Ok(false),
+            Err(()) => return Err(local_binding_error()),
+        }
+        if let Some(previous_session) = previous_session {
+            reject_command_eve_prompt_admissions_for_session(
+                &previous_session,
+                "ATTACHMENT_PROMPT_FINALIZE_PEER_ACK_UNAVAILABLE",
+            );
+        }
+        let (cancelled, cancelled_terminal) = {
+            let mut state = self.state.lock().map_err(|_| local_binding_error())?;
+            (
+                state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
+                state
+                    .pending_terminal
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        cancel_pending(cancelled, "session_rebound");
+        cancel_pending_terminal(cancelled_terminal, "session_rebound");
+        Ok(true)
+    }
+
     /// Invalidate the live binding at the beginning of every
     /// `session/new|load|resume` attempt. While the request is in flight the
     /// route is unbound: async completions stay retryable
