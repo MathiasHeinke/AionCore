@@ -163,8 +163,18 @@ impl AcpSessionBindingTurnGate {
 /// Counts lifecycle transitions which have declared precedence over new
 /// completion admissions. The count (rather than a boolean) preserves the
 /// fail-closed state while more than one lifecycle request is queued.
-struct AcpSessionBindingTransition {
+struct AcpSessionBindingTransitionPending {
     pending: Arc<AtomicUsize>,
+}
+
+impl Drop for AcpSessionBindingTransitionPending {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::Release);
+    }
+}
+
+struct AcpSessionBindingTransition {
+    _pending: AcpSessionBindingTransitionPending,
     had_preexisting_transition: bool,
     _barrier: OwnedRwLockWriteGuard<()>,
 }
@@ -175,9 +185,31 @@ impl AcpSessionBindingTransition {
     }
 }
 
-impl Drop for AcpSessionBindingTransition {
-    fn drop(&mut self) {
-        self.pending.fetch_sub(1, Ordering::Release);
+/// Exclusive ownership of one in-flight ACP session lifecycle request.
+///
+/// The ticket retains the admission writer and the public fail-closed pending
+/// state from the initial invalidation until the transport RPC terminates. A
+/// successful `session/new|load|resume` may restore a binding only through the
+/// generation captured by this exact ticket; dropping it after any failure or
+/// close leaves the route unbound.
+pub(crate) struct AcpSessionBindingLifecycle {
+    state: Arc<Mutex<AcpSessionBindingState>>,
+    invalidated_generation: u64,
+    _transition: AcpSessionBindingTransition,
+}
+
+impl AcpSessionBindingLifecycle {
+    /// Complete the exact lifecycle request with its positively acknowledged
+    /// session. The writer permit prevents another lifecycle owner from
+    /// changing state between the generation check and the bind.
+    pub(crate) fn bind_acknowledged(self, session_id: &str) -> Result<(), ()> {
+        let mut state = self.state.lock().map_err(|_| ())?;
+        if state.generation != self.invalidated_generation || state.bound_session_id.is_some() {
+            return Err(());
+        }
+        state.generation = state.generation.checked_add(1).ok_or(())?;
+        state.bound_session_id = Some(session_id.to_owned());
+        Ok(())
     }
 }
 
@@ -381,14 +413,62 @@ impl AcpSessionBinding {
         Ok(())
     }
 
+    /// Invalidate the route and retain exclusive lifecycle ownership until
+    /// the caller observes the terminal `session/new|load|resume` response.
+    pub(crate) async fn begin_lifecycle(&self) -> Result<AcpSessionBindingLifecycle, ()> {
+        let transition = self.transition().await;
+        let invalidated_generation = {
+            let mut state = self.state.lock().map_err(|_| ())?;
+            Self::advance(&mut state);
+            state.bound_session_id = None;
+            state.generation
+        };
+        Ok(AcpSessionBindingLifecycle {
+            state: Arc::clone(&self.state),
+            invalidated_generation,
+            _transition: transition,
+        })
+    }
+
+    /// Retain lifecycle ownership across a close RPC while invalidating only
+    /// the exact live session named by that request. A close for an already
+    /// unbound or different session still owns the interval, but does not
+    /// discard another live binding.
+    pub(crate) async fn begin_close_lifecycle(
+        &self,
+        session_id: &str,
+    ) -> Result<(AcpSessionBindingLifecycle, bool), ()> {
+        let transition = self.transition().await;
+        let (invalidated_generation, invalidated_matching_session) = {
+            let mut state = self.state.lock().map_err(|_| ())?;
+            let invalidated_matching_session = state.bound_session_id.as_deref() == Some(session_id);
+            if invalidated_matching_session {
+                Self::advance(&mut state);
+                state.bound_session_id = None;
+            }
+            (state.generation, invalidated_matching_session)
+        };
+        Ok((
+            AcpSessionBindingLifecycle {
+                state: Arc::clone(&self.state),
+                invalidated_generation,
+                _transition: transition,
+            },
+            invalidated_matching_session,
+        ))
+    }
+
     /// Start a lifecycle transition. New completion admissions fail closed as
     /// soon as this method is entered; an existing admission linearizes before
     /// the transition and keeps the read permit until receipt/turn admission.
     async fn transition(&self) -> AcpSessionBindingTransition {
         let had_preexisting_transition = self.transition_pending.fetch_add(1, Ordering::AcqRel) != 0;
+        let pending = AcpSessionBindingTransitionPending {
+            pending: Arc::clone(&self.transition_pending),
+        };
         let barrier = Arc::clone(&self.admission_barrier).write_owned().await;
         AcpSessionBindingTransition {
-            pending: Arc::clone(&self.transition_pending),
+            _pending: pending,
             had_preexisting_transition,
             _barrier: barrier,
         }
@@ -527,6 +607,49 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::AcpSessionBinding;
+
+    #[tokio::test]
+    async fn lifecycle_ticket_drop_cancellation_and_unwind_release_the_transition_fence() {
+        let binding = AcpSessionBinding::default();
+        binding.bind("session-1").await.unwrap();
+
+        // Hold the read side so `begin_lifecycle` deterministically reaches
+        // the writer barrier. Poll it once, then cancel by dropping the future.
+        let admission = binding.try_acquire_admission().expect("held admission");
+        {
+            let lifecycle = binding.begin_lifecycle();
+            tokio::pin!(lifecycle);
+            tokio::select! {
+                biased;
+                _ = &mut lifecycle => panic!("writer unexpectedly completed"),
+                () = async {} => {}
+            }
+            assert!(binding.transition_pending());
+        }
+        assert!(!binding.transition_pending());
+        assert_eq!(binding.bound_session_id().as_deref(), Some("session-1"));
+        drop(admission);
+
+        // A normal dropped owner releases both pending state and writer.
+        let lifecycle = binding.begin_lifecycle().await.unwrap();
+        assert!(binding.transition_pending());
+        drop(lifecycle);
+        assert!(!binding.transition_pending());
+
+        // Unwinding across an owned ticket has identical fail-closed cleanup.
+        let lifecycle = binding.begin_lifecycle().await.unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lifecycle = lifecycle;
+            panic!("lifecycle unwind probe");
+        }));
+        assert!(!binding.transition_pending());
+
+        // A fresh owner can still complete the exact positive bind afterward.
+        let lifecycle = binding.begin_lifecycle().await.unwrap();
+        lifecycle.bind_acknowledged("session-2").unwrap();
+        assert!(!binding.transition_pending());
+        assert_eq!(binding.bound_session_id().as_deref(), Some("session-2"));
+    }
 
     #[tokio::test]
     async fn lifecycle_transition_fences_new_admissions_until_the_existing_turn_claim_releases() {

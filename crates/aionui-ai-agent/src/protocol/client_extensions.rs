@@ -21,6 +21,7 @@ use regex::Regex;
 use tokio::sync::{Semaphore, broadcast, mpsc::error::TrySendError, oneshot};
 use tracing::{info, warn};
 
+use crate::async_completion::AcpSessionBindingLifecycle;
 use crate::error::AgentError;
 use crate::prompt_admission::{
     COMMAND_EVE_PROMPT_ADMISSION_EXT_METHOD, COMMAND_EVE_PROMPT_ADMISSION_VERSION,
@@ -227,12 +228,13 @@ impl AcpClientExtensionRouter {
     /// session are cancelled, and every lease minted before this transition
     /// is stale. A failed request leaves the route unbound until a later
     /// successful bind.
-    pub(crate) async fn begin_session_binding(&self) {
+    pub(crate) async fn begin_session_binding(&self) -> Result<AcpSessionBindingLifecycle, AcpError> {
         let previous_session = self.session_binding.bound_session_id();
-        if self.session_binding.invalidate().await.is_err() {
-            warn!("ACP binding admission gate unavailable while beginning session binding");
-            return;
-        }
+        let lifecycle = self
+            .session_binding
+            .begin_lifecycle()
+            .await
+            .map_err(|_| local_binding_error())?;
         if let Some(previous_session) = previous_session {
             reject_command_eve_prompt_admissions_for_session(
                 &previous_session,
@@ -240,10 +242,7 @@ impl AcpClientExtensionRouter {
             );
         }
         let (cancelled, cancelled_terminal) = {
-            let Ok(mut state) = self.state.lock() else {
-                warn!("ACP client extension state unavailable while beginning session binding");
-                return;
-            };
+            let mut state = self.state.lock().map_err(|_| local_binding_error())?;
             (
                 state.pending.drain().map(|(_, pending)| pending).collect::<Vec<_>>(),
                 state
@@ -255,6 +254,21 @@ impl AcpClientExtensionRouter {
         };
         cancel_pending(cancelled, "session_rebinding");
         cancel_pending_terminal(cancelled_terminal, "session_rebinding");
+        Ok(lifecycle)
+    }
+
+    /// Restore the session acknowledged by the exact lifecycle owner. The
+    /// ticket keeps ordinary prompts and other lifecycle requests fenced until
+    /// this identity-checked positive bind has completed.
+    pub(crate) fn finish_session_binding(
+        &self,
+        lifecycle: AcpSessionBindingLifecycle,
+        session_id: &str,
+    ) -> Result<(), AcpError> {
+        validate_identifier(session_id).map_err(|_| local_binding_error())?;
+        lifecycle
+            .bind_acknowledged(session_id)
+            .map_err(|_| local_binding_error())
     }
 
     /// Fence a close before its RPC crosses the transport. The original
@@ -262,16 +276,19 @@ impl AcpClientExtensionRouter {
     /// admission is already fail-closed and every pre-close lease is stale.
     /// A failed close leaves the route unbound; reopening must be a positive
     /// `session/new|load|resume` bind, never restoration of an old lease.
-    pub(crate) async fn begin_session_close(&self, session_id: &str) -> Result<(), AcpError> {
-        if !self
+    pub(crate) async fn begin_session_close(&self, session_id: &str) -> Result<AcpSessionBindingLifecycle, AcpError> {
+        validate_identifier(session_id).map_err(|_| local_binding_error())?;
+        let (lifecycle, invalidated_matching_session) = self
             .session_binding
-            .unbind_matching(session_id)
+            .begin_close_lifecycle(session_id)
             .await
-            .map_err(|_| local_binding_error())?
-        {
-            return Ok(());
+            .map_err(|_| local_binding_error())?;
+        if invalidated_matching_session {
+            reject_command_eve_prompt_admissions_for_session(
+                session_id,
+                "ATTACHMENT_PROMPT_FINALIZE_PEER_ACK_UNAVAILABLE",
+            );
         }
-        reject_command_eve_prompt_admissions_for_session(session_id, "ATTACHMENT_PROMPT_FINALIZE_PEER_ACK_UNAVAILABLE");
         let (cancelled, cancelled_terminal) = {
             let mut state = self.state.lock().map_err(|_| local_binding_error())?;
             (
@@ -285,7 +302,7 @@ impl AcpClientExtensionRouter {
         };
         cancel_pending(cancelled, "session_closed");
         cancel_pending_terminal(cancelled_terminal, "session_closed");
-        Ok(())
+        Ok(lifecycle)
     }
 
     /// Fence ordinary cancellation before its notification crosses the
@@ -1400,13 +1417,13 @@ mod tests {
 
         // The session request interval invalidates the live binding and
         // every lease minted so far.
-        router.begin_session_binding().await;
+        let lifecycle = router.begin_session_binding().await.unwrap();
         assert!(router.session_binding.lease().is_none());
         assert!(!router.session_binding.validate_lease(&first));
 
         // Binding the same session id after the interval is a real bind with
         // a new, strictly greater generation.
-        router.bind_session("session-1").await.unwrap();
+        router.finish_session_binding(lifecycle, "session-1").unwrap();
         let second = router.session_binding.lease().unwrap();
         assert_eq!(second.session_id(), "session-1");
         assert!(second.generation() > first.generation());
@@ -1419,7 +1436,7 @@ mod tests {
         assert!(third.generation() > second.generation());
         assert!(!router.session_binding.validate_lease(&second));
 
-        router.begin_session_close("session-2").await.unwrap();
+        drop(router.begin_session_close("session-2").await.unwrap());
         assert!(router.session_binding.lease().is_none());
         assert!(!router.session_binding.validate_lease(&third));
 
@@ -1441,7 +1458,7 @@ mod tests {
         // Between begin-binding (session/new|load|resume request start) and
         // the successful response, the route is unbound: completions remain
         // retryable and are never dispatched to the consumer.
-        router.begin_session_binding().await;
+        let lifecycle = router.begin_session_binding().await.unwrap();
         let response = dispatch(
             &router,
             COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
@@ -1453,7 +1470,7 @@ mod tests {
         assert!(completion_rx.try_recv().is_err(), "unbound interval must not dispatch");
 
         // After the successful bind, the same completion routes again.
-        router.bind_session("session-1").await.unwrap();
+        router.finish_session_binding(lifecycle, "session-1").unwrap();
         let response = dispatch(
             &router,
             COMMAND_EVE_ASYNC_COMPLETION_EXT_METHOD,
@@ -1490,7 +1507,7 @@ mod tests {
         // `close_session` invokes this fence before its RPC. The dispatched
         // completion has not reached the synchronous turn insertion yet, so
         // it must be unable to cross the close boundary afterwards.
-        router.begin_session_close("session-1").await.unwrap();
+        let close_lifecycle = router.begin_session_close("session-1").await.unwrap();
         assert!(router.session_binding.lease().is_none());
         assert!(deferred.turn_gate.try_admit_turn().is_none());
 
@@ -1514,6 +1531,7 @@ mod tests {
         assert_eq!(post_close.status, AcpAsyncCompletionAckStatus::Retryable);
         assert_eq!(post_close.code.as_deref(), Some("session_not_bound"));
         assert!(completion_rx.try_recv().is_err(), "close must prevent another dispatch");
+        drop(close_lifecycle);
     }
 
     #[tokio::test]
@@ -1966,7 +1984,7 @@ mod tests {
             serde_json::to_value(request("request-close", "session-2")).unwrap(),
         );
         let _ = event_rx.recv().await.unwrap();
-        router.begin_session_close("session-2").await.unwrap();
+        drop(router.begin_session_close("session-2").await.unwrap());
         assert_eq!(router.bound_session_id(), None);
         assert!(closed.await.unwrap().is_err());
 

@@ -253,11 +253,10 @@ impl AcpProtocol {
         // flight the route is unbound (completions stay retryable), and a
         // failed request leaves it unbound instead of trusting the old
         // session.
-        self.client_extensions.begin_session_binding().await;
+        let lifecycle = self.client_extensions.begin_session_binding().await?;
         let response = self.send_request(req, AGENT_METHOD_NAMES.session_new).await?;
         self.client_extensions
-            .bind_session(response.session_id.0.as_ref())
-            .await?;
+            .finish_session_binding(lifecycle, response.session_id.0.as_ref())?;
         Ok(response)
     }
 
@@ -276,10 +275,11 @@ impl AcpProtocol {
     /// and never calls this method, so it is unaffected by the guard.
     pub async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, AcpError> {
         let session_id = req.session_id.0.clone();
-        self.client_extensions.begin_session_binding().await;
+        let lifecycle = self.client_extensions.begin_session_binding().await?;
         let _guard = ReplaySuppressionGuard::new(&self.replay_suppression);
         let response = self.send_request(req, AGENT_METHOD_NAMES.session_load).await?;
-        self.client_extensions.bind_session(session_id.as_ref()).await?;
+        self.client_extensions
+            .finish_session_binding(lifecycle, session_id.as_ref())?;
         Ok(response)
     }
 
@@ -291,9 +291,10 @@ impl AcpProtocol {
     /// Resume an existing ACP session.
     pub async fn resume_session(&self, req: ResumeSessionRequest) -> Result<ResumeSessionResponse, AcpError> {
         let session_id = req.session_id.0.clone();
-        self.client_extensions.begin_session_binding().await;
+        let lifecycle = self.client_extensions.begin_session_binding().await?;
         let response = self.send_request(req, AGENT_METHOD_NAMES.session_resume).await?;
-        self.client_extensions.bind_session(session_id.as_ref()).await?;
+        self.client_extensions
+            .finish_session_binding(lifecycle, session_id.as_ref())?;
         Ok(response)
     }
 
@@ -303,7 +304,7 @@ impl AcpProtocol {
         // Fence durable completions before the close RPC is sent. The request
         // still carries the original positive session id, but every new wake
         // observes `session_not_bound` while the transport close is in flight.
-        self.client_extensions.begin_session_close(session_id.as_ref()).await?;
+        let _lifecycle = self.client_extensions.begin_session_close(session_id.as_ref()).await?;
         let response = self.send_request(req, AGENT_METHOD_NAMES.session_close).await?;
         Ok(response)
     }
@@ -1073,6 +1074,67 @@ for line in sys.stdin:
         print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": None}), flush=True)
 "#;
 
+    /// Deterministic lifecycle peer. Every lifecycle request publishes an
+    /// entered barrier notification, then waits for the competing ordinary
+    /// prompt before returning either its configured result or a JSON-RPC
+    /// error. The test therefore exercises the exact interval without sleeps.
+    #[cfg(unix)]
+    const LIFECYCLE_EPOCH_MOCK_ACP_AGENT: &str = r#"
+import json
+import sys
+
+pending = None
+
+def lifecycle_name(method):
+    return method.split("/")[1]
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0", "id": request_id,
+            "result": {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}
+        }), flush=True)
+    elif method in ("session/new", "session/load", "session/resume", "session/close"):
+        assert pending is None
+        params = message.get("params", {})
+        mode = params.get("_meta", {}).get("lifecycle_test", "success")
+        pending = (request_id, method, mode, params)
+        print(json.dumps({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {
+                "sessionId": "lifecycle-barrier",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{
+                        "name": "entered-" + lifecycle_name(method),
+                        "description": "deterministic lifecycle barrier"
+                    }]
+                }
+            }
+        }), flush=True)
+    elif method == "session/prompt":
+        assert pending is not None
+        print(json.dumps({
+            "jsonrpc": "2.0", "id": request_id,
+            "result": {"stopReason": "end_turn"}
+        }), flush=True)
+        lifecycle_id, lifecycle_method, mode, params = pending
+        if mode == "failure":
+            print(json.dumps({
+                "jsonrpc": "2.0", "id": lifecycle_id,
+                "error": {"code": -32603, "message": "lifecycle fixture failure"}
+            }), flush=True)
+        else:
+            result = {"sessionId": "lifecycle-new"} if lifecycle_method == "session/new" else {}
+            print(json.dumps({"jsonrpc": "2.0", "id": lifecycle_id, "result": result}), flush=True)
+        pending = None
+    elif request_id is not None:
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": None}), flush=True)
+"#;
+
     #[cfg(unix)]
     async fn connect_mock_agent(
         marker: Option<&std::path::Path>,
@@ -1155,6 +1217,43 @@ for line in sys.stdin:
             .enable_async_completion()
             .expect("enable close-race durable completion route");
         (protocol, completion_rx, child)
+    }
+
+    #[cfg(unix)]
+    async fn connect_lifecycle_epoch_mock_agent()
+    -> (AcpProtocol, mpsc::Receiver<SessionNotification>, tokio::process::Child) {
+        use std::process::Stdio;
+
+        let python = which::which("python3").expect("python3 is required for ACP lifecycle regression tests");
+        let mut child = tokio::process::Command::new(python)
+            .arg("-u")
+            .arg("-c")
+            .arg(LIFECYCLE_EPOCH_MOCK_ACP_AGENT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn lifecycle-epoch mock ACP agent");
+        let stdin = child.stdin.take().expect("mock stdin");
+        let stdout = child.stdout.take().expect("mock stdout");
+        let (event_tx, _) = broadcast::channel(16);
+        let (permission_tx, _permission_rx) = mpsc::channel(4);
+        let (notification_tx, notification_rx) = mpsc::channel(16);
+        let protocol = AcpProtocol::connect(stdin, stdout, event_tx, permission_tx, notification_tx)
+            .await
+            .expect("connect lifecycle-epoch mock ACP agent");
+        (protocol, notification_rx, child)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_lifecycle_barrier(notification_rx: &mut mpsc::Receiver<SessionNotification>, name: &str) {
+        let notification = notification_rx.recv().await.expect("lifecycle barrier notification");
+        let wire = serde_json::to_value(notification).expect("serialize lifecycle barrier");
+        assert_eq!(wire["update"]["availableCommands"][0]["name"], name);
+    }
+
+    fn lifecycle_meta(mode: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_value(serde_json::json!({ "lifecycle_test": mode })).expect("lifecycle metadata")
     }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
@@ -1303,6 +1402,129 @@ for line in sys.stdin:
             .is_err()
         {
             let _ = child.kill().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lifecycle_rpc_epoch_blocks_competing_prompt_until_close_terminal() {
+        let temp = tempfile::tempdir().expect("temporary lifecycle-close directory");
+        let (protocol, mut notification_rx, mut child) = connect_lifecycle_epoch_mock_agent().await;
+        let protocol = Arc::new(protocol);
+
+        let lifecycle_protocol = Arc::clone(&protocol);
+        let close = tokio::spawn(async move {
+            lifecycle_protocol
+                .close_session(CloseSessionRequest::new("lifecycle-close"))
+                .await
+        });
+        wait_for_lifecycle_barrier(&mut notification_rx, "entered-close").await;
+        assert_eq!(protocol.client_extensions.session_binding_generation(), None);
+
+        let prompt_protocol = Arc::clone(&protocol);
+        let prompt = tokio::spawn(async move {
+            prompt_protocol
+                .prompt_and_bind_on_ack(PromptRequest::new(
+                    "lifecycle-close",
+                    vec![agent_client_protocol::schema::ContentBlock::from(
+                        "competing-close-prompt",
+                    )],
+                ))
+                .await
+        });
+        close.await.expect("close task").expect("close response");
+        prompt.await.expect("prompt task").expect("prompt response");
+        assert_eq!(protocol.client_extensions.bound_session_id(), None);
+
+        drop(protocol);
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lifecycle_rpc_epoch_blocks_competing_prompt_across_new_load_resume_terminals() {
+        #[derive(Clone, Copy)]
+        enum LifecycleCase {
+            New,
+            Load,
+            Resume,
+        }
+
+        for (case, barrier, session_id) in [
+            (LifecycleCase::New, "entered-new", "lifecycle-new"),
+            (LifecycleCase::Load, "entered-load", "lifecycle-load"),
+            (LifecycleCase::Resume, "entered-resume", "lifecycle-resume"),
+        ] {
+            for mode in ["failure", "success"] {
+                let temp = tempfile::tempdir().expect("temporary lifecycle request directory");
+                let (protocol, mut notification_rx, mut child) = connect_lifecycle_epoch_mock_agent().await;
+                let protocol = Arc::new(protocol);
+                let lifecycle_protocol = Arc::clone(&protocol);
+                let working_dir = temp.path().to_path_buf();
+                let expect_failure = mode == "failure";
+                let mode = mode.to_owned();
+                let lifecycle = tokio::spawn(async move {
+                    match case {
+                        LifecycleCase::New => lifecycle_protocol
+                            .new_session(NewSessionRequest::new(&working_dir).meta(lifecycle_meta(&mode)))
+                            .await
+                            .map(|_| ()),
+                        LifecycleCase::Load => lifecycle_protocol
+                            .load_session(
+                                LoadSessionRequest::new("lifecycle-load", &working_dir).meta(lifecycle_meta(&mode)),
+                            )
+                            .await
+                            .map(|_| ()),
+                        LifecycleCase::Resume => lifecycle_protocol
+                            .resume_session(
+                                ResumeSessionRequest::new("lifecycle-resume", &working_dir).meta(lifecycle_meta(&mode)),
+                            )
+                            .await
+                            .map(|_| ()),
+                    }
+                });
+                wait_for_lifecycle_barrier(&mut notification_rx, barrier).await;
+                assert_eq!(protocol.client_extensions.session_binding_generation(), None);
+
+                let prompt_protocol = Arc::clone(&protocol);
+                let prompt_session = session_id.to_owned();
+                let prompt = tokio::spawn(async move {
+                    prompt_protocol
+                        .prompt_and_bind_on_ack(PromptRequest::new(
+                            prompt_session,
+                            vec![agent_client_protocol::schema::ContentBlock::from(
+                                "competing-lifecycle-prompt",
+                            )],
+                        ))
+                        .await
+                });
+
+                let lifecycle_result = lifecycle.await.expect("lifecycle task");
+                prompt.await.expect("prompt task").expect("prompt response");
+                if expect_failure {
+                    assert!(lifecycle_result.is_err());
+                    assert_eq!(protocol.client_extensions.bound_session_id(), None);
+                } else {
+                    lifecycle_result.expect("successful lifecycle response");
+                    assert_eq!(
+                        protocol.client_extensions.bound_session_id().as_deref(),
+                        Some(session_id)
+                    );
+                }
+
+                drop(protocol);
+                if tokio::time::timeout(Duration::from_secs(2), child.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = child.kill().await;
+                }
+            }
         }
     }
 
