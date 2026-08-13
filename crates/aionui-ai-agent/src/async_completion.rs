@@ -165,11 +165,13 @@ impl AcpSessionBindingTurnGate {
 /// fail-closed state while more than one lifecycle request is queued.
 struct AcpSessionBindingTransitionPending {
     pending: Arc<AtomicUsize>,
+    terminal: Arc<Notify>,
 }
 
 impl Drop for AcpSessionBindingTransitionPending {
     fn drop(&mut self) {
-        self.pending.fetch_sub(1, Ordering::Release);
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        self.terminal.notify_waiters();
     }
 }
 
@@ -229,14 +231,25 @@ pub struct AcpSessionBinding {
     /// completion checks it before and after acquiring a reader permit, so it
     /// cannot slip between a transition request and the writer acquisition.
     transition_pending: Arc<AtomicUsize>,
+    /// Wakes prompts after each lifecycle terminal so they can verify that no
+    /// earlier or queued transition remains pending.
+    transition_terminal: Arc<Notify>,
+    /// Permanent shutdown is distinct from transient lifecycle work. It keeps
+    /// future admissions fail-closed without making a prompt wait forever for
+    /// a lifecycle terminal that can no longer occur.
+    admissions_closed: Arc<AtomicBool>,
 }
 
 impl AcpSessionBinding {
+    fn lifecycle_fenced(&self) -> bool {
+        self.admissions_closed.load(Ordering::Acquire) || self.transition_pending.load(Ordering::Acquire) != 0
+    }
+
     /// Snapshot the current lifecycle generation for an operation that may
     /// later restore a positive binding. `None` means a lifecycle transition
     /// already has precedence, so the later operation must stay fail-closed.
     pub(crate) fn lifecycle_generation(&self) -> Option<u64> {
-        if self.transition_pending.load(Ordering::Acquire) != 0 {
+        if self.lifecycle_fenced() {
             return None;
         }
         self.state.lock().ok().map(|state| state.generation)
@@ -248,14 +261,24 @@ impl AcpSessionBinding {
     /// which began inside that interval from completing before the owning
     /// `session/new|load|resume|close` request has finished.
     pub(crate) async fn wait_for_lifecycle_terminal(&self) {
-        let barrier = Arc::clone(&self.admission_barrier).read_owned().await;
-        drop(barrier);
+        loop {
+            if self.admissions_closed.load(Ordering::Acquire) || self.transition_pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            let terminal = self.transition_terminal.notified();
+            tokio::pin!(terminal);
+            terminal.as_mut().enable();
+            if self.admissions_closed.load(Ordering::Acquire) || self.transition_pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            terminal.await;
+        }
     }
 
     /// Snapshot the live binding as a lease, or `None` while the route is
     /// unbound (pre-bind, mid request interval, after close/cancel).
     pub fn lease(&self) -> Option<AcpSessionBindingLease> {
-        if self.transition_pending.load(Ordering::Acquire) != 0 {
+        if self.lifecycle_fenced() {
             return None;
         }
         self.state.lock().ok().and_then(|state| {
@@ -270,7 +293,7 @@ impl AcpSessionBinding {
     }
 
     pub fn bound_session_id(&self) -> Option<String> {
-        if self.transition_pending.load(Ordering::Acquire) != 0 {
+        if self.lifecycle_fenced() {
             return None;
         }
         self.state.lock().ok().and_then(|state| state.bound_session_id.clone())
@@ -280,7 +303,7 @@ impl AcpSessionBinding {
     /// bound and no binding transition has advanced the generation since the
     /// lease was minted.
     pub fn validate_lease(&self, lease: &AcpSessionBindingLease) -> bool {
-        if self.transition_pending.load(Ordering::Acquire) != 0 {
+        if self.lifecycle_fenced() {
             return false;
         }
         self.state
@@ -296,11 +319,11 @@ impl AcpSessionBinding {
     /// Production durable work uses [`Self::try_acquire_admission_for`] with
     /// the route's already-dispatched lease.
     pub fn try_acquire_admission(&self) -> Option<AcpSessionBindingAdmission> {
-        if self.transition_pending.load(Ordering::Acquire) != 0 {
+        if self.lifecycle_fenced() {
             return None;
         }
         let barrier = Arc::clone(&self.admission_barrier).try_read_owned().ok()?;
-        if self.transition_pending.load(Ordering::Acquire) != 0 {
+        if self.lifecycle_fenced() {
             drop(barrier);
             return None;
         }
@@ -330,11 +353,11 @@ impl AcpSessionBinding {
         lease: &AcpSessionBindingLease,
         observation: AcpSessionBindingTurnObservation,
     ) -> Option<AcpSessionBindingAdmission> {
-        if self.transition_pending.load(Ordering::Acquire) != 0 {
+        if self.lifecycle_fenced() {
             return None;
         }
         let barrier = Arc::clone(&self.admission_barrier).try_read_owned().ok()?;
-        if self.transition_pending.load(Ordering::Acquire) != 0 {
+        if self.lifecycle_fenced() {
             drop(barrier);
             return None;
         }
@@ -475,6 +498,7 @@ impl AcpSessionBinding {
         let had_preexisting_transition = self.transition_pending.fetch_add(1, Ordering::AcqRel) != 0;
         let pending = AcpSessionBindingTransitionPending {
             pending: Arc::clone(&self.transition_pending),
+            terminal: Arc::clone(&self.transition_terminal),
         };
         let barrier = Arc::clone(&self.admission_barrier).write_owned().await;
         AcpSessionBindingTransition {
@@ -488,7 +512,8 @@ impl AcpSessionBinding {
     /// used from protocol `Drop`; the route cannot be rebound after shutdown,
     /// so retaining the pending count is the correct fail-closed state.
     pub(crate) fn close_admissions(&self) {
-        self.transition_pending.fetch_add(1, Ordering::Release);
+        self.admissions_closed.store(true, Ordering::Release);
+        self.transition_terminal.notify_waiters();
     }
 
     #[cfg(test)]
@@ -613,10 +638,11 @@ pub type CommandEveAsyncCompletionSender = mpsc::Sender<CommandEveAsyncCompletio
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use tokio::sync::oneshot;
 
-    use super::AcpSessionBinding;
+    use super::{AcpSessionBinding, AcpSessionBindingTransitionPending};
 
     #[tokio::test]
     async fn lifecycle_ticket_drop_cancellation_and_unwind_release_the_transition_fence() {
@@ -659,6 +685,40 @@ mod tests {
         lifecycle.bind_acknowledged("session-2").unwrap();
         assert!(!binding.transition_pending());
         assert_eq!(binding.bound_session_id().as_deref(), Some("session-2"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_wait_covers_pending_publication_and_every_queued_terminal() {
+        let binding = Arc::new(AcpSessionBinding::default());
+
+        // Publish two lifecycle owners without queueing either writer. This is
+        // the exact preemption window between transition_pending.fetch_add and
+        // write_owned(). The waiter must not pass merely because no writer is
+        // visible to the RwLock yet.
+        binding.transition_pending.fetch_add(2, Ordering::AcqRel);
+        let first = AcpSessionBindingTransitionPending {
+            pending: Arc::clone(&binding.transition_pending),
+            terminal: Arc::clone(&binding.transition_terminal),
+        };
+        let second = AcpSessionBindingTransitionPending {
+            pending: Arc::clone(&binding.transition_pending),
+            terminal: Arc::clone(&binding.transition_terminal),
+        };
+
+        let waiting_binding = Arc::clone(&binding);
+        let waiter = tokio::spawn(async move {
+            waiting_binding.wait_for_lifecycle_terminal().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "published lifecycle work must fence the prompt");
+
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "one queued lifecycle terminal is not enough");
+
+        drop(second);
+        waiter.await.unwrap();
+        assert_eq!(binding.transition_pending.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
