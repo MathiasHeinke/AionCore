@@ -350,6 +350,17 @@ impl AcpProtocol {
         self.send_request(req, AGENT_METHOD_NAMES.session_prompt).await
     }
 
+    /// Send an ordinary user prompt and restore its existing session binding
+    /// only after the agent acknowledges the request. This is the sole
+    /// positive-rebind path after ordinary cancellation; failed prompts leave
+    /// the durable completion route unbound.
+    pub async fn prompt_and_bind_on_ack(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
+        let session_id = req.session_id.0.clone();
+        let response = self.prompt(req).await?;
+        self.client_extensions.bind_session(session_id.as_ref()).await?;
+        Ok(response)
+    }
+
     /// Submit a cancellation notification to the live ACP transport. This is
     /// only a local transport admission receipt, never terminal worker proof.
     /// A disconnected or closed outbound channel returns an error so callers
@@ -890,6 +901,7 @@ import json
 import pathlib
 import sys
 import time
+import time
 
 marker = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] else None
 preview_sent = False
@@ -956,6 +968,43 @@ for line in sys.stdin:
     elif method == "session/new":
         result = {"sessionId": "close-race-session"}
         print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+    elif method == "session/cancel":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "post-cancel-completion",
+            "method": "_command_eve/async_completion",
+            "params": {
+                "version": "command-eve-async-completion/v1",
+                "completion_id": "completion-post-cancel",
+                "session_id": "close-race-session",
+                "content": "must remain retryable before a positive prompt acknowledgement"
+            }
+        }), flush=True)
+    elif method == "session/prompt":
+        text = message["params"]["prompt"][0]["text"]
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"stopReason": "end_turn"}
+        }), flush=True)
+        time.sleep(0.05)
+        if text == "queue-before-cancel":
+            completion_id = "pre-cancel-completion"
+            completion = "completion-pre-cancel"
+        else:
+            completion_id = "post-rebind-completion"
+            completion = "completion-post-rebind"
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": completion_id,
+            "method": "_command_eve/async_completion",
+            "params": {
+                "version": "command-eve-async-completion/v1",
+                "completion_id": completion,
+                "session_id": "close-race-session",
+                "content": "cancel/rebind lifecycle probe"
+            }
+        }), flush=True)
     elif method == "session/close":
         completion_id = "close-race-completion"
         print(json.dumps({
@@ -980,6 +1029,19 @@ for line in sys.stdin:
                 break
 
         print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": {}}), flush=True)
+    elif method is None and request_id in (
+        "pre-cancel-completion",
+        "post-cancel-completion",
+        "post-rebind-completion",
+    ):
+        responses = {}
+        if marker.exists():
+            try:
+                responses = json.loads(marker.read_text())
+            except json.JSONDecodeError:
+                pass
+        responses[request_id] = message
+        marker.write_text(json.dumps(responses))
     elif request_id is not None:
         print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": None}), flush=True)
 "#;
@@ -1207,6 +1269,128 @@ for line in sys.stdin:
             "a completion arriving during close RPC must never reach turn admission"
         );
         assert_eq!(protocol.client_extensions.bound_session_id(), None);
+
+        drop(protocol);
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_session_rebinds_only_after_the_next_ordinary_prompt_is_acknowledged() {
+        let temp = tempfile::tempdir().expect("temporary cancel-rebind directory");
+        let marker = temp.path().join("cancel-rebind.json");
+        let (protocol, mut completion_rx, mut child) = connect_close_race_mock_agent(&marker).await;
+
+        let created = protocol
+            .new_session(NewSessionRequest::new(temp.path()))
+            .await
+            .expect("bind cancel-rebind session");
+        let session_id = created.session_id.0.clone();
+        assert_eq!(session_id.as_ref(), "close-race-session");
+
+        protocol
+            .prompt(PromptRequest::new(
+                session_id.clone(),
+                vec![agent_client_protocol::schema::ContentBlock::from("queue-before-cancel")],
+            ))
+            .await
+            .expect("queue pre-cancel completion");
+        let queued = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .expect("pre-cancel completion timeout")
+            .expect("pre-cancel completion");
+        let stale_turn_gate = queued.turn_gate.clone();
+        let stale_generation = queued.lease.generation();
+
+        protocol
+            .cancel_session(CancelNotification::new(session_id.clone()))
+            .await
+            .expect("cancel notification transport receipt");
+        assert_eq!(protocol.client_extensions.bound_session_id(), None);
+        assert!(stale_turn_gate.try_admit_turn().is_none());
+        queued
+            .reply
+            .send(crate::CommandEveAsyncCompletionResult::RetryableBusy {
+                code: "session_not_bound".to_owned(),
+            })
+            .expect("stale completion reply");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let wire = std::fs::read(&marker)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                if wire
+                    .as_ref()
+                    .is_some_and(|wire| wire.get("post-cancel-completion").is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("post-cancel retryable wire receipt");
+        assert!(
+            completion_rx.try_recv().is_err(),
+            "post-cancel completion must not dispatch"
+        );
+
+        protocol
+            .prompt_and_bind_on_ack(PromptRequest::new(
+                session_id.clone(),
+                vec![agent_client_protocol::schema::ContentBlock::from(
+                    "ordinary-after-cancel",
+                )],
+            ))
+            .await
+            .expect("acknowledged ordinary prompt");
+        assert_eq!(
+            protocol.client_extensions.bound_session_id().as_deref(),
+            Some("close-race-session")
+        );
+        assert!(stale_turn_gate.try_admit_turn().is_none());
+
+        let fresh = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .expect("post-rebind completion timeout")
+            .expect("post-rebind completion");
+        assert!(fresh.lease.generation() > stale_generation);
+        assert!(fresh.turn_gate.try_admit_turn().is_some());
+        fresh
+            .reply
+            .send(crate::CommandEveAsyncCompletionResult::Completed {
+                turn_id: "turn-post-rebind".to_owned(),
+            })
+            .expect("fresh completion reply");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let wire = std::fs::read(&marker)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                if wire
+                    .as_ref()
+                    .is_some_and(|wire| wire.get("post-rebind-completion").is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("post-rebind accepted wire receipt");
+        let wire: serde_json::Value = serde_json::from_slice(&std::fs::read(&marker).expect("cancel-rebind marker"))
+            .expect("valid cancel-rebind marker JSON");
+        assert_eq!(wire["post-cancel-completion"]["result"]["status"], "retryable");
+        assert_eq!(wire["post-cancel-completion"]["result"]["code"], "session_not_bound");
+        assert_eq!(wire["post-rebind-completion"]["result"]["status"], "accepted");
+        assert_eq!(wire["post-rebind-completion"]["result"]["turnId"], "turn-post-rebind");
 
         drop(protocol);
         if tokio::time::timeout(Duration::from_secs(2), child.wait())

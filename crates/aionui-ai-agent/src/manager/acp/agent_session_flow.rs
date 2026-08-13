@@ -402,7 +402,7 @@ impl AcpAgentManager {
 
         let prompt_response = self
             .protocol
-            .prompt(prompt_request)
+            .prompt_and_bind_on_ack(prompt_request)
             .await
             .map_err(AcpSendFailure::from)?;
 
