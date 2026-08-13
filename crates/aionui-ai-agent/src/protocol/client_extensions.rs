@@ -180,6 +180,10 @@ impl AcpClientExtensionRouter {
         self.session_binding.lifecycle_generation()
     }
 
+    pub(crate) async fn wait_for_session_lifecycle_terminal(&self) {
+        self.session_binding.wait_for_lifecycle_terminal().await;
+    }
+
     /// Restore a prompt's positive session binding only if no lifecycle
     /// transition superseded the generation captured before transport send.
     pub(crate) async fn bind_session_if_generation(

@@ -242,6 +242,16 @@ impl AcpSessionBinding {
         self.state.lock().ok().map(|state| state.generation)
     }
 
+    /// Wait until the lifecycle transition that already owns (or is queued
+    /// for) the admission writer reaches its terminal boundary. This does not
+    /// mint a lease or restore a binding: it only prevents an ordinary prompt
+    /// which began inside that interval from completing before the owning
+    /// `session/new|load|resume|close` request has finished.
+    pub(crate) async fn wait_for_lifecycle_terminal(&self) {
+        let barrier = Arc::clone(&self.admission_barrier).read_owned().await;
+        drop(barrier);
+    }
+
     /// Snapshot the live binding as a lease, or `None` while the route is
     /// unbound (pre-bind, mid request interval, after close/cancel).
     pub fn lease(&self) -> Option<AcpSessionBindingLease> {

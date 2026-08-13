@@ -358,7 +358,15 @@ impl AcpProtocol {
     pub async fn prompt_and_bind_on_ack(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
         let session_id = req.session_id.0.clone();
         let binding_generation = self.client_extensions.session_binding_generation();
-        let response = self.prompt(req).await?;
+        let response = self.prompt(req).await;
+        if binding_generation.is_none() {
+            // A lifecycle transition already had precedence when this prompt
+            // started. Preserve its unbound outcome and do not let either a
+            // success, cancellation, or transport error report completion
+            // before that transition's RPC reaches its terminal response.
+            self.client_extensions.wait_for_session_lifecycle_terminal().await;
+        }
+        let response = response?;
         if response.stop_reason != StopReason::Cancelled
             && let Some(binding_generation) = binding_generation
         {
@@ -1273,7 +1281,7 @@ for line in sys.stdin:
 
     fn release_lifecycle_terminal(protocol: &AcpProtocol) {
         let params = serde_json::value::to_raw_value(&serde_json::json!({})).expect("lifecycle release params");
-        protocol.ext_notify(ExtNotification::new("lifecycle_release", params.into()));
+        protocol.ext_notify(ExtNotification::new("_lifecycle_release", params.into()));
     }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
