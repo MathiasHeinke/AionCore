@@ -1075,17 +1075,16 @@ for line in sys.stdin:
 "#;
 
     /// Deterministic lifecycle peer. Every lifecycle request publishes an
-    /// entered barrier notification, then waits for the competing ordinary
-    /// prompt before returning either its configured result or a JSON-RPC
-    /// error. The test therefore exercises the exact interval without sleeps.
+    /// entered barrier notification and keeps its terminal response pending.
+    /// Competing prompts publish their own barrier and acknowledge transport
+    /// immediately, so the Rust task can block on the lifecycle binding fence
+    /// until an explicit release without sleeps or a circular fixture wait.
     #[cfg(unix)]
     const LIFECYCLE_EPOCH_MOCK_ACP_AGENT: &str = r#"
 import json
 import sys
 
 pending = None
-pending_prompt = None
-
 def lifecycle_name(method):
     return method.split("/")[1]
 
@@ -1118,8 +1117,6 @@ for line in sys.stdin:
         }), flush=True)
     elif method == "session/prompt":
         assert pending is not None
-        assert pending_prompt is None
-        pending_prompt = request_id
         print(json.dumps({
             "jsonrpc": "2.0", "method": "session/update",
             "params": {
@@ -1133,9 +1130,12 @@ for line in sys.stdin:
                 }
             }
         }), flush=True)
+        print(json.dumps({
+            "jsonrpc": "2.0", "id": request_id,
+            "result": {"stopReason": "end_turn"}
+        }), flush=True)
     elif method == "_lifecycle_release":
         assert pending is not None
-        assert pending_prompt is not None
         lifecycle_id, lifecycle_method, mode, params = pending
         if mode == "failure":
             print(json.dumps({
@@ -1145,12 +1145,7 @@ for line in sys.stdin:
         else:
             result = {"sessionId": "lifecycle-new"} if lifecycle_method == "session/new" else {}
             print(json.dumps({"jsonrpc": "2.0", "id": lifecycle_id, "result": result}), flush=True)
-        print(json.dumps({
-            "jsonrpc": "2.0", "id": pending_prompt,
-            "result": {"stopReason": "end_turn"}
-        }), flush=True)
         pending = None
-        pending_prompt = None
     elif request_id is not None:
         print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": None}), flush=True)
 "#;
