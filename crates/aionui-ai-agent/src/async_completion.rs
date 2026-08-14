@@ -255,6 +255,20 @@ impl AcpSessionBinding {
         self.state.lock().ok().map(|state| state.generation)
     }
 
+    /// Snapshot the current binding generation for an idempotent receipt
+    /// retry while lifecycle admission is transiently fenced. This is not an
+    /// admission lease: callers may only preserve a retryable receipt and
+    /// must retry after the lifecycle owner reaches terminal state.
+    pub(crate) fn retry_generation_for_session(&self, session_id: &str) -> Option<u64> {
+        if self.admissions_closed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| (state.bound_session_id.as_deref() == Some(session_id)).then_some(state.generation))
+    }
+
     /// Wait until the lifecycle transition that already owns (or is queued
     /// for) the admission writer reaches its terminal boundary. This does not
     /// mint a lease or restore a binding: it only prevents an ordinary prompt
