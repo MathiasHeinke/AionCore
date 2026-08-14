@@ -4,6 +4,7 @@
 //! methods are Hermes' bounded `read_preview` and `read_terminal` requests,
 //! and each public response path consumes one matching request exactly once.
 
+mod correction_boundary;
 mod read_terminal;
 
 use std::collections::HashMap;
@@ -82,6 +83,7 @@ struct ExtensionState {
     async_completion_enabled: bool,
     pending: HashMap<String, PendingReadPreview>,
     pending_terminal: HashMap<String, PendingReadTerminal>,
+    correction_boundary_receipts: correction_boundary::ReceiptSet,
 }
 
 #[derive(Clone)]
@@ -446,6 +448,10 @@ impl AcpClientExtensionRouter {
     }
 
     fn handle_ext_request(&self, request: ExtRequest, respond: ResponseSender) {
+        if request.method.as_ref() == correction_boundary::EXT_METHOD {
+            correction_boundary::handle(self, request.params.get(), respond);
+            return;
+        }
         if request.method.as_ref() == COMMAND_EVE_PROMPT_ADMISSION_EXT_METHOD {
             self.handle_prompt_admission_request(request.params.get(), respond);
             return;
