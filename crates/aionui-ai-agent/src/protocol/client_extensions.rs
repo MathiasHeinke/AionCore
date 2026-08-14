@@ -83,7 +83,7 @@ struct ExtensionState {
     async_completion_enabled: bool,
     pending: HashMap<String, PendingReadPreview>,
     pending_terminal: HashMap<String, PendingReadTerminal>,
-    correction_boundary_receipts: correction_boundary::ReceiptSet,
+    correction_boundary_receipts: correction_boundary::ReceiptMap,
 }
 
 #[derive(Clone)]

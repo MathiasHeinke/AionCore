@@ -1,6 +1,6 @@
 //! Idempotent Command EVE correction boundary request handling.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use tracing::info;
 
@@ -16,7 +16,14 @@ const WIRE_METHOD: &str = "_command_eve/correction_boundary";
 const VERSION: &str = "command-eve-correction-boundary/v1";
 const MAX_RECEIPTS: usize = 256;
 
-pub(super) type ReceiptSet = HashSet<(String, String)>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReceiptState {
+    Retryable(u64),
+    Accepted(u64),
+    Rejected,
+}
+
+pub(super) type ReceiptMap = HashMap<(String, String), ReceiptState>;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,18 +67,21 @@ pub(super) fn handle(router: &AcpClientExtensionRouter, raw_params: &str, respon
         }
     };
 
+    let receipt_key = (request.session_id.clone(), request.request_id.clone());
+
     // The read admission linearizes this event with cancel/close/rebind. A
     // lifecycle transition either owns the writer first and rejects this
     // request, or waits until the exact session boundary is committed.
     let Some(admission) = router.session_binding.try_acquire_admission() else {
-        send_response(respond, &request.request_id, false);
+        reject_receipt(router, &receipt_key, respond, &request.request_id);
         return;
     };
     if admission.lease().session_id() != request.session_id {
         drop(admission);
-        send_response(respond, &request.request_id, false);
+        reject_receipt(router, &receipt_key, respond, &request.request_id);
         return;
     }
+    let generation = admission.lease().generation();
 
     let mut state = match router.state.lock() {
         Ok(state) => state,
@@ -85,22 +95,36 @@ pub(super) fn handle(router: &AcpClientExtensionRouter, raw_params: &str, respon
     // retry an ambiguously delivered response.
     state
         .correction_boundary_receipts
-        .retain(|(session_id, _)| session_id == &request.session_id);
-    let receipt_key = (request.session_id.clone(), request.request_id.clone());
-    if state.correction_boundary_receipts.contains(&receipt_key) {
-        drop(state);
-        drop(admission);
-        send_response(respond, &request.request_id, true);
-        return;
+        .retain(|(session_id, _), _| session_id == &request.session_id);
+    match state.correction_boundary_receipts.get(&receipt_key).copied() {
+        Some(ReceiptState::Accepted(existing_generation)) if existing_generation == generation => {
+            drop(state);
+            drop(admission);
+            send_response(respond, &request.request_id, true);
+            return;
+        }
+        Some(ReceiptState::Retryable(existing_generation)) if existing_generation == generation => {}
+        Some(_) => {
+            state
+                .correction_boundary_receipts
+                .insert(receipt_key, ReceiptState::Rejected);
+            drop(state);
+            drop(admission);
+            send_response(respond, &request.request_id, false);
+            return;
+        }
+        None => {
+            if state.correction_boundary_receipts.len() >= MAX_RECEIPTS {
+                drop(state);
+                drop(admission);
+                respond_ignoring_transport(respond, Err(rpc_internal("receipt_capacity_exhausted")));
+                return;
+            }
+            state
+                .correction_boundary_receipts
+                .insert(receipt_key.clone(), ReceiptState::Retryable(generation));
+        }
     }
-    if state.correction_boundary_receipts.len() >= MAX_RECEIPTS {
-        drop(state);
-        drop(admission);
-        respond_ignoring_transport(respond, Err(rpc_internal("receipt_capacity_exhausted")));
-        return;
-    }
-
-    state.correction_boundary_receipts.insert(receipt_key.clone());
     if router
         .event_tx
         .send(AgentStreamEvent::CorrectionBoundary(
@@ -108,15 +132,43 @@ pub(super) fn handle(router: &AcpClientExtensionRouter, raw_params: &str, respon
         ))
         .is_err()
     {
-        state.correction_boundary_receipts.remove(&receipt_key);
         drop(state);
         drop(admission);
         send_response(respond, &request.request_id, false);
         return;
     }
+    state
+        .correction_boundary_receipts
+        .insert(receipt_key, ReceiptState::Accepted(generation));
     drop(state);
     drop(admission);
     send_response(respond, &request.request_id, true);
+}
+
+fn reject_receipt(
+    router: &AcpClientExtensionRouter,
+    receipt_key: &(String, String),
+    respond: ResponseSender,
+    request_id: &str,
+) {
+    let mut state = match router.state.lock() {
+        Ok(state) => state,
+        Err(_) => {
+            respond_ignoring_transport(respond, Err(rpc_internal("state_unavailable")));
+            return;
+        }
+    };
+    if !state.correction_boundary_receipts.contains_key(receipt_key)
+        && state.correction_boundary_receipts.len() >= MAX_RECEIPTS
+    {
+        respond_ignoring_transport(respond, Err(rpc_internal("receipt_capacity_exhausted")));
+        return;
+    }
+    state
+        .correction_boundary_receipts
+        .insert(receipt_key.clone(), ReceiptState::Rejected);
+    drop(state);
+    send_response(respond, request_id, false);
 }
 
 fn send_response(respond: ResponseSender, request_id: &str, accepted: bool) {
@@ -221,12 +273,29 @@ mod tests {
         let router = AcpClientExtensionRouter::new(event_tx);
         router.bind_session("session-correction").await.unwrap();
 
+        let committed_request = request("receipt-committed", "session-correction");
+        let committed = dispatch(&router, &committed_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(accepted_response(committed, "receipt-committed"));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            AgentStreamEvent::CorrectionBoundary(_)
+        ));
+
         let unbound = dispatch(&router, &request("receipt-unbound", "session-other").to_string())
             .await
             .unwrap()
             .unwrap();
         let unbound: Response = serde_json::from_value(unbound).unwrap();
         assert_eq!(unbound.status, Status::Rejected);
+
+        let committed_replay = dispatch(&router, &committed_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(accepted_response(committed_replay, "receipt-committed"));
 
         for invalid in [
             "{".to_owned(),
@@ -285,16 +354,33 @@ mod tests {
         let router = AcpClientExtensionRouter::new(event_tx);
         router.bind_session("session-correction").await.unwrap();
         let lifecycle = router.begin_session_binding().await.unwrap();
-        let request = request("receipt-lifecycle", "session-correction");
+        let lifecycle_request = request("receipt-lifecycle", "session-correction");
 
-        let rejected = dispatch(&router, &request.to_string()).await.unwrap().unwrap();
+        let rejected = dispatch(&router, &lifecycle_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
         let rejected: Response = serde_json::from_value(rejected).unwrap();
         assert_eq!(rejected.status, Status::Rejected);
         assert!(event_rx.try_recv().is_err());
 
         router.finish_session_binding(lifecycle, "session-correction").unwrap();
-        let accepted = dispatch(&router, &request.to_string()).await.unwrap().unwrap();
-        assert!(accepted_response(accepted, "receipt-lifecycle"));
+        let rejected_again = dispatch(&router, &lifecycle_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let rejected_again: Response = serde_json::from_value(rejected_again).unwrap();
+        assert_eq!(rejected_again.status, Status::Rejected);
+        assert!(event_rx.try_recv().is_err());
+
+        let fresh = dispatch(
+            &router,
+            &request("receipt-lifecycle-fresh", "session-correction").to_string(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(accepted_response(fresh, "receipt-lifecycle-fresh"));
         assert!(matches!(
             event_rx.recv().await.unwrap(),
             AgentStreamEvent::CorrectionBoundary(_)
@@ -310,7 +396,12 @@ mod tests {
             let mut state = router.state.lock().unwrap();
             state
                 .correction_boundary_receipts
-                .extend((0..MAX_RECEIPTS).map(|index| ("session-capacity".to_owned(), format!("receipt-{index}"))));
+                .extend((0..MAX_RECEIPTS).map(|index| {
+                    (
+                        ("session-capacity".to_owned(), format!("receipt-{index}")),
+                        ReceiptState::Accepted(1),
+                    )
+                }));
         }
 
         let exhausted = dispatch(&router, &request("receipt-overflow", "session-capacity").to_string())
