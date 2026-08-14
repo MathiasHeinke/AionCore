@@ -13,14 +13,14 @@ use crate::protocol::events::{AgentStreamEvent, CorrectionBoundaryEventData};
 pub(super) const EXT_METHOD: &str = "command_eve/correction_boundary";
 #[cfg(test)]
 const WIRE_METHOD: &str = "_command_eve/correction_boundary";
-const VERSION: &str = "command-eve-correction-boundary/v1";
+const VERSION: &str = "command-eve-correction-boundary/v2";
 const MAX_RECEIPTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReceiptState {
     Retryable(u64),
     Accepted(u64),
-    Rejected,
+    Rejected(RejectionReason),
 }
 
 pub(super) type ReceiptMap = HashMap<(String, String), ReceiptState>;
@@ -39,6 +39,7 @@ struct Response {
     version: String,
     request_id: String,
     status: Status,
+    rejection: Option<RejectionReason>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -46,6 +47,14 @@ struct Response {
 enum Status {
     Accepted,
     Rejected,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RejectionReason {
+    RetryableSameGeneration,
+    LifecycleChanged,
+    SessionMismatch,
 }
 
 pub(super) fn handle(router: &AcpClientExtensionRouter, raw_params: &str, respond: ResponseSender) {
@@ -73,12 +82,24 @@ pub(super) fn handle(router: &AcpClientExtensionRouter, raw_params: &str, respon
     // lifecycle transition either owns the writer first and rejects this
     // request, or waits until the exact session boundary is committed.
     let Some(admission) = router.session_binding.try_acquire_admission() else {
-        reject_receipt(router, &receipt_key, respond, &request.request_id);
+        reject_receipt(
+            router,
+            &receipt_key,
+            RejectionReason::LifecycleChanged,
+            respond,
+            &request.request_id,
+        );
         return;
     };
     if admission.lease().session_id() != request.session_id {
         drop(admission);
-        reject_receipt(router, &receipt_key, respond, &request.request_id);
+        reject_receipt(
+            router,
+            &receipt_key,
+            RejectionReason::SessionMismatch,
+            respond,
+            &request.request_id,
+        );
         return;
     }
     let generation = admission.lease().generation();
@@ -100,17 +121,28 @@ pub(super) fn handle(router: &AcpClientExtensionRouter, raw_params: &str, respon
         Some(ReceiptState::Accepted(existing_generation)) if existing_generation == generation => {
             drop(state);
             drop(admission);
-            send_response(respond, &request.request_id, true);
+            send_response(respond, &request.request_id, true, None);
             return;
         }
         Some(ReceiptState::Retryable(existing_generation)) if existing_generation == generation => {}
-        Some(_) => {
-            state
-                .correction_boundary_receipts
-                .insert(receipt_key, ReceiptState::Rejected);
+        Some(ReceiptState::Rejected(reason)) => {
             drop(state);
             drop(admission);
-            send_response(respond, &request.request_id, false);
+            send_response(respond, &request.request_id, false, Some(reason));
+            return;
+        }
+        Some(ReceiptState::Accepted(_) | ReceiptState::Retryable(_)) => {
+            state
+                .correction_boundary_receipts
+                .insert(receipt_key, ReceiptState::Rejected(RejectionReason::LifecycleChanged));
+            drop(state);
+            drop(admission);
+            send_response(
+                respond,
+                &request.request_id,
+                false,
+                Some(RejectionReason::LifecycleChanged),
+            );
             return;
         }
         None => {
@@ -134,7 +166,12 @@ pub(super) fn handle(router: &AcpClientExtensionRouter, raw_params: &str, respon
     {
         drop(state);
         drop(admission);
-        send_response(respond, &request.request_id, false);
+        send_response(
+            respond,
+            &request.request_id,
+            false,
+            Some(RejectionReason::RetryableSameGeneration),
+        );
         return;
     }
     state
@@ -142,12 +179,13 @@ pub(super) fn handle(router: &AcpClientExtensionRouter, raw_params: &str, respon
         .insert(receipt_key, ReceiptState::Accepted(generation));
     drop(state);
     drop(admission);
-    send_response(respond, &request.request_id, true);
+    send_response(respond, &request.request_id, true, None);
 }
 
 fn reject_receipt(
     router: &AcpClientExtensionRouter,
     receipt_key: &(String, String),
+    reason: RejectionReason,
     respond: ResponseSender,
     request_id: &str,
 ) {
@@ -166,16 +204,17 @@ fn reject_receipt(
     }
     state
         .correction_boundary_receipts
-        .insert(receipt_key.clone(), ReceiptState::Rejected);
+        .insert(receipt_key.clone(), ReceiptState::Rejected(reason));
     drop(state);
-    send_response(respond, request_id, false);
+    send_response(respond, request_id, false, Some(reason));
 }
 
-fn send_response(respond: ResponseSender, request_id: &str, accepted: bool) {
+fn send_response(respond: ResponseSender, request_id: &str, accepted: bool, rejection: Option<RejectionReason>) {
     let response = Response {
         version: VERSION.to_owned(),
         request_id: request_id.to_owned(),
         status: if accepted { Status::Accepted } else { Status::Rejected },
+        rejection,
     };
     let Ok(value) = serde_json::to_value(response) else {
         respond_ignoring_transport(respond, Err(rpc_internal("response_encoding_failed")));
@@ -226,6 +265,19 @@ mod tests {
                     version: VERSION.to_owned(),
                     request_id: request_id.to_owned(),
                     status: Status::Accepted,
+                    rejection: None,
+                }
+        })
+    }
+
+    fn rejected_response(value: serde_json::Value, request_id: &str, reason: RejectionReason) -> bool {
+        serde_json::from_value::<Response>(value).is_ok_and(|response| {
+            response
+                == Response {
+                    version: VERSION.to_owned(),
+                    request_id: request_id.to_owned(),
+                    status: Status::Rejected,
+                    rejection: Some(reason),
                 }
         })
     }
@@ -288,8 +340,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let unbound: Response = serde_json::from_value(unbound).unwrap();
-        assert_eq!(unbound.status, Status::Rejected);
+        assert!(rejected_response(
+            unbound,
+            "receipt-unbound",
+            RejectionReason::SessionMismatch
+        ));
 
         let committed_replay = dispatch(&router, &committed_request.to_string())
             .await
@@ -336,8 +391,11 @@ mod tests {
         let request = request("receipt-subscriber", "session-correction");
 
         let rejected = dispatch(&router, &request.to_string()).await.unwrap().unwrap();
-        let rejected: Response = serde_json::from_value(rejected).unwrap();
-        assert_eq!(rejected.status, Status::Rejected);
+        assert!(rejected_response(
+            rejected,
+            "receipt-subscriber",
+            RejectionReason::RetryableSameGeneration,
+        ));
 
         let mut event_rx = router.event_tx.subscribe();
         let accepted = dispatch(&router, &request.to_string()).await.unwrap().unwrap();
@@ -360,8 +418,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let rejected: Response = serde_json::from_value(rejected).unwrap();
-        assert_eq!(rejected.status, Status::Rejected);
+        assert!(rejected_response(
+            rejected,
+            "receipt-lifecycle",
+            RejectionReason::LifecycleChanged,
+        ));
         assert!(event_rx.try_recv().is_err());
 
         router.finish_session_binding(lifecycle, "session-correction").unwrap();
@@ -369,8 +430,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let rejected_again: Response = serde_json::from_value(rejected_again).unwrap();
-        assert_eq!(rejected_again.status, Status::Rejected);
+        assert!(rejected_response(
+            rejected_again,
+            "receipt-lifecycle",
+            RejectionReason::LifecycleChanged,
+        ));
         assert!(event_rx.try_recv().is_err());
 
         let fresh = dispatch(
