@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aionui_api_types::AcpAsyncCompletionRequest;
@@ -160,17 +160,47 @@ impl AcpSessionBindingTurnGate {
     }
 }
 
-/// Counts lifecycle transitions which have declared precedence over new
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcpSessionBindingTransitionClass {
+    ReceiptPreservingBind,
+    LifecycleChanging,
+}
+
+/// Atomically sampled authority for preserving an existing correction
+/// receipt during a receipt-preserving bind fence. The lifecycle epoch is
+/// revalidated while the receipt map is locked, without taking the binding
+/// state mutex in the opposite order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AcpSessionBindingReceiptRetrySnapshot {
+    generation: u64,
+    lifecycle_epoch: u64,
+}
+
+impl AcpSessionBindingReceiptRetrySnapshot {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Counts binding transitions which have declared precedence over new
 /// completion admissions. The count (rather than a boolean) preserves the
-/// fail-closed state while more than one lifecycle request is queued.
+/// fail-closed state while more than one transition is queued. Lifecycle-
+/// changing owners additionally retain their classified counter until drop.
 struct AcpSessionBindingTransitionPending {
     pending: Arc<AtomicUsize>,
+    lifecycle_change_pending: Option<Arc<AtomicUsize>>,
     terminal: Arc<Notify>,
 }
 
 impl Drop for AcpSessionBindingTransitionPending {
     fn drop(&mut self) {
+        // Keep the classified lifecycle fence visible until the generic
+        // pending count has been released. A retry snapshot can therefore
+        // never mistake lifecycle cleanup for a receipt-preserving bind.
         self.pending.fetch_sub(1, Ordering::AcqRel);
+        if let Some(lifecycle_change_pending) = &self.lifecycle_change_pending {
+            lifecycle_change_pending.fetch_sub(1, Ordering::AcqRel);
+        }
         self.terminal.notify_waiters();
     }
 }
@@ -231,6 +261,13 @@ pub struct AcpSessionBinding {
     /// completion checks it before and after acquiring a reader permit, so it
     /// cannot slip between a transition request and the writer acquisition.
     transition_pending: Arc<AtomicUsize>,
+    /// Counts only transitions which can invalidate or replace a binding.
+    /// Receipt-preserving same-session binds deliberately do not increment it.
+    lifecycle_change_pending: Arc<AtomicUsize>,
+    /// Monotonic publication epoch for lifecycle-changing transitions. It is
+    /// advanced before the writer is awaited, closing the pre-writer TOCTOU
+    /// window for correction receipt retries.
+    lifecycle_epoch: Arc<AtomicU64>,
     /// Wakes prompts after each lifecycle terminal so they can verify that no
     /// earlier or queued transition remains pending.
     transition_terminal: Arc<Notify>,
@@ -242,7 +279,9 @@ pub struct AcpSessionBinding {
 
 impl AcpSessionBinding {
     fn lifecycle_fenced(&self) -> bool {
-        self.admissions_closed.load(Ordering::Acquire) || self.transition_pending.load(Ordering::Acquire) != 0
+        self.admissions_closed.load(Ordering::Acquire)
+            || self.transition_pending.load(Ordering::Acquire) != 0
+            || self.lifecycle_change_pending.load(Ordering::Acquire) != 0
     }
 
     /// Snapshot the current lifecycle generation for an operation that may
@@ -255,18 +294,40 @@ impl AcpSessionBinding {
         self.state.lock().ok().map(|state| state.generation)
     }
 
-    /// Snapshot the current binding generation for an idempotent receipt
-    /// retry while lifecycle admission is transiently fenced. This is not an
-    /// admission lease: callers may only preserve a retryable receipt and
-    /// must retry after the lifecycle owner reaches terminal state.
-    pub(crate) fn retry_generation_for_session(&self, session_id: &str) -> Option<u64> {
-        if self.admissions_closed.load(Ordering::Acquire) {
+    /// Snapshot the exact same-session generation only while a classified
+    /// receipt-preserving bind owns the admission fence. This is not an
+    /// admission lease and cannot authorize a new receipt.
+    pub(crate) fn receipt_retry_snapshot(&self, session_id: &str) -> Option<AcpSessionBindingReceiptRetrySnapshot> {
+        if self.admissions_closed.load(Ordering::Acquire)
+            || self.transition_pending.load(Ordering::Acquire) == 0
+            || self.lifecycle_change_pending.load(Ordering::Acquire) != 0
+        {
             return None;
         }
-        self.state
-            .lock()
-            .ok()
-            .and_then(|state| (state.bound_session_id.as_deref() == Some(session_id)).then_some(state.generation))
+        let lifecycle_epoch = self.lifecycle_epoch.load(Ordering::Acquire);
+        let generation =
+            self.state.lock().ok().and_then(|state| {
+                (state.bound_session_id.as_deref() == Some(session_id)).then_some(state.generation)
+            })?;
+        if self.admissions_closed.load(Ordering::Acquire)
+            || self.lifecycle_change_pending.load(Ordering::Acquire) != 0
+            || self.lifecycle_epoch.load(Ordering::Acquire) != lifecycle_epoch
+        {
+            return None;
+        }
+        Some(AcpSessionBindingReceiptRetrySnapshot {
+            generation,
+            lifecycle_epoch,
+        })
+    }
+
+    /// Final lock-order-safe validation for a receipt retry snapshot. This is
+    /// intentionally atomic-only so callers may invoke it while holding their
+    /// receipt-map mutex without also acquiring the binding state mutex.
+    pub(crate) fn receipt_retry_snapshot_is_current(&self, snapshot: &AcpSessionBindingReceiptRetrySnapshot) -> bool {
+        !self.admissions_closed.load(Ordering::Acquire)
+            && self.lifecycle_change_pending.load(Ordering::Acquire) == 0
+            && self.lifecycle_epoch.load(Ordering::Acquire) == snapshot.lifecycle_epoch
     }
 
     /// Wait until the lifecycle transition that already owns (or is queued
@@ -276,13 +337,13 @@ impl AcpSessionBinding {
     /// `session/new|load|resume|close` request has finished.
     pub(crate) async fn wait_for_lifecycle_terminal(&self) {
         loop {
-            if self.admissions_closed.load(Ordering::Acquire) || self.transition_pending.load(Ordering::Acquire) == 0 {
+            if self.admissions_closed.load(Ordering::Acquire) || !self.any_transition_pending() {
                 return;
             }
             let terminal = self.transition_terminal.notified();
             tokio::pin!(terminal);
             terminal.as_mut().enable();
-            if self.admissions_closed.load(Ordering::Acquire) || self.transition_pending.load(Ordering::Acquire) == 0 {
+            if self.admissions_closed.load(Ordering::Acquire) || !self.any_transition_pending() {
                 return;
             }
             terminal.await;
@@ -398,7 +459,9 @@ impl AcpSessionBinding {
     /// real (re)bind advanced the generation, `Ok(false)` for an idempotent
     /// same-session bind without an intervening begin-binding transition.
     pub(crate) async fn bind(&self, session_id: &str) -> Result<bool, ()> {
-        let _transition = self.transition().await;
+        let _transition = self
+            .transition(AcpSessionBindingTransitionClass::LifecycleChanging)
+            .await;
         let mut state = self.state.lock().map_err(|_| ())?;
         if state.bound_session_id.as_deref() == Some(session_id) {
             return Ok(false);
@@ -417,7 +480,18 @@ impl AcpSessionBinding {
         session_id: &str,
         expected_generation: u64,
     ) -> Result<Option<bool>, ()> {
-        let transition = self.transition().await;
+        let class = self
+            .state
+            .lock()
+            .map(|state| {
+                if state.generation == expected_generation && state.bound_session_id.as_deref() == Some(session_id) {
+                    AcpSessionBindingTransitionClass::ReceiptPreservingBind
+                } else {
+                    AcpSessionBindingTransitionClass::LifecycleChanging
+                }
+            })
+            .map_err(|_| ())?;
+        let transition = self.transition(class).await;
         if transition.had_preexisting_transition() {
             return Ok(None);
         }
@@ -436,7 +510,9 @@ impl AcpSessionBinding {
     /// Unbind a matching closed session, advancing the generation. Returns
     /// whether a live binding was dropped.
     pub(crate) async fn unbind_matching(&self, session_id: &str) -> Result<bool, ()> {
-        let _transition = self.transition().await;
+        let _transition = self
+            .transition(AcpSessionBindingTransitionClass::LifecycleChanging)
+            .await;
         let mut state = self.state.lock().map_err(|_| ())?;
         if state.bound_session_id.as_deref() != Some(session_id) {
             return Ok(false);
@@ -451,7 +527,9 @@ impl AcpSessionBinding {
     /// cancel/shutdown: until the request succeeds and binds, the route
     /// stays unbound and every previously minted lease is stale.
     pub(crate) async fn invalidate(&self) -> Result<(), ()> {
-        let _transition = self.transition().await;
+        let _transition = self
+            .transition(AcpSessionBindingTransitionClass::LifecycleChanging)
+            .await;
         let Ok(mut state) = self.state.lock() else {
             return Err(());
         };
@@ -463,7 +541,9 @@ impl AcpSessionBinding {
     /// Invalidate the route and retain exclusive lifecycle ownership until
     /// the caller observes the terminal `session/new|load|resume` response.
     pub(crate) async fn begin_lifecycle(&self) -> Result<AcpSessionBindingLifecycle, ()> {
-        let transition = self.transition().await;
+        let transition = self
+            .transition(AcpSessionBindingTransitionClass::LifecycleChanging)
+            .await;
         let invalidated_generation = {
             let mut state = self.state.lock().map_err(|_| ())?;
             Self::advance(&mut state);
@@ -485,7 +565,9 @@ impl AcpSessionBinding {
         &self,
         session_id: &str,
     ) -> Result<(AcpSessionBindingLifecycle, bool), ()> {
-        let transition = self.transition().await;
+        let transition = self
+            .transition(AcpSessionBindingTransitionClass::LifecycleChanging)
+            .await;
         let (invalidated_generation, invalidated_matching_session) = {
             let mut state = self.state.lock().map_err(|_| ())?;
             let invalidated_matching_session = state.bound_session_id.as_deref() == Some(session_id);
@@ -505,13 +587,35 @@ impl AcpSessionBinding {
         ))
     }
 
-    /// Start a lifecycle transition. New completion admissions fail closed as
+    /// Start a classified binding transition. New completion admissions fail closed as
     /// soon as this method is entered; an existing admission linearizes before
     /// the transition and keeps the read permit until receipt/turn admission.
-    async fn transition(&self) -> AcpSessionBindingTransition {
+    async fn transition(&self, class: AcpSessionBindingTransitionClass) -> AcpSessionBindingTransition {
+        let (mut lifecycle_change_pending, mut had_preexisting_lifecycle_change) = match class {
+            AcpSessionBindingTransitionClass::ReceiptPreservingBind => (None, false),
+            AcpSessionBindingTransitionClass::LifecycleChanging => {
+                let had_preexisting = self.lifecycle_change_pending.fetch_add(1, Ordering::AcqRel) != 0;
+                self.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
+                (Some(Arc::clone(&self.lifecycle_change_pending)), had_preexisting)
+            }
+        };
         let had_preexisting_transition = self.transition_pending.fetch_add(1, Ordering::AcqRel) != 0;
+        if class == AcpSessionBindingTransitionClass::ReceiptPreservingBind
+            && self.lifecycle_change_pending.load(Ordering::Acquire) != 0
+        {
+            // A bind which was classified from an older snapshot but queued
+            // behind lifecycle work cannot expose receipt-preserving retry
+            // authority. Promote its whole queued interval to fail-closed;
+            // `bind_if_generation` will return `None` after the writer arrives.
+            self.lifecycle_change_pending.fetch_add(1, Ordering::AcqRel);
+            self.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
+            lifecycle_change_pending = Some(Arc::clone(&self.lifecycle_change_pending));
+            had_preexisting_lifecycle_change = true;
+        }
+        let had_preexisting_transition = had_preexisting_transition || had_preexisting_lifecycle_change;
         let pending = AcpSessionBindingTransitionPending {
             pending: Arc::clone(&self.transition_pending),
+            lifecycle_change_pending,
             terminal: Arc::clone(&self.transition_terminal),
         };
         let barrier = Arc::clone(&self.admission_barrier).write_owned().await;
@@ -532,7 +636,22 @@ impl AcpSessionBinding {
 
     #[cfg(test)]
     pub(crate) fn transition_pending(&self) -> bool {
+        self.any_transition_pending()
+    }
+
+    fn any_transition_pending(&self) -> bool {
         self.transition_pending.load(Ordering::Acquire) != 0
+            || self.lifecycle_change_pending.load(Ordering::Acquire) != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle_change_pending(&self) -> bool {
+        self.lifecycle_change_pending.load(Ordering::Acquire) != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle_epoch(&self) -> u64 {
+        self.lifecycle_epoch.load(Ordering::Acquire)
     }
 
     /// Test-only fixture constructor. Production admissions are only minted
@@ -662,6 +781,7 @@ mod tests {
     async fn lifecycle_ticket_drop_cancellation_and_unwind_release_the_transition_fence() {
         let binding = AcpSessionBinding::default();
         binding.bind("session-1").await.unwrap();
+        let initial_epoch = binding.lifecycle_epoch();
 
         // Hold the read side so `begin_lifecycle` deterministically reaches
         // the writer barrier. Poll it once, then cancel by dropping the future.
@@ -675,16 +795,21 @@ mod tests {
                 () = async {} => {}
             }
             assert!(binding.transition_pending());
+            assert!(binding.lifecycle_change_pending());
+            assert_eq!(binding.lifecycle_epoch(), initial_epoch + 1);
         }
         assert!(!binding.transition_pending());
+        assert!(!binding.lifecycle_change_pending());
         assert_eq!(binding.bound_session_id().as_deref(), Some("session-1"));
         drop(admission);
 
         // A normal dropped owner releases both pending state and writer.
         let lifecycle = binding.begin_lifecycle().await.unwrap();
         assert!(binding.transition_pending());
+        assert!(binding.lifecycle_change_pending());
         drop(lifecycle);
         assert!(!binding.transition_pending());
+        assert!(!binding.lifecycle_change_pending());
 
         // Unwinding across an owned ticket has identical fail-closed cleanup.
         let lifecycle = binding.begin_lifecycle().await.unwrap();
@@ -693,11 +818,13 @@ mod tests {
             panic!("lifecycle unwind probe");
         }));
         assert!(!binding.transition_pending());
+        assert!(!binding.lifecycle_change_pending());
 
         // A fresh owner can still complete the exact positive bind afterward.
         let lifecycle = binding.begin_lifecycle().await.unwrap();
         lifecycle.bind_acknowledged("session-2").unwrap();
         assert!(!binding.transition_pending());
+        assert!(!binding.lifecycle_change_pending());
         assert_eq!(binding.bound_session_id().as_deref(), Some("session-2"));
     }
 
@@ -710,12 +837,16 @@ mod tests {
         // write_owned(). The waiter must not pass merely because no writer is
         // visible to the RwLock yet.
         binding.transition_pending.fetch_add(2, Ordering::AcqRel);
+        binding.lifecycle_change_pending.fetch_add(2, Ordering::AcqRel);
+        binding.lifecycle_epoch.fetch_add(2, Ordering::AcqRel);
         let first = AcpSessionBindingTransitionPending {
             pending: Arc::clone(&binding.transition_pending),
+            lifecycle_change_pending: Some(Arc::clone(&binding.lifecycle_change_pending)),
             terminal: Arc::clone(&binding.transition_terminal),
         };
         let second = AcpSessionBindingTransitionPending {
             pending: Arc::clone(&binding.transition_pending),
+            lifecycle_change_pending: Some(Arc::clone(&binding.lifecycle_change_pending)),
             terminal: Arc::clone(&binding.transition_terminal),
         };
 
@@ -733,6 +864,42 @@ mod tests {
         drop(second);
         waiter.await.unwrap();
         assert_eq!(binding.transition_pending.load(Ordering::Acquire), 0);
+        assert_eq!(binding.lifecycle_change_pending.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn same_session_bind_is_receipt_preserving_but_a_real_rebind_advances_lifecycle_epoch() {
+        let binding = Arc::new(AcpSessionBinding::default());
+        binding.bind("session-1").await.unwrap();
+        let generation = binding.lifecycle_generation().unwrap();
+        let initial_epoch = binding.lifecycle_epoch();
+        let admission = binding.try_acquire_admission().expect("held admission");
+
+        let same_session_binding = Arc::clone(&binding);
+        let same_session_bind =
+            tokio::spawn(async move { same_session_binding.bind_if_generation("session-1", generation).await });
+        while !binding.transition_pending() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!binding.lifecycle_change_pending());
+        assert_eq!(binding.lifecycle_epoch(), initial_epoch);
+        let snapshot = binding
+            .receipt_retry_snapshot("session-1")
+            .expect("same-session bind retry snapshot");
+        assert_eq!(snapshot.generation(), generation);
+        assert!(binding.receipt_retry_snapshot_is_current(&snapshot));
+
+        drop(admission);
+        assert_eq!(same_session_bind.await.unwrap().unwrap(), Some(false));
+
+        let real_rebind_generation = binding.lifecycle_generation().unwrap();
+        let real_rebind = binding
+            .bind_if_generation("session-2", real_rebind_generation)
+            .await
+            .unwrap();
+        assert_eq!(real_rebind, Some(true));
+        assert_eq!(binding.lifecycle_epoch(), initial_epoch + 1);
+        assert!(!binding.receipt_retry_snapshot_is_current(&snapshot));
     }
 
     #[tokio::test]

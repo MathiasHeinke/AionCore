@@ -8,6 +8,7 @@ use super::{
     AcpClientExtensionRouter, MAX_PROMPT_ADMISSION_PAYLOAD_BYTES, ResponseSender, respond_ignoring_transport,
     rpc_internal, validate_identifier,
 };
+use crate::async_completion::AcpSessionBindingReceiptRetrySnapshot;
 use crate::protocol::events::{AgentStreamEvent, CorrectionBoundaryEventData};
 
 pub(super) const EXT_METHOD: &str = "command_eve/correction_boundary";
@@ -78,19 +79,13 @@ pub(super) fn handle(router: &AcpClientExtensionRouter, raw_params: &str, respon
 
     let receipt_key = (request.session_id.clone(), request.request_id.clone());
 
-    // The read admission linearizes this event with cancel/close/rebind. When
-    // a lifecycle writer owns the interval first, the exact current-generation
-    // receipt remains retryable but cannot emit or commit until the writer is
-    // terminal; a changed/unbound generation is rejected below.
+    // The read admission linearizes this event with cancel/close/rebind. Only
+    // an existing same-generation receipt may survive a classified
+    // receipt-preserving bind fence; every lifecycle-changing publication is
+    // rejected before its writer is acquired.
     let Some(admission) = router.session_binding.try_acquire_admission() else {
-        // Admission can be unavailable before a lifecycle writer has changed
-        // the binding at all (including idempotent same-session prompt ACKs
-        // and mismatched close requests). Preserve the exact receipt as
-        // retryable while its recorded/current generation is still live. This
-        // path never emits the boundary event or grants admission; the caller
-        // must retry after the lifecycle owner reaches terminal state.
-        if let Some(generation) = router.session_binding.retry_generation_for_session(&request.session_id) {
-            retry_receipt_during_lifecycle(router, &receipt_key, generation, respond, &request.request_id);
+        if let Some(snapshot) = router.session_binding.receipt_retry_snapshot(&request.session_id) {
+            retry_existing_receipt_during_bind(router, &receipt_key, snapshot, respond, &request.request_id);
         } else {
             reject_receipt(
                 router,
@@ -220,10 +215,10 @@ fn reject_receipt(
     send_response(respond, request_id, false, Some(reason));
 }
 
-fn retry_receipt_during_lifecycle(
+fn retry_existing_receipt_during_bind(
     router: &AcpClientExtensionRouter,
     receipt_key: &(String, String),
-    generation: u64,
+    snapshot: AcpSessionBindingReceiptRetrySnapshot,
     respond: ResponseSender,
     request_id: &str,
 ) {
@@ -234,9 +229,11 @@ fn retry_receipt_during_lifecycle(
             return;
         }
     };
-    match state.correction_boundary_receipts.get(receipt_key).copied() {
+    let existing = state.correction_boundary_receipts.get(receipt_key).copied();
+    let snapshot_is_current = router.session_binding.receipt_retry_snapshot_is_current(&snapshot);
+    match existing {
         Some(ReceiptState::Accepted(existing_generation) | ReceiptState::Retryable(existing_generation))
-            if existing_generation == generation => {}
+            if existing_generation == snapshot.generation() && snapshot_is_current => {}
         Some(ReceiptState::Rejected(reason)) => {
             drop(state);
             send_response(respond, request_id, false, Some(reason));
@@ -252,14 +249,21 @@ fn retry_receipt_during_lifecycle(
             return;
         }
         None => {
+            // A fenced request may only preserve an existing idempotency
+            // receipt. It must never manufacture new Retryable authority from
+            // a state snapshot which can become stale before receipt locking.
             if state.correction_boundary_receipts.len() >= MAX_RECEIPTS {
                 drop(state);
                 respond_ignoring_transport(respond, Err(rpc_internal("receipt_capacity_exhausted")));
                 return;
             }
-            state
-                .correction_boundary_receipts
-                .insert(receipt_key.clone(), ReceiptState::Retryable(generation));
+            state.correction_boundary_receipts.insert(
+                receipt_key.clone(),
+                ReceiptState::Rejected(RejectionReason::LifecycleChanged),
+            );
+            drop(state);
+            send_response(respond, request_id, false, Some(RejectionReason::LifecycleChanged));
+            return;
         }
     }
     drop(state);
@@ -320,6 +324,36 @@ mod tests {
         });
         handle(router, raw, sender);
         rx
+    }
+
+    fn dispatch_retry_snapshot(
+        router: &AcpClientExtensionRouter,
+        receipt_key: &(String, String),
+        snapshot: AcpSessionBindingReceiptRetrySnapshot,
+        request_id: &str,
+    ) -> oneshot::Receiver<Result<serde_json::Value, agent_client_protocol::Error>> {
+        let (tx, rx) = oneshot::channel();
+        let sender: ResponseSender = Box::new(move |result| {
+            tx.send(result)
+                .map_err(|_| agent_client_protocol::Error::internal_error())
+        });
+        retry_existing_receipt_during_bind(router, receipt_key, snapshot, sender, request_id);
+        rx
+    }
+
+    async fn wait_for_transition_publication(router: &AcpClientExtensionRouter, lifecycle_changing: bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if router.session_binding.transition_pending()
+                    && (!lifecycle_changing || router.session_binding.lifecycle_change_pending())
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transition must publish before its queued writer");
     }
 
     fn accepted_response(value: serde_json::Value, request_id: &str) -> bool {
@@ -471,12 +505,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_receipt_stays_retryable_during_same_generation_bind_fence() {
+    async fn only_existing_same_generation_receipts_survive_receipt_preserving_bind_fence() {
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let router = Arc::new(AcpClientExtensionRouter::new(event_tx));
         router.bind_session("session-correction").await.unwrap();
         let generation = router.session_binding_generation().unwrap();
         let request = request("receipt-bind-fence", "session-correction");
+        let retryable_request = request("receipt-retryable-fence", "session-correction");
+        let new_request = request("receipt-new-fence", "session-correction");
 
         let committed = dispatch(router.as_ref(), &request.to_string()).await.unwrap().unwrap();
         assert!(accepted_response(committed, "receipt-bind-fence"));
@@ -484,6 +520,10 @@ mod tests {
             event_rx.recv().await.unwrap(),
             AgentStreamEvent::CorrectionBoundary(_)
         ));
+        router.state.lock().unwrap().correction_boundary_receipts.insert(
+            ("session-correction".to_owned(), "receipt-retryable-fence".to_owned()),
+            ReceiptState::Retryable(generation),
+        );
 
         // Hold an admission so the idempotent prompt-ACK bind publishes its
         // transition fence before it can acquire the writer. A replay in this
@@ -495,19 +535,32 @@ mod tests {
                 .bind_session_if_generation("session-correction", generation)
                 .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !router.session_binding.transition_pending() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("same-generation bind must publish its transition fence");
+        wait_for_transition_publication(router.as_ref(), false).await;
+        assert!(!router.session_binding.lifecycle_change_pending());
 
         let retry = dispatch(router.as_ref(), &request.to_string()).await.unwrap().unwrap();
         assert!(rejected_response(
             retry,
             "receipt-bind-fence",
             RejectionReason::RetryableSameGeneration,
+        ));
+        let retryable = dispatch(router.as_ref(), &retryable_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rejected_response(
+            retryable,
+            "receipt-retryable-fence",
+            RejectionReason::RetryableSameGeneration,
+        ));
+        let new = dispatch(router.as_ref(), &new_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rejected_response(
+            new,
+            "receipt-new-fence",
+            RejectionReason::LifecycleChanged,
         ));
         assert_eq!(
             router
@@ -519,12 +572,204 @@ mod tests {
                 .copied(),
             Some(ReceiptState::Accepted(generation)),
         );
+        assert_eq!(
+            router
+                .state
+                .lock()
+                .unwrap()
+                .correction_boundary_receipts
+                .get(&("session-correction".to_owned(), "receipt-retryable-fence".to_owned(),))
+                .copied(),
+            Some(ReceiptState::Retryable(generation)),
+        );
+        assert_eq!(
+            router
+                .state
+                .lock()
+                .unwrap()
+                .correction_boundary_receipts
+                .get(&("session-correction".to_owned(), "receipt-new-fence".to_owned()))
+                .copied(),
+            Some(ReceiptState::Rejected(RejectionReason::LifecycleChanged)),
+        );
         assert!(event_rx.try_recv().is_err());
 
         drop(held_admission);
         assert!(bind.await.unwrap().unwrap());
         let replayed = dispatch(router.as_ref(), &request.to_string()).await.unwrap().unwrap();
         assert!(accepted_response(replayed, "receipt-bind-fence"));
+        let retryable_replayed = dispatch(router.as_ref(), &retryable_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(accepted_response(retryable_replayed, "receipt-retryable-fence"));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            AgentStreamEvent::CorrectionBoundary(_)
+        ));
+        let new_replayed = dispatch(router.as_ref(), &new_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rejected_response(
+            new_replayed,
+            "receipt-new-fence",
+            RejectionReason::LifecycleChanged,
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    async fn assert_lifecycle_publication_rejects_existing_receipt(operation: &str) {
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let router = Arc::new(AcpClientExtensionRouter::new(event_tx));
+        router.bind_session("session-correction").await.unwrap();
+        let request_id = format!("receipt-{operation}");
+        let request = request(&request_id, "session-correction");
+        let committed = dispatch(router.as_ref(), &request.to_string()).await.unwrap().unwrap();
+        assert!(accepted_response(committed, &request_id));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            AgentStreamEvent::CorrectionBoundary(_)
+        ));
+
+        let held_admission = router.session_binding.try_acquire_admission().unwrap();
+        let lifecycle_router = Arc::clone(&router);
+        let lifecycle = match operation {
+            "new" | "load" | "resume" => tokio::spawn(async move {
+                let lifecycle = lifecycle_router.begin_session_binding().await.unwrap();
+                drop(lifecycle);
+            }),
+            "close" => tokio::spawn(async move {
+                let lifecycle = lifecycle_router
+                    .begin_session_close("session-correction")
+                    .await
+                    .unwrap();
+                drop(lifecycle);
+            }),
+            "cancel" => tokio::spawn(async move {
+                lifecycle_router.begin_session_cancel().await.unwrap();
+            }),
+            other => panic!("unsupported lifecycle operation: {other}"),
+        };
+        wait_for_transition_publication(router.as_ref(), true).await;
+
+        let rejected = dispatch(router.as_ref(), &request.to_string()).await.unwrap().unwrap();
+        assert!(rejected_response(
+            rejected,
+            &request_id,
+            RejectionReason::LifecycleChanged,
+        ));
+        assert!(event_rx.try_recv().is_err());
+
+        drop(held_admission);
+        lifecycle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_publication_rejects_before_new_load_resume_close_and_cancel_writers() {
+        for operation in ["new", "load", "resume", "close", "cancel"] {
+            assert_lifecycle_publication_rejects_existing_receipt(operation).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_epoch_revalidation_closes_the_receipt_lock_toctou_window() {
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let router = Arc::new(AcpClientExtensionRouter::new(event_tx));
+        router.bind_session("session-correction").await.unwrap();
+        let generation = router.session_binding_generation().unwrap();
+        let receipt_key = ("session-correction".to_owned(), "receipt-toctou".to_owned());
+        let request = request(&receipt_key.1, &receipt_key.0);
+        assert!(accepted_response(
+            dispatch(router.as_ref(), &request.to_string()).await.unwrap().unwrap(),
+            &receipt_key.1,
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            AgentStreamEvent::CorrectionBoundary(_)
+        ));
+
+        let held_admission = router.session_binding.try_acquire_admission().unwrap();
+        let bind_router = Arc::clone(&router);
+        let bind = tokio::spawn(async move {
+            bind_router
+                .bind_session_if_generation("session-correction", generation)
+                .await
+        });
+        wait_for_transition_publication(router.as_ref(), false).await;
+        let snapshot = router
+            .session_binding
+            .receipt_retry_snapshot("session-correction")
+            .expect("receipt-preserving snapshot");
+
+        let lifecycle_router = Arc::clone(&router);
+        let lifecycle = tokio::spawn(async move {
+            let lifecycle = lifecycle_router.begin_session_binding().await.unwrap();
+            drop(lifecycle);
+        });
+        wait_for_transition_publication(router.as_ref(), true).await;
+
+        let rejected = dispatch_retry_snapshot(router.as_ref(), &receipt_key, snapshot, &receipt_key.1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rejected_response(
+            rejected,
+            &receipt_key.1,
+            RejectionReason::LifecycleChanged,
+        ));
+        assert!(event_rx.try_recv().is_err());
+
+        drop(held_admission);
+        let _ = bind.await.unwrap().unwrap();
+        lifecycle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn higher_generation_rejects_a_stale_receipt_retry_snapshot() {
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let router = Arc::new(AcpClientExtensionRouter::new(event_tx));
+        router.bind_session("session-correction").await.unwrap();
+        let generation = router.session_binding_generation().unwrap();
+        let receipt_key = ("session-correction".to_owned(), "receipt-stale-generation".to_owned());
+        let request = request(&receipt_key.1, &receipt_key.0);
+        assert!(accepted_response(
+            dispatch(router.as_ref(), &request.to_string()).await.unwrap().unwrap(),
+            &receipt_key.1,
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            AgentStreamEvent::CorrectionBoundary(_)
+        ));
+
+        let held_admission = router.session_binding.try_acquire_admission().unwrap();
+        let bind_router = Arc::clone(&router);
+        let bind = tokio::spawn(async move {
+            bind_router
+                .bind_session_if_generation("session-correction", generation)
+                .await
+        });
+        wait_for_transition_publication(router.as_ref(), false).await;
+        let snapshot = router
+            .session_binding
+            .receipt_retry_snapshot("session-correction")
+            .expect("receipt-preserving snapshot");
+        drop(held_admission);
+        assert!(bind.await.unwrap().unwrap());
+
+        let lifecycle = router.begin_session_binding().await.unwrap();
+        router.finish_session_binding(lifecycle, "session-correction").unwrap();
+        assert_ne!(router.session_binding_generation().unwrap(), generation);
+
+        let rejected = dispatch_retry_snapshot(router.as_ref(), &receipt_key, snapshot, &receipt_key.1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rejected_response(
+            rejected,
+            &receipt_key.1,
+            RejectionReason::LifecycleChanged,
+        ));
         assert!(event_rx.try_recv().is_err());
     }
 
