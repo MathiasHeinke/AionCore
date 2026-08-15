@@ -510,11 +510,14 @@ mod tests {
         let router = Arc::new(AcpClientExtensionRouter::new(event_tx));
         router.bind_session("session-correction").await.unwrap();
         let generation = router.session_binding_generation().unwrap();
-        let request = request("receipt-bind-fence", "session-correction");
+        let accepted_request = request("receipt-bind-fence", "session-correction");
         let retryable_request = request("receipt-retryable-fence", "session-correction");
         let new_request = request("receipt-new-fence", "session-correction");
 
-        let committed = dispatch(router.as_ref(), &request.to_string()).await.unwrap().unwrap();
+        let committed = dispatch(router.as_ref(), &accepted_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(accepted_response(committed, "receipt-bind-fence"));
         assert!(matches!(
             event_rx.recv().await.unwrap(),
@@ -538,7 +541,10 @@ mod tests {
         wait_for_transition_publication(router.as_ref(), false).await;
         assert!(!router.session_binding.lifecycle_change_pending());
 
-        let retry = dispatch(router.as_ref(), &request.to_string()).await.unwrap().unwrap();
+        let retry = dispatch(router.as_ref(), &accepted_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(rejected_response(
             retry,
             "receipt-bind-fence",
@@ -596,7 +602,10 @@ mod tests {
 
         drop(held_admission);
         assert!(bind.await.unwrap().unwrap());
-        let replayed = dispatch(router.as_ref(), &request.to_string()).await.unwrap().unwrap();
+        let replayed = dispatch(router.as_ref(), &accepted_request.to_string())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(accepted_response(replayed, "receipt-bind-fence"));
         let retryable_replayed = dispatch(router.as_ref(), &retryable_request.to_string())
             .await
