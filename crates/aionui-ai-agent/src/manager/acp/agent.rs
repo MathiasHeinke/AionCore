@@ -7,7 +7,7 @@ use crate::capability::skill_manager::AcpSkillManager;
 use crate::error::AgentError;
 use crate::factory::acp_assembler::AcpSessionParams;
 use crate::manager::acp::{AcpSession, AcpSessionEvent, PermissionRouter, SessionNewPreludeHook};
-use crate::manager::process_registry::{register_session_process, unregister_agent_process};
+use crate::manager::process_registry::{RegisteredProcessLease, register_session_process};
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::{AcpError, CloseReason};
 use crate::protocol::events::AgentStreamEvent;
@@ -37,6 +37,29 @@ use tracing::{debug, error, info, warn};
 
 use super::agent_session_flow::PromptOutcome;
 use super::error_mapping::AcpSendFailure;
+
+async fn retire_failed_startup(
+    registration: &RegisteredProcessLease,
+    process: &CliAgentProcess,
+    conversation_id: &str,
+    original: AgentError,
+) -> AgentError {
+    match registration.retire_startup_failure(process).await {
+        Ok(()) => original,
+        Err(cleanup_error) => {
+            error!(
+                conversation_id,
+                pid = process.pid(),
+                process_group_id = ?process.process_group_id(),
+                error = %ErrorChain(&cleanup_error),
+                "ACP startup failed and process-tree retirement remains unproven; durable registry evidence retained"
+            );
+            AgentError::internal(format!(
+                "ACP startup failed and process-tree retirement remains unproven: {cleanup_error}"
+            ))
+        }
+    }
+}
 
 /// The user-visible body inside an [`AgentError`].
 ///
@@ -528,7 +551,7 @@ impl AcpAgentManager {
         codex_sandbox::sync_for_agent(&params.metadata, initial_mode.as_ref().map(|m| m.as_str())).await;
 
         let process = Arc::new(CliAgentProcess::spawn_for_sdk(params.command_spec.clone(), &params.data_dir).await?);
-        register_session_process(
+        let process_registration = register_session_process(
             &params.data_dir,
             Arc::clone(&process),
             params.conversation_id.clone(),
@@ -539,12 +562,18 @@ impl AcpAgentManager {
                 params.command_spec.command.display(),
                 params.command_spec.args.join(" ")
             )),
-        )?;
-        let (stdin, stdout) = process.take_stdio().await.ok_or_else(|| {
-            error!(conversation_id = %params.conversation_id, "Failed to take stdio from CLI process");
-            let _ = unregister_agent_process(&params.data_dir, process.pid());
-            AgentError::internal("Failed to take stdio from CLI process")
-        })?;
+        )
+        .await?;
+        let (stdin, stdout) = match process.take_stdio().await {
+            Some(stdio) => stdio,
+            None => {
+                error!(conversation_id = %params.conversation_id, "Failed to take stdio from CLI process");
+                let failure = AgentError::internal("Failed to take stdio from CLI process");
+                return Err(
+                    retire_failed_startup(&process_registration, &process, &params.conversation_id, failure).await,
+                );
+            }
+        };
 
         // Dedicated channel for raw SDK SessionNotifications → session tracker.
         // This channel is separate from event_tx so the tracker never re-applies
@@ -590,24 +619,61 @@ impl AcpAgentManager {
                     stderr = %stderr,
                     "Agent process exited before ACP handshake completed"
                 );
-                let _ = unregister_agent_process(&params.data_dir, process.pid());
-                return Err(AgentError::from(AcpError::StartupCrash { exit_code, signal, stderr }));
-            }
-            res = &mut connect_fut => res.map_err(|e| {
-                error!(
-                    conversation_id = %params.conversation_id,
-                    error = %ErrorChain(&e),
-                    "Failed to establish ACP protocol connection"
+                let failure = AgentError::from(AcpError::StartupCrash { exit_code, signal, stderr });
+                return Err(
+                    retire_failed_startup(&process_registration, &process, &params.conversation_id, failure).await,
                 );
-                let _ = unregister_agent_process(&params.data_dir, process.pid());
-                AgentError::from(e)
-            })?,
+            }
+            res = &mut connect_fut => match res {
+                Ok(protocol) => protocol,
+                Err(error) => {
+                    error!(
+                        conversation_id = %params.conversation_id,
+                        error = %ErrorChain(&error),
+                        "Failed to establish ACP protocol connection"
+                    );
+                    let failure = AgentError::from(error);
+                    return Err(
+                        retire_failed_startup(
+                            &process_registration,
+                            &process,
+                            &params.conversation_id,
+                            failure,
+                        )
+                        .await,
+                    );
+                }
+            },
         };
         if params.metadata.backend.as_deref() == Some("hermes") {
-            protocol.enable_read_preview().map_err(AgentError::from)?;
-            protocol.enable_read_terminal().map_err(AgentError::from)?;
+            if let Err(error) = protocol.enable_read_preview() {
+                return Err(retire_failed_startup(
+                    &process_registration,
+                    &process,
+                    &params.conversation_id,
+                    AgentError::from(error),
+                )
+                .await);
+            }
+            if let Err(error) = protocol.enable_read_terminal() {
+                return Err(retire_failed_startup(
+                    &process_registration,
+                    &process,
+                    &params.conversation_id,
+                    AgentError::from(error),
+                )
+                .await);
+            }
             if has_async_completion {
-                protocol.enable_async_completion().map_err(AgentError::from)?;
+                if let Err(error) = protocol.enable_async_completion() {
+                    return Err(retire_failed_startup(
+                        &process_registration,
+                        &process,
+                        &params.conversation_id,
+                        AgentError::from(error),
+                    )
+                    .await);
+                }
             }
         }
         let permission_router = Arc::new(PermissionRouter::new(permission_rx));

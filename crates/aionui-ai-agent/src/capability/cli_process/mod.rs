@@ -161,6 +161,60 @@ impl CliAgentProcess {
         }
     }
 
+    /// Terminate the exact tracked process tree and prove that neither its
+    /// leader nor its detached process group remains observable before the
+    /// caller discards durable registry evidence.
+    pub(crate) async fn terminate_tree_and_prove_absence(
+        &self,
+        grace_period: Duration,
+        proof_timeout: Duration,
+    ) -> Result<(), AgentError> {
+        let termination = self.kill(grace_period).await;
+        let absence = self.prove_tree_absent(proof_timeout).await;
+
+        match (termination, absence) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(termination_error), Ok(())) => Err(AgentError::internal(format!(
+                "Process {} tree is absent but termination reported an error: {termination_error}",
+                self.pid
+            ))),
+            (_, Err(absence_error)) => Err(absence_error),
+        }
+    }
+
+    /// Observation-only proof used after the direct child exit monitor fires.
+    /// It never sends TERM/KILL and treats permission or any other uncertainty
+    /// as live until the bounded deadline expires.
+    pub(crate) async fn prove_tree_absent(&self, timeout: Duration) -> Result<(), AgentError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if !self.process_tree_is_observed_alive() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AgentError::internal(format!(
+                    "Process {} tree termination remains unproven",
+                    self.pid
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn process_tree_is_observed_alive(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.process_group_id
+                .filter(|group_id| *group_id > 1)
+                .is_some_and(|group_id| signal_zero(-(group_id as i32)))
+                || signal_zero(self.pid as i32)
+        }
+        #[cfg(not(unix))]
+        {
+            self.exit_rx.borrow().is_none()
+        }
+    }
+
     /// Check whether the subprocess is still running.
     #[allow(dead_code)] // Complete CliProcess lifecycle API
     pub fn is_running(&self) -> bool {
@@ -251,6 +305,15 @@ pub(super) fn tracked_process_group_id(pid: u32) -> Option<u32> {
 #[cfg(not(unix))]
 pub(super) fn tracked_process_group_id(_pid: u32) -> Option<u32> {
     None
+}
+
+#[cfg(unix)]
+fn signal_zero(target: i32) -> bool {
+    let result = unsafe { libc::kill(target, 0) };
+    if result == 0 {
+        return true;
+    }
+    !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
 }
 
 #[cfg(test)]

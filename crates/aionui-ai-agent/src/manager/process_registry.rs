@@ -16,8 +16,12 @@ use crate::capability::cli_process::CliAgentProcess;
 use crate::error::AgentError;
 
 pub(crate) const AGENT_PROCESS_REGISTRY_RELATIVE_PATH: &str = "runtime/agent-process-registry.json";
+pub(crate) const AGENT_PROCESS_REGISTRY_EMERGENCY_RELATIVE_DIR: &str = "runtime/agent-process-registry-emergency";
 
 const PROCESS_REGISTRY_VERSION: u32 = 2;
+const PROCESS_TREE_TERMINATION_GRACE: Duration = Duration::from_millis(100);
+const PROCESS_TREE_PROOF_TIMEOUT: Duration = Duration::from_secs(5);
+const BACKGROUND_PROCESS_TREE_PROOF_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +63,47 @@ struct ProcessRegistry {
     processes: Vec<RegisteredAgentProcess>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmergencyProcessEvidence {
+    version: u32,
+    reason: String,
+    process: RegisteredAgentProcess,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RegisteredProcessLease {
+    data_dir: PathBuf,
+    pid: u32,
+    registered_at_ms: u64,
+    process_identity: Option<ProcessIdentity>,
+}
+
+impl RegisteredProcessLease {
+    pub(crate) async fn retire_startup_failure(&self, process: &CliAgentProcess) -> Result<(), AgentError> {
+        process
+            .terminate_tree_and_prove_absence(PROCESS_TREE_TERMINATION_GRACE, PROCESS_TREE_PROOF_TIMEOUT)
+            .await?;
+        self.unregister_after_absence_proof(Ok(()))
+    }
+
+    fn unregister_after_absence_proof(&self, proof: Result<(), AgentError>) -> Result<(), AgentError> {
+        proof?;
+        unregister_agent_process_if_matching(
+            &self.data_dir,
+            self.pid,
+            self.registered_at_ms,
+            self.process_identity.as_ref(),
+        )
+        .map_err(|error| {
+            AgentError::internal(format!(
+                "Failed to retire proven-terminal process {} from runtime registry: {error}",
+                self.pid
+            ))
+        })
+    }
+}
+
 impl Default for ProcessRegistry {
     fn default() -> Self {
         Self {
@@ -74,14 +119,22 @@ pub(crate) fn agent_process_registry_path(data_dir: &Path) -> PathBuf {
     data_dir.join(AGENT_PROCESS_REGISTRY_RELATIVE_PATH)
 }
 
-pub(crate) fn register_session_process(
+pub(crate) fn agent_process_registry_emergency_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(AGENT_PROCESS_REGISTRY_EMERGENCY_RELATIVE_DIR)
+}
+
+fn platform_requires_proven_process_identity(platform: &str) -> bool {
+    platform == "windows"
+}
+
+pub(crate) async fn register_session_process(
     data_dir: &Path,
     process: Arc<CliAgentProcess>,
     conversation_id: impl Into<String>,
     agent_type: AgentType,
     backend: Option<String>,
     command_preview: Option<String>,
-) -> Result<(), AgentError> {
+) -> Result<RegisteredProcessLease, AgentError> {
     let pid = process.pid();
     let process_group_id = process.process_group_id();
     let process_identity = capture_process_identity_or_unproven(pid, process_group_id, capture_process_identity);
@@ -97,27 +150,53 @@ pub(crate) fn register_session_process(
         process_identity: process_identity.clone(),
     };
 
-    finish_process_registration(pid, register_agent_process(data_dir, entry), || {
-        process.force_kill_tree();
-    })?;
+    let lease = RegisteredProcessLease {
+        data_dir: data_dir.to_path_buf(),
+        pid,
+        registered_at_ms,
+        process_identity: process_identity.clone(),
+    };
 
-    let data_dir = data_dir.to_path_buf();
+    if process_identity.is_none() && platform_requires_proven_process_identity(std::env::consts::OS) {
+        let cleanup = process
+            .terminate_tree_and_prove_absence(PROCESS_TREE_TERMINATION_GRACE, PROCESS_TREE_PROOF_TIMEOUT)
+            .await;
+        return finish_process_registration(
+            data_dir,
+            &entry,
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "platform process identity is unavailable",
+            )),
+            cleanup,
+        )
+        .map(|()| lease);
+    }
+
+    let registration = register_agent_process(data_dir, entry.clone());
+    if registration.is_err() {
+        let cleanup = process
+            .terminate_tree_and_prove_absence(PROCESS_TREE_TERMINATION_GRACE, PROCESS_TREE_PROOF_TIMEOUT)
+            .await;
+        finish_process_registration(data_dir, &entry, registration, cleanup)?;
+    }
+
+    let background_lease = lease.clone();
     tokio::spawn(async move {
         let _ = process.wait_for_exit().await;
-        wait_for_process_tree_exit(pid, process_group_id).await;
-        if let Err(e) =
-            unregister_agent_process_if_matching(&data_dir, pid, registered_at_ms, process_identity.as_ref())
-        {
+        let proof = process.prove_tree_absent(BACKGROUND_PROCESS_TREE_PROOF_TIMEOUT).await;
+        if let Err(e) = background_lease.unregister_after_absence_proof(proof) {
             warn!(
                 pid,
-                path = %agent_process_registry_path(&data_dir).display(),
+                process_group_id = ?process_group_id,
+                path = %agent_process_registry_path(&background_lease.data_dir).display(),
                 error = %ErrorChain(&e),
-                "Failed to unregister exited agent process from runtime registry"
+                "Agent process tree absence or registry retirement remains unproven; retaining durable evidence"
             );
         }
     });
 
-    Ok(())
+    Ok(lease)
 }
 
 fn register_agent_process(data_dir: &Path, entry: RegisteredAgentProcess) -> io::Result<()> {
@@ -132,37 +211,46 @@ fn register_agent_process(data_dir: &Path, entry: RegisteredAgentProcess) -> io:
 }
 
 fn finish_process_registration(
-    pid: u32,
+    data_dir: &Path,
+    entry: &RegisteredAgentProcess,
     registration: io::Result<()>,
-    cleanup_spawned_tree: impl FnOnce(),
+    cleanup: Result<(), AgentError>,
 ) -> Result<(), AgentError> {
     match registration {
         Ok(()) => Ok(()),
         Err(registration_error) => {
             error!(
-                pid,
+                pid = entry.pid,
+                process_group_id = ?entry.process_group_id,
                 error = %ErrorChain(&registration_error),
                 "Failed to persist agent process registry entry; terminating spawned process tree"
             );
-            cleanup_spawned_tree();
+            if let Err(cleanup_error) = cleanup {
+                let emergency = preserve_emergency_process_evidence(data_dir, entry);
+                error!(
+                    pid = entry.pid,
+                    process_group_id = ?entry.process_group_id,
+                    cleanup_error = %ErrorChain(&cleanup_error),
+                    emergency_evidence = ?emergency.as_ref().ok(),
+                    emergency_error = ?emergency.as_ref().err(),
+                    "Spawned process tree cleanup is unproven; retaining emergency evidence"
+                );
+                return Err(AgentError::internal(format!(
+                    "Failed to register agent process {} and process-tree cleanup is unproven{}",
+                    entry.pid,
+                    if emergency.is_ok() {
+                        "; emergency evidence retained"
+                    } else {
+                        "; emergency evidence persistence also failed"
+                    }
+                )));
+            }
             Err(AgentError::internal(format!(
-                "Failed to register agent process {pid} in runtime registry: {registration_error}"
+                "Failed to register agent process {} in runtime registry: {registration_error}",
+                entry.pid
             )))
         }
     }
-}
-
-pub(crate) fn unregister_agent_process(data_dir: &Path, pid: u32) -> io::Result<()> {
-    with_registry_lock(|| {
-        let path = agent_process_registry_path(data_dir);
-        let mut registry = read_registry_file(&path)?;
-        let original_len = registry.processes.len();
-        registry.processes.retain(|existing| existing.pid != pid);
-        if registry.processes.len() == original_len {
-            return Ok(());
-        }
-        write_registry_file(&path, &registry)
-    })
 }
 
 fn unregister_agent_process_if_matching(
@@ -214,17 +302,42 @@ fn read_registry_file(path: &Path) -> io::Result<ProcessRegistry> {
 }
 
 fn write_registry_file(path: &Path, registry: &ProcessRegistry) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let tmp_path = path.with_extension(format!("tmp-{}-{}", std::process::id(), now_ms()));
     let payload = serde_json::to_vec_pretty(registry).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Failed to serialize process registry {}: {e}", path.display()),
         )
     })?;
+    write_payload_atomic(path, &payload)
+}
+
+fn preserve_emergency_process_evidence(data_dir: &Path, process: &RegisteredAgentProcess) -> io::Result<PathBuf> {
+    let directory = agent_process_registry_emergency_dir(data_dir);
+    let path = directory.join(format!(
+        "agent-process-{}-{}.json",
+        process.registered_at_ms, process.pid
+    ));
+    let payload = serde_json::to_vec_pretty(&EmergencyProcessEvidence {
+        version: 1,
+        reason: "registry_write_failed_cleanup_unproven".to_owned(),
+        process: process.clone(),
+    })
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to serialize emergency process evidence: {error}"),
+        )
+    })?;
+    write_payload_atomic(&path, &payload)?;
+    Ok(path)
+}
+
+fn write_payload_atomic(path: &Path, payload: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = path.with_extension(format!("tmp-{}-{}", std::process::id(), now_ms()));
 
     let result = (|| {
         let mut options = OpenOptions::new();
@@ -235,7 +348,7 @@ fn write_registry_file(path: &Path, registry: &ProcessRegistry) -> io::Result<()
             options.mode(0o600);
         }
         let mut tmp_file = options.open(&tmp_path)?;
-        tmp_file.write_all(&payload)?;
+        tmp_file.write_all(payload)?;
         tmp_file.sync_all()?;
         drop(tmp_file);
 
@@ -502,57 +615,9 @@ fn capture_process_identity(
     _expected_process_group_id: Option<u32>,
     _expected_parent_pid: u32,
 ) -> io::Result<Option<ProcessIdentity>> {
-    // The current packaged release target is macOS. Other platforms retain a
-    // v2 entry with a null identity so a consumer can fail closed instead of
-    // signaling a numeric pid without a platform-authenticated birth record.
+    // `register_session_process` rejects and proves cleanup for this
+    // unsupported producer before any v2 registry entry is published.
     Ok(None)
-}
-
-async fn wait_for_process_tree_exit(pid: u32, process_group_id: Option<u32>) {
-    while is_registered_process_tree_alive(pid, process_group_id) {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-fn is_registered_process_tree_alive(pid: u32, process_group_id: Option<u32>) -> bool {
-    process_group_id
-        .filter(|group_id| *group_id > 1)
-        .is_some_and(is_unix_process_group_alive)
-        || is_unix_process_alive(pid)
-}
-
-#[cfg(unix)]
-fn is_unix_process_group_alive(process_group_id: u32) -> bool {
-    signal_zero(-(process_group_id as i32))
-}
-
-#[cfg(not(unix))]
-fn is_unix_process_group_alive(_process_group_id: u32) -> bool {
-    false
-}
-
-#[cfg(unix)]
-fn is_unix_process_alive(pid: u32) -> bool {
-    signal_zero(pid as i32)
-}
-
-#[cfg(not(unix))]
-fn is_unix_process_alive(_pid: u32) -> bool {
-    false
-}
-
-#[cfg(unix)]
-fn signal_zero(target: i32) -> bool {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-
-    let result = unsafe { kill(target, 0) };
-    if result == 0 {
-        return true;
-    }
-
-    !matches!(io::Error::last_os_error().raw_os_error(), Some(3))
 }
 
 fn now_ms() -> u64 {
@@ -567,6 +632,12 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn is_pid_alive(pid: u32) -> bool {
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        result == 0 || !matches!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
+    }
 
     fn sample_identity() -> ProcessIdentity {
         ProcessIdentity {
@@ -601,14 +672,6 @@ mod tests {
     }
 
     #[test]
-    fn unregister_is_idempotent_for_missing_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        unregister_agent_process(dir.path(), 42).unwrap();
-        let registry = read_registry_file(&agent_process_registry_path(dir.path())).unwrap();
-        assert!(registry.processes.is_empty());
-    }
-
-    #[test]
     fn register_then_unregister_updates_registry_file() {
         let dir = tempfile::tempdir().unwrap();
         let entry = sample_entry(42);
@@ -617,11 +680,39 @@ mod tests {
         let path = agent_process_registry_path(dir.path());
         let registry = read_registry_file(&path).unwrap();
         assert_eq!(registry.version, PROCESS_REGISTRY_VERSION);
-        assert_eq!(registry.processes, vec![entry]);
+        assert_eq!(registry.processes, vec![entry.clone()]);
 
-        unregister_agent_process(dir.path(), 42).unwrap();
+        RegisteredProcessLease {
+            data_dir: dir.path().to_path_buf(),
+            pid: entry.pid,
+            registered_at_ms: entry.registered_at_ms,
+            process_identity: entry.process_identity.clone(),
+        }
+        .unregister_after_absence_proof(Ok(()))
+        .unwrap();
         let registry = read_registry_file(&path).unwrap();
         assert!(registry.processes.is_empty());
+    }
+
+    #[test]
+    fn unproven_tree_absence_retains_exact_registry_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = sample_entry(42);
+        register_agent_process(dir.path(), entry.clone()).unwrap();
+        let lease = RegisteredProcessLease {
+            data_dir: dir.path().to_path_buf(),
+            pid: entry.pid,
+            registered_at_ms: entry.registered_at_ms,
+            process_identity: entry.process_identity.clone(),
+        };
+
+        assert!(
+            lease
+                .unregister_after_absence_proof(Err(AgentError::internal("fixture keeps descendant alive")))
+                .is_err()
+        );
+        let registry = read_registry_file(&agent_process_registry_path(dir.path())).unwrap();
+        assert_eq!(registry.processes, vec![entry]);
     }
 
     #[test]
@@ -732,24 +823,180 @@ mod tests {
 
     #[test]
     fn failed_registry_write_cleans_up_the_spawned_process_tree() {
-        let cleanup_called = std::cell::Cell::new(false);
+        let dir = tempfile::tempdir().unwrap();
+        let entry = sample_entry(42);
         let result = finish_process_registration(
-            42,
+            dir.path(),
+            &entry,
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "fixture denies registry write",
             )),
-            || cleanup_called.set(true),
+            Ok(()),
         );
 
         assert!(result.is_err());
-        assert!(cleanup_called.get());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
                 .contains("fixture denies registry write")
         );
+        assert!(!agent_process_registry_emergency_dir(dir.path()).exists());
+    }
+
+    #[test]
+    fn failed_registry_write_with_unproven_cleanup_persists_emergency_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = sample_entry(42);
+        let result = finish_process_registration(
+            dir.path(),
+            &entry,
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture denies registry write",
+            )),
+            Err(AgentError::internal("fixture process group remains observable")),
+        );
+
+        assert!(result.unwrap_err().to_string().contains("emergency evidence retained"));
+        let emergency_dir = agent_process_registry_emergency_dir(dir.path());
+        let files = fs::read_dir(&emergency_dir)
+            .unwrap()
+            .map(|item| item.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        let evidence: EmergencyProcessEvidence = serde_json::from_slice(&fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(evidence.version, 1);
+        assert_eq!(evidence.reason, "registry_write_failed_cleanup_unproven");
+        assert_eq!(evidence.process, entry);
+    }
+
+    #[test]
+    fn windows_requires_proven_identity_before_registry_publication() {
+        assert!(platform_requires_proven_process_identity("windows"));
+        assert!(!platform_requires_proven_process_identity("macos"));
+        assert!(!platform_requires_proven_process_identity("linux"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_retirement_keeps_evidence_until_leader_and_descendant_group_are_absent() {
+        use aionui_common::CommandSpec;
+        use tokio::time::timeout;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_string_lossy().into_owned();
+        let process = Arc::new(
+            CliAgentProcess::spawn_for_sdk(
+                CommandSpec {
+                    command: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "sleep 60 & child=$!; printf '%s' \"$child\" > \"$1\"; exit 0".into(),
+                        "registry-startup-retirement".into(),
+                        marker_path,
+                    ],
+                    env: vec![],
+                    cwd: None,
+                },
+                data_dir.path(),
+            )
+            .await
+            .unwrap(),
+        );
+        let lease = register_session_process(
+            data_dir.path(),
+            Arc::clone(&process),
+            "conv-startup-retirement",
+            AgentType::Acp,
+            Some("fixture".into()),
+            Some("fixture launcher".into()),
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(5), process.wait_for_exit())
+            .await
+            .expect("leader should exit");
+        let child_pid = fs::read_to_string(marker.path())
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(is_pid_alive(child_pid));
+        assert_eq!(
+            read_registry_file(&agent_process_registry_path(data_dir.path()))
+                .unwrap()
+                .processes
+                .len(),
+            1
+        );
+
+        lease.retire_startup_failure(&process).await.unwrap();
+
+        assert!(!is_pid_alive(child_pid));
+        assert!(
+            read_registry_file(&agent_process_registry_path(data_dir.path()))
+                .unwrap()
+                .processes
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_write_failure_proves_spawned_group_absent_before_returning() {
+        use aionui_common::CommandSpec;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry_path = agent_process_registry_path(data_dir.path());
+        fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        fs::write(&registry_path, b"not-json").unwrap();
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_string_lossy().into_owned();
+        let process = Arc::new(
+            CliAgentProcess::spawn_for_sdk(
+                CommandSpec {
+                    command: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "sleep 60 & child=$!; printf '%s' \"$child\" > \"$1\"; wait".into(),
+                        "registry-write-failure".into(),
+                        marker_path,
+                    ],
+                    env: vec![],
+                    cwd: None,
+                },
+                data_dir.path(),
+            )
+            .await
+            .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fs::read_to_string(marker.path()).unwrap().trim().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let child_pid = fs::read_to_string(marker.path())
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+
+        let error = register_session_process(
+            data_dir.path(),
+            Arc::clone(&process),
+            "conv-registry-failure",
+            AgentType::Acp,
+            Some("fixture".into()),
+            Some("fixture launcher".into()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Failed to register agent process"));
+        assert!(!is_pid_alive(child_pid));
+        assert!(!agent_process_registry_emergency_dir(data_dir.path()).exists());
     }
 
     #[cfg(target_os = "macos")]
