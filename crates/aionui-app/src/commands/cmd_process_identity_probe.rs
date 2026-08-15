@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 const SENTINEL: &str = "COMMAND_EVE_WINDOWS_PROCESS_IDENTITY_V1";
 const MAX_REQUEST_BYTES: u64 = 65_537;
 const MAX_BATCH: usize = 512;
+const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,8 +23,10 @@ struct ProbeResponse {
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum ProbeResult {
+    #[cfg(target_os = "windows")]
     Absent,
     Unknown,
+    #[cfg(target_os = "windows")]
     Observed {
         pid: u32,
         start_time_value: String,
@@ -61,6 +64,9 @@ pub(crate) fn run_process_identity_probe() -> ExitCode {
     let Ok(payload) = serde_json::to_vec(&response) else {
         return ExitCode::from(1);
     };
+    if payload.len() > MAX_RESPONSE_BYTES {
+        return ExitCode::from(1);
+    }
     if io::stdout().write_all(&payload).is_err() {
         return ExitCode::from(1);
     }
@@ -141,16 +147,24 @@ mod tests {
 
     #[test]
     fn response_schema_is_closed_and_content_free() {
+        #[cfg(target_os = "windows")]
+        let results = vec![ProbeResult::Unknown, ProbeResult::Absent];
+        #[cfg(not(target_os = "windows"))]
+        let results = vec![ProbeResult::Unknown];
         let payload = serde_json::to_value(ProbeResponse {
             sentinel: SENTINEL,
-            results: vec![ProbeResult::Unknown, ProbeResult::Absent],
+            results,
         })
         .unwrap();
+        #[cfg(target_os = "windows")]
+        let expected_results = serde_json::json!([{"state": "unknown"}, {"state": "absent"}]);
+        #[cfg(not(target_os = "windows"))]
+        let expected_results = serde_json::json!([{"state": "unknown"}]);
         assert_eq!(
             payload,
             serde_json::json!({
                 "sentinel": SENTINEL,
-                "results": [{"state": "unknown"}, {"state": "absent"}],
+                "results": expected_results,
             })
         );
     }

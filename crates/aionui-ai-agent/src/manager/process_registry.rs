@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -17,11 +18,13 @@ use crate::capability::cli_process::CliAgentProcess;
 use crate::error::AgentError;
 
 pub(crate) const AGENT_PROCESS_REGISTRY_RELATIVE_PATH: &str = "runtime/agent-process-registry.json";
-pub(crate) const AGENT_PROCESS_REGISTRY_EMERGENCY_RELATIVE_DIR: &str = "runtime/agent-process-registry-emergency";
 pub(crate) const AGENT_PROCESS_REGISTRY_FALLBACK_RELATIVE_DIR: &str =
     ".command-eve-agent-process-registry-emergency-v2";
+pub(crate) const AGENT_PROCESS_REGISTRY_EXTERNAL_FALLBACK_DIR_NAME: &str =
+    "command-eve-agent-process-registry-emergency-v3";
 
 const PROCESS_REGISTRY_VERSION: u32 = 2;
+const EXTERNAL_EVIDENCE_KEY_DOMAIN: &str = "command-eve-agent-process-registry-external-key/v1";
 const PROCESS_TREE_TERMINATION_GRACE: Duration = Duration::from_millis(100);
 const PROCESS_TREE_PROOF_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKGROUND_PROCESS_TREE_PROOF_TIMEOUT: Duration = Duration::from_secs(30);
@@ -149,25 +152,72 @@ impl Default for ProcessRegistry {
 }
 
 static REGISTRY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+type SupervisionKey = (PathBuf, u32, u64);
+static UNPERSISTED_PROCESS_SUPERVISORS: OnceLock<Mutex<HashMap<SupervisionKey, Arc<CliAgentProcess>>>> =
+    OnceLock::new();
 
 pub(crate) fn agent_process_registry_path(data_dir: &Path) -> PathBuf {
     data_dir.join(AGENT_PROCESS_REGISTRY_RELATIVE_PATH)
-}
-
-pub(crate) fn agent_process_registry_emergency_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join(AGENT_PROCESS_REGISTRY_EMERGENCY_RELATIVE_DIR)
 }
 
 pub(crate) fn agent_process_registry_fallback_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(AGENT_PROCESS_REGISTRY_FALLBACK_RELATIVE_DIR)
 }
 
-pub(crate) fn agent_process_registry_external_fallback_dir(data_dir: &Path) -> PathBuf {
-    let canonical = fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
-    let key = hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()));
-    std::env::temp_dir()
-        .join("command-eve-agent-process-registry-emergency-v2")
-        .join(key)
+pub(crate) fn agent_process_registry_external_fallback_dir(data_dir: &Path) -> io::Result<PathBuf> {
+    let canonical = fs::canonicalize(data_dir)?;
+    let canonical = canonical.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "canonical data directory is not valid Unicode",
+        )
+    })?;
+    let preimage = external_evidence_key_preimage(std::env::consts::OS, canonical)?;
+    let key = hex::encode(Sha256::digest(preimage));
+    Ok(std::env::temp_dir()
+        .join(AGENT_PROCESS_REGISTRY_EXTERNAL_FALLBACK_DIR_NAME)
+        .join(key))
+}
+
+fn external_evidence_key_preimage(platform: &str, canonical: &str) -> io::Result<Vec<u8>> {
+    let (platform, normalized) = match platform {
+        "windows" | "win32" => ("windows", normalize_windows_canonical_path(canonical)?),
+        "macos" | "darwin" | "linux" => ("posix", canonical.to_owned()),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unsupported platform for external process evidence",
+            ));
+        }
+    };
+    Ok(format!("{EXTERNAL_EVIDENCE_KEY_DOMAIN}\0{platform}\0{normalized}").into_bytes())
+}
+
+fn normalize_windows_canonical_path(value: &str) -> io::Result<String> {
+    let without_namespace = if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        value.to_owned()
+    };
+    let normalized = without_namespace.replace('\\', "/").to_ascii_lowercase();
+    let is_drive = normalized.as_bytes().get(1) == Some(&b':')
+        && normalized.as_bytes().first().is_some_and(u8::is_ascii_lowercase);
+    let is_unc = normalized.starts_with("//")
+        && normalized[2..]
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .take(2)
+            .count()
+            == 2;
+    if (!is_drive && !is_unc) || normalized.contains("/../") || normalized.ends_with("/..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "canonical Windows data directory has an invalid absolute form",
+        ));
+    }
+    Ok(normalized.trim_end_matches('/').to_owned())
 }
 
 fn platform_requires_proven_process_identity(platform: &str) -> bool {
@@ -206,6 +256,16 @@ pub(crate) async fn register_session_process(
         process_identity: process_identity.clone(),
     };
 
+    if unpersisted_process_supervision_active(data_dir) {
+        let cleanup = terminate_registered_process_tree(&lease, &process).await;
+        if cleanup.is_err() {
+            retain_unpersisted_process_ownership(data_dir, &entry, Arc::clone(&process));
+        }
+        return Err(AgentError::internal(
+            "Agent runtime remains fail-closed while an unpersisted process tree is under owned supervision",
+        ));
+    }
+
     if process_identity.is_none() && platform_requires_proven_process_identity(std::env::consts::OS) {
         let cleanup = terminate_registered_process_tree(&lease, &process).await;
         return finish_process_registration(
@@ -216,6 +276,7 @@ pub(crate) async fn register_session_process(
                 "platform process identity is unavailable",
             )),
             cleanup,
+            Some(Arc::clone(&process)),
         )
         .map(|()| lease);
     }
@@ -223,7 +284,7 @@ pub(crate) async fn register_session_process(
     let registration = register_agent_process(data_dir, entry.clone());
     if registration.is_err() {
         let cleanup = terminate_registered_process_tree(&lease, &process).await;
-        finish_process_registration(data_dir, &entry, registration, cleanup)?;
+        finish_process_registration(data_dir, &entry, registration, cleanup, Some(Arc::clone(&process)))?;
     }
 
     let background_lease = lease.clone();
@@ -282,6 +343,7 @@ fn finish_process_registration(
     entry: &RegisteredAgentProcess,
     registration: io::Result<()>,
     cleanup: Result<(), AgentError>,
+    process: Option<Arc<CliAgentProcess>>,
 ) -> Result<(), AgentError> {
     match registration {
         Ok(()) => Ok(()),
@@ -294,6 +356,13 @@ fn finish_process_registration(
             );
             if let Err(cleanup_error) = cleanup {
                 let emergency = preserve_emergency_process_evidence(data_dir, entry);
+                let supervised = if emergency.is_err() {
+                    process.map(|process| {
+                        retain_unpersisted_process_ownership(data_dir, entry, process);
+                    })
+                } else {
+                    None
+                };
                 error!(
                     pid = entry.pid,
                     process_group_id = ?entry.process_group_id,
@@ -307,6 +376,8 @@ fn finish_process_registration(
                     entry.pid,
                     if emergency.is_ok() {
                         "; emergency evidence retained"
+                    } else if supervised.is_some() {
+                        "; emergency persistence failed and owned runtime supervision is active"
                     } else {
                         "; emergency evidence persistence also failed"
                     }
@@ -318,6 +389,47 @@ fn finish_process_registration(
             )))
         }
     }
+}
+
+fn unpersisted_process_supervision_active(data_dir: &Path) -> bool {
+    let root = supervision_root_key(data_dir);
+    UNPERSISTED_PROCESS_SUPERVISORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|(candidate, _, _)| candidate == &root)
+}
+
+fn retain_unpersisted_process_ownership(
+    data_dir: &Path,
+    entry: &RegisteredAgentProcess,
+    process: Arc<CliAgentProcess>,
+) {
+    let key = (supervision_root_key(data_dir), entry.pid, entry.registered_at_ms);
+    let supervisors = UNPERSISTED_PROCESS_SUPERVISORS.get_or_init(|| Mutex::new(HashMap::new()));
+    supervisors.lock().unwrap().insert(key.clone(), Arc::clone(&process));
+    tokio::spawn(async move {
+        loop {
+            if process
+                .prove_tree_absent(BACKGROUND_PROCESS_TREE_PROOF_TIMEOUT)
+                .await
+                .is_ok()
+            {
+                supervisors.lock().unwrap().remove(&key);
+                return;
+            }
+            warn!(
+                pid = key.1,
+                registered_at_ms = key.2,
+                "Unpersisted agent process tree remains under owned fail-closed supervision"
+            );
+        }
+    });
+}
+
+fn supervision_root_key(data_dir: &Path) -> PathBuf {
+    fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf())
 }
 
 fn unregister_agent_process_if_matching(
@@ -383,10 +495,13 @@ fn write_registry_file(path: &Path, registry: &ProcessRegistry) -> io::Result<()
 }
 
 fn preserve_emergency_process_evidence(data_dir: &Path, process: &RegisteredAgentProcess) -> io::Result<PathBuf> {
+    let mut process = process.clone();
+    process.command_preview = None;
+    let file_name = format!("agent-process-{}-{}.json", process.registered_at_ms, process.pid);
     let payload = serde_json::to_vec_pretty(&EmergencyProcessEvidence {
         version: 1,
         reason: "registry_write_failed_cleanup_unproven".to_owned(),
-        process: process.clone(),
+        process,
     })
     .map_err(|error| {
         io::Error::new(
@@ -394,15 +509,22 @@ fn preserve_emergency_process_evidence(data_dir: &Path, process: &RegisteredAgen
             format!("Failed to serialize emergency process evidence: {error}"),
         )
     })?;
-    let file_name = format!("agent-process-{}-{}.json", process.registered_at_ms, process.pid);
-    preserve_emergency_payload_in_directories(
-        &payload,
-        &file_name,
-        &[
-            agent_process_registry_fallback_dir(data_dir),
-            agent_process_registry_external_fallback_dir(data_dir),
-        ],
-    )
+    let fallback = agent_process_registry_fallback_dir(data_dir);
+    match preserve_emergency_payload_in_directories(&payload, &file_name, &[fallback]) {
+        Ok(path) => Ok(path),
+        Err(fallback_error) => {
+            let external = agent_process_registry_external_fallback_dir(data_dir).map_err(|external_error| {
+                io::Error::other(format!(
+                    "all independent emergency evidence locations failed: fallback: {fallback_error} | external-key: {external_error}"
+                ))
+            })?;
+            preserve_emergency_payload_in_directories(&payload, &file_name, &[external]).map_err(|external_error| {
+                io::Error::other(format!(
+                    "all independent emergency evidence locations failed: fallback: {fallback_error} | external: {external_error}"
+                ))
+            })
+        }
+    }
 }
 
 fn preserve_emergency_payload_in_directories(
@@ -1092,6 +1214,7 @@ mod tests {
                 "fixture denies registry write",
             )),
             Ok(()),
+            None,
         );
 
         assert!(result.is_err());
@@ -1116,6 +1239,7 @@ mod tests {
                 "fixture denies registry write",
             )),
             Err(AgentError::internal("fixture process group remains observable")),
+            None,
         );
 
         assert!(result.unwrap_err().to_string().contains("emergency evidence retained"));
@@ -1145,11 +1269,12 @@ mod tests {
                 "primary registry denied",
             )),
             Err(AgentError::internal("process group remains observable")),
+            None,
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("emergency evidence retained"));
-        let external = agent_process_registry_external_fallback_dir(dir.path());
+        let external = agent_process_registry_external_fallback_dir(dir.path()).unwrap();
         let files = fs::read_dir(&external).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(files.len(), 1);
         let evidence: EmergencyProcessEvidence = serde_json::from_slice(&fs::read(files[0].path()).unwrap()).unwrap();
@@ -1171,6 +1296,101 @@ mod tests {
                 .to_string()
                 .contains("all independent emergency evidence locations failed")
         );
+    }
+
+    #[test]
+    fn external_evidence_key_preimage_is_cross_language_stable_for_windows_drive_and_unc_paths() {
+        let drive =
+            external_evidence_key_preimage("windows", r"\\?\C:\Users\Mathias\AppData\Roaming\Command EVE").unwrap();
+        assert_eq!(
+            String::from_utf8(drive).unwrap(),
+            "command-eve-agent-process-registry-external-key/v1\0windows\0c:/users/mathias/appdata/roaming/command eve"
+        );
+        let unc = external_evidence_key_preimage("win32", r"\\?\UNC\Server\Share\Command EVE").unwrap();
+        assert_eq!(
+            String::from_utf8(unc).unwrap(),
+            "command-eve-agent-process-registry-external-key/v1\0windows\0//server/share/command eve"
+        );
+    }
+
+    #[test]
+    fn emergency_evidence_rescrubs_a_legacy_command_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entry = sample_entry(42);
+        entry.command_preview = Some("agent --api-key=secret-arg-value".into());
+        let evidence_path = preserve_emergency_process_evidence(dir.path(), &entry).unwrap();
+        let evidence: EmergencyProcessEvidence = serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        assert_eq!(evidence.process.command_preview, None);
+        assert!(!fs::read_to_string(evidence_path).unwrap().contains("secret-arg-value"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn double_evidence_write_failure_keeps_a_live_descendant_under_owned_supervision() {
+        use aionui_common::CommandSpec;
+        use tokio::time::timeout;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry_path = agent_process_registry_path(data_dir.path());
+        fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        fs::write(&registry_path, b"not-json").unwrap();
+        let fallback = agent_process_registry_fallback_dir(data_dir.path());
+        fs::write(&fallback, b"not-a-directory").unwrap();
+        let external = agent_process_registry_external_fallback_dir(data_dir.path()).unwrap();
+        fs::create_dir_all(external.parent().unwrap()).unwrap();
+        fs::write(&external, b"not-a-directory").unwrap();
+
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_string_lossy().into_owned();
+        let process = Arc::new(
+            CliAgentProcess::spawn_for_sdk(
+                CommandSpec {
+                    command: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "sleep 6 & child=$!; printf '%s' \"$child\" > \"$1\"; exit 0".into(),
+                        "double-evidence-failure".into(),
+                        marker_path,
+                    ],
+                    env: vec![],
+                    cwd: None,
+                },
+                data_dir.path(),
+            )
+            .await
+            .unwrap(),
+        );
+        timeout(Duration::from_secs(5), process.wait_for_exit())
+            .await
+            .expect("launcher leader should exit");
+        let child_pid = fs::read_to_string(marker.path())
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(is_pid_alive(child_pid));
+
+        let error = register_session_process(
+            data_dir.path(),
+            Arc::clone(&process),
+            "conv-double-evidence-failure",
+            AgentType::Acp,
+            Some("fixture".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("owned runtime supervision is active"));
+        assert!(unpersisted_process_supervision_active(data_dir.path()));
+        assert!(is_pid_alive(child_pid));
+
+        timeout(Duration::from_secs(5), async {
+            while unpersisted_process_supervision_active(data_dir.path()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("owned supervisor should retire only after tree absence");
+        fs::remove_file(external).unwrap();
     }
 
     #[test]
