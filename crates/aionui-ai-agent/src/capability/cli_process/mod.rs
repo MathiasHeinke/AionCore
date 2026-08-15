@@ -13,7 +13,7 @@ use crate::error::AgentError;
 mod spawn_sdk;
 mod stderr_monitor;
 
-use stderr_monitor::force_kill;
+use stderr_monitor::{force_kill, force_kill_registered_tree};
 
 /// Maximum stderr ring-buffer size in bytes.
 pub(super) const STDERR_BUFFER_MAX: usize = 8192;
@@ -159,6 +159,12 @@ impl CliAgentProcess {
         if let Err(e) = force_kill(self.pid, self.process_group_id) {
             warn!(pid = self.pid, error = %e, "force_kill_tree failed");
         }
+    }
+
+    /// Execute the final signal for a registry-owned process only after the
+    /// caller has revalidated its durable birth identity and process group.
+    pub(crate) fn force_kill_registered_tree(&self) -> Result<(), AgentError> {
+        force_kill_registered_tree(self.pid, self.process_group_id)
     }
 
     /// Terminate the exact tracked process tree and prove that neither its

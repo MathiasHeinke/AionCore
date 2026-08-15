@@ -557,11 +557,6 @@ impl AcpAgentManager {
             params.conversation_id.clone(),
             AgentType::Acp,
             params.metadata.backend.clone(),
-            Some(format!(
-                "{} {}",
-                params.command_spec.command.display(),
-                params.command_spec.args.join(" ")
-            )),
         )
         .await?;
         let (stdin, stdout) = match process.take_stdio().await {

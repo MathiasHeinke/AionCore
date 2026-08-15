@@ -104,6 +104,8 @@ pub(crate) enum Command {
     Doctor,
     /// Prepare current-platform managed runtime resources under a bundle output root.
     PrepareManagedResources(PrepareManagedResourcesArgs),
+    /// Native, bounded process-birth probe used by the signed desktop cleanup owner.
+    ProcessIdentityProbe,
 }
 
 impl Command {
@@ -114,6 +116,7 @@ impl Command {
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
+            Self::ProcessIdentityProbe => "process-identity-probe",
         }
     }
 
@@ -196,6 +199,16 @@ mod tests {
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
+    }
+
+    #[test]
+    fn process_identity_probe_is_a_runtime_free_closed_subcommand() {
+        let cli = Cli::parse_from(["aioncore", "process-identity-probe"]);
+        let Some(command @ Command::ProcessIdentityProbe) = cli.command else {
+            panic!("expected process-identity-probe subcommand");
+        };
+        assert_eq!(command.as_str(), "process-identity-probe");
+        assert!(!command.need_runtime());
     }
 
     #[test]

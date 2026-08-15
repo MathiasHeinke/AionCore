@@ -45,6 +45,13 @@ tokio-util = { version = "0.7", features = ["compat"] }
 rusqlite.workspace = true
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
 [features]
 # Enables the `AgentInstance::Mock` variant used by downstream test harnesses
 # (conversation/cron/team/app) to inject trait-object stubs without having to

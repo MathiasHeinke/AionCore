@@ -83,6 +83,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::McpTeamStdio) => Ok(commands::run_team_stdio().await),
         Some(Command::Doctor) => Ok(commands::run_doctor(&cli, &merged_path).await?),
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
+        Some(Command::ProcessIdentityProbe) => Ok(commands::run_process_identity_probe()),
         None => {
             let mut env = bootstrap::init_environment(&cli, &merged_path)?;
             let listener = commands::bind_http_listener(&mut env.config).await?;

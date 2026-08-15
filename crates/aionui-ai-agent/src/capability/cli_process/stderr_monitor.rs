@@ -101,6 +101,49 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
     }
 }
 
+/// Signal only the process target whose birth identity was revalidated by the
+/// registry owner immediately before this call.
+///
+/// Unlike [`force_kill`], the Unix group path never falls back to a positive
+/// PID after an `ESRCH`: once the group disappears, that numeric PID may
+/// already have been recycled. The caller must therefore supply the exact
+/// cached group only while the original leader birth is still proven.
+pub(super) fn force_kill_registered_tree(pid: u32, process_group_id: Option<u32>) -> Result<(), AgentError> {
+    #[cfg(unix)]
+    {
+        use std::io;
+
+        let target = process_group_id
+            .filter(|group_id| *group_id > 1)
+            .map(|group_id| -(group_id as i32))
+            .unwrap_or(pid as i32);
+        let rc = unsafe { libc::kill(target, libc::SIGKILL) };
+        if rc == 0 {
+            debug!(pid, process_group_id, "Identity-authorized SIGKILL sent");
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            debug!(pid, process_group_id, "Identity-authorized target already absent");
+            return Ok(());
+        }
+        Err(AgentError::internal(format!(
+            "Failed to kill identity-authorized process target for pid {pid}: {error}"
+        )))
+    }
+    #[cfg(windows)]
+    {
+        force_kill(pid, None)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = process_group_id;
+        Err(AgentError::internal(format!(
+            "Identity-authorized force kill is unsupported for pid {pid}"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod force_kill_tests {
     use super::force_kill;

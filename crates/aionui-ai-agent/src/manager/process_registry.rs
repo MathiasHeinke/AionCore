@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aionui_common::{AgentType, ErrorChain};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
 #[cfg(unix)]
@@ -17,6 +18,8 @@ use crate::error::AgentError;
 
 pub(crate) const AGENT_PROCESS_REGISTRY_RELATIVE_PATH: &str = "runtime/agent-process-registry.json";
 pub(crate) const AGENT_PROCESS_REGISTRY_EMERGENCY_RELATIVE_DIR: &str = "runtime/agent-process-registry-emergency";
+pub(crate) const AGENT_PROCESS_REGISTRY_FALLBACK_RELATIVE_DIR: &str =
+    ".command-eve-agent-process-registry-emergency-v2";
 
 const PROCESS_REGISTRY_VERSION: u32 = 2;
 const PROCESS_TREE_TERMINATION_GRACE: Duration = Duration::from_millis(100);
@@ -75,16 +78,44 @@ struct EmergencyProcessEvidence {
 pub(crate) struct RegisteredProcessLease {
     data_dir: PathBuf,
     pid: u32,
+    process_group_id: Option<u32>,
     registered_at_ms: u64,
     process_identity: Option<ProcessIdentity>,
 }
 
 impl RegisteredProcessLease {
     pub(crate) async fn retire_startup_failure(&self, process: &CliAgentProcess) -> Result<(), AgentError> {
-        process
-            .terminate_tree_and_prove_absence(PROCESS_TREE_TERMINATION_GRACE, PROCESS_TREE_PROOF_TIMEOUT)
-            .await?;
+        terminate_registered_process_tree(self, process).await?;
         self.unregister_after_absence_proof(Ok(()))
+    }
+
+    fn revalidate_signal_authority(&self) -> Result<(), AgentError> {
+        let expected = self.process_identity.as_ref().ok_or_else(|| {
+            AgentError::internal(format!(
+                "Process {} has no proven birth identity; numeric signal authority denied",
+                self.pid
+            ))
+        })?;
+        let observed = capture_process_identity(self.pid, self.process_group_id, expected.parent_pid)
+            .map_err(|error| {
+                AgentError::internal(format!(
+                    "Process {} birth identity could not be revalidated before signal: {error}",
+                    self.pid
+                ))
+            })?
+            .ok_or_else(|| {
+                AgentError::internal(format!(
+                    "Process {} birth identity is unavailable before signal",
+                    self.pid
+                ))
+            })?;
+        if !same_signal_authority(expected, &observed) {
+            return Err(AgentError::internal(format!(
+                "Process {} birth identity changed before signal; numeric signal authority denied",
+                self.pid
+            )));
+        }
+        Ok(())
     }
 
     fn unregister_after_absence_proof(&self, proof: Result<(), AgentError>) -> Result<(), AgentError> {
@@ -102,6 +133,10 @@ impl RegisteredProcessLease {
             ))
         })
     }
+}
+
+fn same_signal_authority(expected: &ProcessIdentity, observed: &ProcessIdentity) -> bool {
+    expected.platform == observed.platform && expected.start_time == observed.start_time
 }
 
 impl Default for ProcessRegistry {
@@ -123,6 +158,18 @@ pub(crate) fn agent_process_registry_emergency_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(AGENT_PROCESS_REGISTRY_EMERGENCY_RELATIVE_DIR)
 }
 
+pub(crate) fn agent_process_registry_fallback_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(AGENT_PROCESS_REGISTRY_FALLBACK_RELATIVE_DIR)
+}
+
+pub(crate) fn agent_process_registry_external_fallback_dir(data_dir: &Path) -> PathBuf {
+    let canonical = fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let key = hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()));
+    std::env::temp_dir()
+        .join("command-eve-agent-process-registry-emergency-v2")
+        .join(key)
+}
+
 fn platform_requires_proven_process_identity(platform: &str) -> bool {
     platform == "windows"
 }
@@ -133,7 +180,6 @@ pub(crate) async fn register_session_process(
     conversation_id: impl Into<String>,
     agent_type: AgentType,
     backend: Option<String>,
-    command_preview: Option<String>,
 ) -> Result<RegisteredProcessLease, AgentError> {
     let pid = process.pid();
     let process_group_id = process.process_group_id();
@@ -145,7 +191,9 @@ pub(crate) async fn register_session_process(
         conversation_id: conversation_id.into(),
         agent_type: agent_type.serde_name().to_owned(),
         backend,
-        command_preview,
+        // ACP arguments may contain credentials. Durable lifecycle evidence is
+        // structural only and never persists command text.
+        command_preview: None,
         registered_at_ms,
         process_identity: process_identity.clone(),
     };
@@ -153,14 +201,13 @@ pub(crate) async fn register_session_process(
     let lease = RegisteredProcessLease {
         data_dir: data_dir.to_path_buf(),
         pid,
+        process_group_id,
         registered_at_ms,
         process_identity: process_identity.clone(),
     };
 
     if process_identity.is_none() && platform_requires_proven_process_identity(std::env::consts::OS) {
-        let cleanup = process
-            .terminate_tree_and_prove_absence(PROCESS_TREE_TERMINATION_GRACE, PROCESS_TREE_PROOF_TIMEOUT)
-            .await;
+        let cleanup = terminate_registered_process_tree(&lease, &process).await;
         return finish_process_registration(
             data_dir,
             &entry,
@@ -175,9 +222,7 @@ pub(crate) async fn register_session_process(
 
     let registration = register_agent_process(data_dir, entry.clone());
     if registration.is_err() {
-        let cleanup = process
-            .terminate_tree_and_prove_absence(PROCESS_TREE_TERMINATION_GRACE, PROCESS_TREE_PROOF_TIMEOUT)
-            .await;
+        let cleanup = terminate_registered_process_tree(&lease, &process).await;
         finish_process_registration(data_dir, &entry, registration, cleanup)?;
     }
 
@@ -197,6 +242,28 @@ pub(crate) async fn register_session_process(
     });
 
     Ok(lease)
+}
+
+async fn terminate_registered_process_tree(
+    lease: &RegisteredProcessLease,
+    process: &CliAgentProcess,
+) -> Result<(), AgentError> {
+    process.close_stdin().await;
+    let _ = tokio::time::timeout(PROCESS_TREE_TERMINATION_GRACE, process.wait_for_exit()).await;
+
+    // A terminal leader no longer owns its numeric PID/PGID. Observation may
+    // prove the whole tree absent, but a surviving group must remain durable
+    // evidence instead of being signalled through a potentially recycled ID.
+    if !process.is_running() {
+        return process.prove_tree_absent(PROCESS_TREE_PROOF_TIMEOUT).await;
+    }
+
+    lease.revalidate_signal_authority()?;
+    process.force_kill_registered_tree()?;
+    tokio::time::timeout(Duration::from_secs(5), process.wait_for_exit())
+        .await
+        .map_err(|_| AgentError::internal(format!("Process {} did not exit after authorized SIGKILL", lease.pid)))?;
+    process.prove_tree_absent(PROCESS_TREE_PROOF_TIMEOUT).await
 }
 
 fn register_agent_process(data_dir: &Path, entry: RegisteredAgentProcess) -> io::Result<()> {
@@ -302,7 +369,11 @@ fn read_registry_file(path: &Path) -> io::Result<ProcessRegistry> {
 }
 
 fn write_registry_file(path: &Path, registry: &ProcessRegistry) -> io::Result<()> {
-    let payload = serde_json::to_vec_pretty(registry).map_err(|e| {
+    let mut sanitized = registry.clone();
+    for process in &mut sanitized.processes {
+        process.command_preview = None;
+    }
+    let payload = serde_json::to_vec_pretty(&sanitized).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Failed to serialize process registry {}: {e}", path.display()),
@@ -312,11 +383,6 @@ fn write_registry_file(path: &Path, registry: &ProcessRegistry) -> io::Result<()
 }
 
 fn preserve_emergency_process_evidence(data_dir: &Path, process: &RegisteredAgentProcess) -> io::Result<PathBuf> {
-    let directory = agent_process_registry_emergency_dir(data_dir);
-    let path = directory.join(format!(
-        "agent-process-{}-{}.json",
-        process.registered_at_ms, process.pid
-    ));
     let payload = serde_json::to_vec_pretty(&EmergencyProcessEvidence {
         version: 1,
         reason: "registry_write_failed_cleanup_unproven".to_owned(),
@@ -328,8 +394,54 @@ fn preserve_emergency_process_evidence(data_dir: &Path, process: &RegisteredAgen
             format!("Failed to serialize emergency process evidence: {error}"),
         )
     })?;
-    write_payload_atomic(&path, &payload)?;
-    Ok(path)
+    let file_name = format!("agent-process-{}-{}.json", process.registered_at_ms, process.pid);
+    preserve_emergency_payload_in_directories(
+        &payload,
+        &file_name,
+        &[
+            agent_process_registry_fallback_dir(data_dir),
+            agent_process_registry_external_fallback_dir(data_dir),
+        ],
+    )
+}
+
+fn preserve_emergency_payload_in_directories(
+    payload: &[u8],
+    file_name: &str,
+    directories: &[PathBuf],
+) -> io::Result<PathBuf> {
+    let mut failures = Vec::new();
+    for directory in directories {
+        let path = directory.join(file_name);
+        match ensure_private_evidence_directory(directory).and_then(|()| write_payload_atomic(&path, payload)) {
+            Ok(()) => return Ok(path),
+            Err(error) => failures.push(format!("{}: {error}", directory.display())),
+        }
+    }
+    Err(io::Error::other(format!(
+        "all independent emergency evidence locations failed: {}",
+        failures.join(" | ")
+    )))
+}
+
+fn ensure_private_evidence_directory(directory: &Path) -> io::Result<()> {
+    fs::create_dir_all(directory)?;
+    let identity = fs::symlink_metadata(directory)?;
+    if !identity.is_dir() || identity.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "emergency evidence directory is not a real directory: {}",
+                directory.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn write_payload_atomic(path: &Path, payload: &[u8]) -> io::Result<()> {
@@ -370,10 +482,37 @@ fn replace_registry_file(tmp_path: &Path, path: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn replace_registry_file(tmp_path: &Path, path: &Path) -> io::Result<()> {
-    if path.exists() {
-        fs::remove_file(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+        let source = tmp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let moved = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
-    fs::rename(tmp_path, path)
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp_path, path)
+    }
 }
 
 #[cfg(unix)]
@@ -541,7 +680,7 @@ fn capture_process_identity(
     }
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let boot_id = boot_id.trim();
-    if boot_id.is_empty() || boot_id.contains(':') {
+    if !is_exact_lowercase_uuid(boot_id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Linux boot id is empty or malformed",
@@ -563,6 +702,18 @@ fn capture_process_identity(
         parent_pid: fields.parent_pid,
         executable_path,
     }))
+}
+
+#[cfg(target_os = "linux")]
+fn is_exact_lowercase_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -609,7 +760,86 @@ fn parse_linux_proc_field(value: Option<&str>, name: &str) -> io::Result<u32> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Linux proc {name} is not numeric")))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+fn capture_process_identity(
+    pid: u32,
+    _expected_process_group_id: Option<u32>,
+    expected_parent_pid: u32,
+) -> io::Result<Option<ProcessIdentity>> {
+    use std::mem::MaybeUninit;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == null_mut() {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mut creation = MaybeUninit::<FILETIME>::zeroed();
+        let mut exit = MaybeUninit::<FILETIME>::zeroed();
+        let mut kernel = MaybeUninit::<FILETIME>::zeroed();
+        let mut user = MaybeUninit::<FILETIME>::zeroed();
+        if unsafe {
+            GetProcessTimes(
+                handle,
+                creation.as_mut_ptr(),
+                exit.as_mut_ptr(),
+                kernel.as_mut_ptr(),
+                user.as_mut_ptr(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let creation = unsafe { creation.assume_init() };
+
+        let mut path = vec![0_u16; 32_768];
+        let mut path_len = u32::try_from(path.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows process path buffer is too large"))?;
+        if unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut path_len) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let path_len = usize::try_from(path_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows process path length is invalid"))?;
+        let executable_path = String::from_utf16(&path[..path_len])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows process path is not UTF-16"))?;
+        if executable_path.is_empty() || !Path::new(&executable_path).is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows process path is empty or not absolute",
+            ));
+        }
+
+        let creation_100ns = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        if creation_100ns == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows process creation time is zero",
+            ));
+        }
+        Ok(Some(ProcessIdentity {
+            platform: "win32".to_owned(),
+            start_time: ProcessStartTime {
+                kind: "windows_filetime_100ns".to_owned(),
+                value: creation_100ns.to_string(),
+            },
+            // The process was returned by our just-completed spawn and this
+            // producer is its parent. Birth time is the durable signal
+            // authority; parent/path remain registration provenance.
+            parent_pid: expected_parent_pid,
+            executable_path,
+        }))
+    })();
+    unsafe {
+        CloseHandle(handle);
+    }
+    result
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn capture_process_identity(
     _pid: u32,
     _expected_process_group_id: Option<u32>,
@@ -658,7 +888,7 @@ mod tests {
             conversation_id: format!("conv-{pid}"),
             agent_type: AgentType::Acp.serde_name().into(),
             backend: Some("codex".into()),
-            command_preview: Some("codex-acp".into()),
+            command_preview: None,
             registered_at_ms: 123,
             process_identity: Some(sample_identity()),
         }
@@ -685,6 +915,7 @@ mod tests {
         RegisteredProcessLease {
             data_dir: dir.path().to_path_buf(),
             pid: entry.pid,
+            process_group_id: entry.process_group_id,
             registered_at_ms: entry.registered_at_ms,
             process_identity: entry.process_identity.clone(),
         }
@@ -702,6 +933,7 @@ mod tests {
         let lease = RegisteredProcessLease {
             data_dir: dir.path().to_path_buf(),
             pid: entry.pid,
+            process_group_id: entry.process_group_id,
             registered_at_ms: entry.registered_at_ms,
             process_identity: entry.process_identity.clone(),
         };
@@ -742,6 +974,33 @@ mod tests {
         assert_eq!(registry.processes[0].pid, 41);
         assert_eq!(registry.processes[0].process_identity, None);
         assert_eq!(registry.processes[1].process_identity, Some(sample_identity()));
+    }
+
+    #[test]
+    fn every_registry_rewrite_scrubs_legacy_raw_command_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = agent_process_registry_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "processes": [{
+    "pid": 41,
+    "process_group_id": 41,
+    "conversation_id": "legacy",
+    "agent_type": "acp",
+    "command_preview": "agent --api-key=secret-arg-value",
+    "registered_at_ms": 100
+  }]
+}"#,
+        )
+        .unwrap();
+
+        register_agent_process(dir.path(), sample_entry(42)).unwrap();
+        let bytes = fs::read_to_string(path).unwrap();
+        assert!(!bytes.contains("secret-arg-value"));
+        assert!(!bytes.contains("command_preview"));
     }
 
     #[test]
@@ -842,7 +1101,7 @@ mod tests {
                 .to_string()
                 .contains("fixture denies registry write")
         );
-        assert!(!agent_process_registry_emergency_dir(dir.path()).exists());
+        assert!(!agent_process_registry_fallback_dir(dir.path()).exists());
     }
 
     #[test]
@@ -860,7 +1119,7 @@ mod tests {
         );
 
         assert!(result.unwrap_err().to_string().contains("emergency evidence retained"));
-        let emergency_dir = agent_process_registry_emergency_dir(dir.path());
+        let emergency_dir = agent_process_registry_fallback_dir(dir.path());
         let files = fs::read_dir(&emergency_dir)
             .unwrap()
             .map(|item| item.unwrap().path())
@@ -873,6 +1132,56 @@ mod tests {
     }
 
     #[test]
+    fn data_root_fallback_failure_uses_the_independent_external_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = agent_process_registry_fallback_dir(dir.path());
+        fs::write(&fallback, b"not-a-directory").unwrap();
+        let entry = sample_entry(42);
+        let error = finish_process_registration(
+            dir.path(),
+            &entry,
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "primary registry denied",
+            )),
+            Err(AgentError::internal("process group remains observable")),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("emergency evidence retained"));
+        let external = agent_process_registry_external_fallback_dir(dir.path());
+        let files = fs::read_dir(&external).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(files.len(), 1);
+        let evidence: EmergencyProcessEvidence = serde_json::from_slice(&fs::read(files[0].path()).unwrap()).unwrap();
+        assert_eq!(evidence.process, entry);
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn all_fallback_write_failures_are_reported_without_a_false_retention_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("blocked-one");
+        let second = dir.path().join("blocked-two");
+        fs::write(&first, b"not-a-directory").unwrap();
+        fs::write(&second, b"not-a-directory").unwrap();
+        let error =
+            preserve_emergency_payload_in_directories(b"{}", "agent-process.json", &[first, second]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("all independent emergency evidence locations failed")
+        );
+    }
+
+    #[test]
+    fn recycled_birth_identity_never_matches_signal_authority() {
+        let expected = sample_identity();
+        let mut recycled = expected.clone();
+        recycled.start_time.value = "1723728000123457".into();
+        assert!(!same_signal_authority(&expected, &recycled));
+    }
+
+    #[test]
     fn windows_requires_proven_identity_before_registry_publication() {
         assert!(platform_requires_proven_process_identity("windows"));
         assert!(!platform_requires_proven_process_identity("macos"));
@@ -881,7 +1190,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn startup_retirement_keeps_evidence_until_leader_and_descendant_group_are_absent() {
+    async fn terminal_leader_with_live_descendant_is_observation_only_and_retains_evidence() {
         use aionui_common::CommandSpec;
         use tokio::time::timeout;
 
@@ -912,10 +1221,17 @@ mod tests {
             "conv-startup-retirement",
             AgentType::Acp,
             Some("fixture".into()),
-            Some("fixture launcher".into()),
         )
         .await
         .unwrap();
+        assert_eq!(
+            read_registry_file(&agent_process_registry_path(data_dir.path()))
+                .unwrap()
+                .processes[0]
+                .command_preview,
+            None,
+            "raw ACP arguments must never enter durable process evidence"
+        );
         timeout(Duration::from_secs(5), process.wait_for_exit())
             .await
             .expect("leader should exit");
@@ -933,15 +1249,23 @@ mod tests {
             1
         );
 
-        lease.retire_startup_failure(&process).await.unwrap();
-
-        assert!(!is_pid_alive(child_pid));
+        let retirement = lease.retire_startup_failure(&process).await;
+        assert!(retirement.is_err());
+        assert!(
+            is_pid_alive(child_pid),
+            "terminal leader must not authorize a cached-PGID signal"
+        );
         assert!(
             read_registry_file(&agent_process_registry_path(data_dir.path()))
                 .unwrap()
                 .processes
-                .is_empty()
+                .len()
+                == 1
         );
+
+        process.force_kill_tree();
+        process.prove_tree_absent(Duration::from_secs(5)).await.unwrap();
+        lease.unregister_after_absence_proof(Ok(())).unwrap();
     }
 
     #[cfg(unix)]
@@ -989,14 +1313,13 @@ mod tests {
             "conv-registry-failure",
             AgentType::Acp,
             Some("fixture".into()),
-            Some("fixture launcher".into()),
         )
         .await
         .unwrap_err();
 
         assert!(error.to_string().contains("Failed to register agent process"));
         assert!(!is_pid_alive(child_pid));
-        assert!(!agent_process_registry_emergency_dir(data_dir.path()).exists());
+        assert!(!agent_process_registry_fallback_dir(data_dir.path()).exists());
     }
 
     #[cfg(target_os = "macos")]
@@ -1037,5 +1360,13 @@ mod tests {
                 start_time_ticks: 98765,
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepts_only_exact_lowercase_linux_boot_uuid() {
+        assert!(is_exact_lowercase_uuid("11111111-2222-3333-4444-555555555555"));
+        assert!(!is_exact_lowercase_uuid("11111111-2222-3333-4444-55555555555A"));
+        assert!(!is_exact_lowercase_uuid("111111112222-3333-4444-555555555555"));
     }
 }
