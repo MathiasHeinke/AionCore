@@ -327,6 +327,11 @@ pub(crate) async fn run_server(
         );
     }
 
+    // A failed registry write may leave a child tree under in-process,
+    // fail-closed supervision. Do not let the Tokio runtime disappear until
+    // that tree is absent or exact durable recovery evidence exists.
+    aionui_ai_agent::manager::drain_unpersisted_process_supervisors().await;
+
     services.database.close().await;
     info!("Server shut down gracefully");
 

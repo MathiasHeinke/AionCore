@@ -153,7 +153,13 @@ impl Default for ProcessRegistry {
 
 static REGISTRY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 type SupervisionKey = (PathBuf, u32, u64);
-static UNPERSISTED_PROCESS_SUPERVISORS: OnceLock<Mutex<HashMap<SupervisionKey, Arc<CliAgentProcess>>>> =
+#[derive(Clone)]
+struct UnpersistedProcessSupervisor {
+    data_dir: PathBuf,
+    entry: RegisteredAgentProcess,
+    process: Arc<CliAgentProcess>,
+}
+static UNPERSISTED_PROCESS_SUPERVISORS: OnceLock<Mutex<HashMap<SupervisionKey, UnpersistedProcessSupervisor>>> =
     OnceLock::new();
 
 pub(crate) fn agent_process_registry_path(data_dir: &Path) -> PathBuf {
@@ -408,15 +414,31 @@ fn retain_unpersisted_process_ownership(
 ) {
     let key = (supervision_root_key(data_dir), entry.pid, entry.registered_at_ms);
     let supervisors = UNPERSISTED_PROCESS_SUPERVISORS.get_or_init(|| Mutex::new(HashMap::new()));
-    supervisors.lock().unwrap().insert(key.clone(), Arc::clone(&process));
+    let supervisor = UnpersistedProcessSupervisor {
+        data_dir: data_dir.to_path_buf(),
+        entry: entry.clone(),
+        process,
+    };
+    supervisors.lock().unwrap().insert(key.clone(), supervisor.clone());
     tokio::spawn(async move {
         loop {
-            if process
+            if supervisor
+                .process
                 .prove_tree_absent(BACKGROUND_PROCESS_TREE_PROOF_TIMEOUT)
                 .await
                 .is_ok()
             {
-                supervisors.lock().unwrap().remove(&key);
+                remove_unpersisted_process_supervision_if_matching(&key, &supervisor.process);
+                return;
+            }
+            if let Ok(path) = preserve_emergency_process_evidence(&supervisor.data_dir, &supervisor.entry) {
+                warn!(
+                    pid = key.1,
+                    registered_at_ms = key.2,
+                    evidence_path = %path.display(),
+                    "Recovered durable evidence for an unpersisted agent process tree"
+                );
+                remove_unpersisted_process_supervision_if_matching(&key, &supervisor.process);
                 return;
             }
             warn!(
@@ -426,6 +448,83 @@ fn retain_unpersisted_process_ownership(
             );
         }
     });
+}
+
+fn remove_unpersisted_process_supervision_if_matching(key: &SupervisionKey, process: &Arc<CliAgentProcess>) {
+    let mut supervisors = UNPERSISTED_PROCESS_SUPERVISORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    if supervisors
+        .get(key)
+        .is_some_and(|candidate| Arc::ptr_eq(&candidate.process, process))
+    {
+        supervisors.remove(key);
+    }
+}
+
+/// Prevent the server runtime from reporting terminal shutdown while a process
+/// tree has neither disappeared nor acquired durable recovery evidence.
+pub(crate) async fn drain_unpersisted_process_supervisors() {
+    drain_unpersisted_process_supervisors_matching(None).await;
+}
+
+async fn drain_unpersisted_process_supervisors_matching(root: Option<PathBuf>) {
+    let mut reported_wait = false;
+    loop {
+        let supervisors = {
+            UNPERSISTED_PROCESS_SUPERVISORS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| root.as_ref().is_none_or(|root| &key.0 == root))
+                .map(|(key, supervisor)| (key.clone(), supervisor.clone()))
+                .collect::<Vec<_>>()
+        };
+        if supervisors.is_empty() {
+            if reported_wait {
+                warn!("Unpersisted agent process supervision is now terminally resolved");
+            }
+            return;
+        }
+        if !reported_wait {
+            warn!(
+                process_count = supervisors.len(),
+                "Server shutdown is waiting for unpersisted agent process supervision"
+            );
+            reported_wait = true;
+        }
+
+        let mut progressed = false;
+        for (key, supervisor) in supervisors {
+            let tree_absent = supervisor
+                .process
+                .prove_tree_absent(Duration::from_millis(100))
+                .await
+                .is_ok();
+            let evidence_path = if tree_absent {
+                None
+            } else {
+                preserve_emergency_process_evidence(&supervisor.data_dir, &supervisor.entry).ok()
+            };
+            if tree_absent || evidence_path.is_some() {
+                if let Some(path) = evidence_path {
+                    warn!(
+                        pid = key.1,
+                        registered_at_ms = key.2,
+                        evidence_path = %path.display(),
+                        "Server shutdown recovered durable agent process evidence"
+                    );
+                }
+                remove_unpersisted_process_supervision_if_matching(&key, &supervisor.process);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
 }
 
 fn supervision_root_key(data_dir: &Path) -> PathBuf {
@@ -1390,6 +1489,94 @@ mod tests {
         })
         .await
         .expect("owned supervisor should retire only after tree absence");
+        fs::remove_file(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backend_shutdown_waits_for_live_unpersisted_tree_until_durable_evidence_recovers() {
+        use aionui_common::CommandSpec;
+        use tokio::time::timeout;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry_path = agent_process_registry_path(data_dir.path());
+        fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        fs::write(&registry_path, b"not-json").unwrap();
+        let fallback = agent_process_registry_fallback_dir(data_dir.path());
+        fs::write(&fallback, b"not-a-directory").unwrap();
+        let external = agent_process_registry_external_fallback_dir(data_dir.path()).unwrap();
+        fs::create_dir_all(external.parent().unwrap()).unwrap();
+        fs::write(&external, b"not-a-directory").unwrap();
+
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_string_lossy().into_owned();
+        let process = Arc::new(
+            CliAgentProcess::spawn_for_sdk(
+                CommandSpec {
+                    command: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "sleep 8 & child=$!; printf '%s' \"$child\" > \"$1\"; exit 0".into(),
+                        "shutdown-supervision".into(),
+                        marker_path,
+                    ],
+                    env: vec![],
+                    cwd: None,
+                },
+                data_dir.path(),
+            )
+            .await
+            .unwrap(),
+        );
+        timeout(Duration::from_secs(5), process.wait_for_exit())
+            .await
+            .expect("launcher leader should exit");
+        let child_pid = fs::read_to_string(marker.path())
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+
+        register_session_process(
+            data_dir.path(),
+            Arc::clone(&process),
+            "conv-shutdown-supervision",
+            AgentType::Acp,
+            Some("fixture".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(unpersisted_process_supervision_active(data_dir.path()));
+        assert!(is_pid_alive(child_pid));
+
+        let root = supervision_root_key(data_dir.path());
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                drain_unpersisted_process_supervisors_matching(Some(root.clone()))
+            )
+            .await
+            .is_err(),
+            "backend shutdown must remain pending while tree and evidence are both unresolved"
+        );
+        assert!(is_pid_alive(child_pid));
+
+        fs::remove_file(&fallback).unwrap();
+        timeout(
+            Duration::from_secs(2),
+            drain_unpersisted_process_supervisors_matching(Some(root)),
+        )
+        .await
+        .expect("shutdown drain should retry durable evidence before returning");
+        assert!(!unpersisted_process_supervision_active(data_dir.path()));
+        assert!(
+            is_pid_alive(child_pid),
+            "durable recovery should complete while the descendant is still live"
+        );
+        let evidence_files = fs::read_dir(&fallback).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(evidence_files.len(), 1);
+
+        process.prove_tree_absent(Duration::from_secs(5)).await.unwrap();
         fs::remove_file(external).unwrap();
     }
 
