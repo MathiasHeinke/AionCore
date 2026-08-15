@@ -206,14 +206,38 @@ impl Drop for AcpSessionBindingTransitionPending {
 }
 
 struct AcpSessionBindingTransition {
-    _pending: AcpSessionBindingTransitionPending,
     had_preexisting_transition: bool,
-    _barrier: OwnedRwLockWriteGuard<()>,
+    barrier: Option<OwnedRwLockWriteGuard<()>>,
+    pending: Option<AcpSessionBindingTransitionPending>,
 }
 
 impl AcpSessionBindingTransition {
     fn had_preexisting_transition(&self) -> bool {
         self.had_preexisting_transition
+    }
+
+    /// Release the writer before unpublishing the transition counters. A
+    /// correction retry may fail to acquire the reader while the writer is
+    /// held; the published fence must still be visible for that whole window.
+    fn release(&mut self) {
+        self.release_with(|| {});
+    }
+
+    fn release_with(&mut self, after_writer_release: impl FnOnce()) {
+        drop(self.barrier.take());
+        after_writer_release();
+        drop(self.pending.take());
+    }
+
+    #[cfg(test)]
+    fn release_with_probe(&mut self, probe: impl FnOnce()) {
+        self.release_with(probe);
+    }
+}
+
+impl Drop for AcpSessionBindingTransition {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -620,9 +644,9 @@ impl AcpSessionBinding {
         };
         let barrier = Arc::clone(&self.admission_barrier).write_owned().await;
         AcpSessionBindingTransition {
-            _pending: pending,
             had_preexisting_transition,
-            _barrier: barrier,
+            barrier: Some(barrier),
+            pending: Some(pending),
         }
     }
 
@@ -775,7 +799,33 @@ mod tests {
 
     use tokio::sync::oneshot;
 
-    use super::{AcpSessionBinding, AcpSessionBindingTransitionPending};
+    use super::{AcpSessionBinding, AcpSessionBindingTransitionClass, AcpSessionBindingTransitionPending};
+
+    #[tokio::test]
+    async fn transition_drop_releases_writer_before_unpublishing_receipt_fence() {
+        let binding = AcpSessionBinding::default();
+        binding.bind("session-1").await.unwrap();
+        let mut transition = binding
+            .transition(AcpSessionBindingTransitionClass::ReceiptPreservingBind)
+            .await;
+        assert!(binding.transition_pending());
+        assert!(!binding.lifecycle_change_pending());
+
+        transition.release_with_probe(|| {
+            assert!(
+                binding.transition_pending(),
+                "the receipt fence must remain published after the writer unlocks"
+            );
+            let reader = Arc::clone(&binding.admission_barrier)
+                .try_read_owned()
+                .expect("the writer must release before the receipt fence");
+            drop(reader);
+        });
+
+        assert!(!binding.transition_pending());
+        assert!(!binding.lifecycle_change_pending());
+        assert_eq!(binding.bound_session_id().as_deref(), Some("session-1"));
+    }
 
     #[tokio::test]
     async fn lifecycle_ticket_drop_cancellation_and_unwind_release_the_transition_fence() {
