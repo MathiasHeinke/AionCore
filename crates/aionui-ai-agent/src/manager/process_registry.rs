@@ -84,11 +84,7 @@ pub(crate) fn register_session_process(
 ) -> Result<(), AgentError> {
     let pid = process.pid();
     let process_group_id = process.process_group_id();
-    let process_identity = capture_process_identity(pid, process_group_id).map_err(|e| {
-        AgentError::internal(format!(
-            "Failed to capture process identity for agent process {pid}: {e}"
-        ))
-    })?;
+    let process_identity = capture_process_identity_or_unproven(pid, process_group_id, capture_process_identity);
     let registered_at_ms = now_ms();
     let entry = RegisteredAgentProcess {
         pid,
@@ -266,8 +262,30 @@ fn with_registry_lock<T>(f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     f()
 }
 
+fn capture_process_identity_or_unproven(
+    pid: u32,
+    expected_process_group_id: Option<u32>,
+    capture: impl FnOnce(u32, Option<u32>, u32) -> io::Result<Option<ProcessIdentity>>,
+) -> Option<ProcessIdentity> {
+    match capture(pid, expected_process_group_id, std::process::id()) {
+        Ok(identity) => identity,
+        Err(error) => {
+            warn!(
+                pid,
+                error = %ErrorChain(&error),
+                "Could not prove agent process birth identity; registry cleanup will remain fail-closed"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn capture_process_identity(pid: u32, expected_process_group_id: Option<u32>) -> io::Result<Option<ProcessIdentity>> {
+fn capture_process_identity(
+    pid: u32,
+    expected_process_group_id: Option<u32>,
+    expected_parent_pid: u32,
+) -> io::Result<Option<ProcessIdentity>> {
     use std::ffi::c_void;
     use std::mem::{MaybeUninit, size_of};
 
@@ -293,6 +311,15 @@ fn capture_process_identity(pid: u32, expected_process_group_id: Option<u32>) ->
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("proc_pidinfo returned pid {} for requested pid {pid}", info.pbi_pid),
+        ));
+    }
+    if info.pbi_ppid != expected_parent_pid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "process parent changed during registration: expected {expected_parent_pid}, observed {}",
+                info.pbi_ppid
+            ),
         ));
     }
     if let Some(expected) = expected_process_group_id
@@ -352,10 +379,23 @@ fn capture_process_identity(pid: u32, expected_process_group_id: Option<u32>) ->
 }
 
 #[cfg(target_os = "linux")]
-fn capture_process_identity(pid: u32, expected_process_group_id: Option<u32>) -> io::Result<Option<ProcessIdentity>> {
+fn capture_process_identity(
+    pid: u32,
+    expected_process_group_id: Option<u32>,
+    expected_parent_pid: u32,
+) -> io::Result<Option<ProcessIdentity>> {
     let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
     let stat = fs::read_to_string(&stat_path)?;
     let fields = parse_linux_proc_stat(&stat)?;
+    if fields.parent_pid != expected_parent_pid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "process parent changed during registration: expected {expected_parent_pid}, observed {}",
+                fields.parent_pid
+            ),
+        ));
+    }
     if let Some(expected) = expected_process_group_id
         && fields.process_group_id != expected
     {
@@ -438,7 +478,11 @@ fn parse_linux_proc_field(value: Option<&str>, name: &str) -> io::Result<u32> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn capture_process_identity(_pid: u32, _expected_process_group_id: Option<u32>) -> io::Result<Option<ProcessIdentity>> {
+fn capture_process_identity(
+    _pid: u32,
+    _expected_process_group_id: Option<u32>,
+    _expected_parent_pid: u32,
+) -> io::Result<Option<ProcessIdentity>> {
     // The current packaged release target is macOS. Other platforms retain a
     // v2 entry with a null identity so a consumer can fail closed instead of
     // signaling a numeric pid without a platform-authenticated birth record.
@@ -656,14 +700,27 @@ mod tests {
         assert!(registry.processes.is_empty());
     }
 
+    #[test]
+    fn capture_failure_degrades_to_an_explicitly_unproven_identity() {
+        let identity = capture_process_identity_or_unproven(42, Some(42), |_pid, _pgid, _ppid| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture denies process inspection",
+            ))
+        });
+        assert_eq!(identity, None);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn captures_exact_macos_birth_parent_group_and_executable() {
         let pid = std::process::id();
         let process_group_id = unsafe { libc::getpgid(pid as i32) };
+        let parent_pid = unsafe { libc::getppid() };
         assert!(process_group_id > 1);
+        assert!(parent_pid > 0);
 
-        let identity = capture_process_identity(pid, Some(process_group_id as u32))
+        let identity = capture_process_identity(pid, Some(process_group_id as u32), parent_pid as u32)
             .unwrap()
             .unwrap();
         assert_eq!(identity.platform, "darwin");
@@ -672,7 +729,7 @@ mod tests {
         assert!(identity.parent_pid > 0);
         assert!(Path::new(&identity.executable_path).is_absolute());
 
-        let mismatch = capture_process_identity(pid, Some(process_group_id as u32 + 1));
+        let mismatch = capture_process_identity(pid, Some(process_group_id as u32 + 1), parent_pid as u32);
         assert_eq!(mismatch.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
