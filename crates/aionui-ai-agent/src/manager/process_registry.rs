@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aionui_common::{AgentType, ErrorChain};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{error, warn};
 
 #[cfg(unix)]
 use std::fs::File;
@@ -97,10 +97,8 @@ pub(crate) fn register_session_process(
         process_identity: process_identity.clone(),
     };
 
-    register_agent_process(data_dir, entry).map_err(|e| {
-        AgentError::internal(format!(
-            "Failed to register agent process {pid} in runtime registry: {e}"
-        ))
+    finish_process_registration(pid, register_agent_process(data_dir, entry), || {
+        process.force_kill_tree();
     })?;
 
     let data_dir = data_dir.to_path_buf();
@@ -131,6 +129,27 @@ fn register_agent_process(data_dir: &Path, entry: RegisteredAgentProcess) -> io:
         registry.processes.push(entry);
         write_registry_file(&path, &registry)
     })
+}
+
+fn finish_process_registration(
+    pid: u32,
+    registration: io::Result<()>,
+    cleanup_spawned_tree: impl FnOnce(),
+) -> Result<(), AgentError> {
+    match registration {
+        Ok(()) => Ok(()),
+        Err(registration_error) => {
+            error!(
+                pid,
+                error = %ErrorChain(&registration_error),
+                "Failed to persist agent process registry entry; terminating spawned process tree"
+            );
+            cleanup_spawned_tree();
+            Err(AgentError::internal(format!(
+                "Failed to register agent process {pid} in runtime registry: {registration_error}"
+            )))
+        }
+    }
 }
 
 pub(crate) fn unregister_agent_process(data_dir: &Path, pid: u32) -> io::Result<()> {
@@ -709,6 +728,28 @@ mod tests {
             ))
         });
         assert_eq!(identity, None);
+    }
+
+    #[test]
+    fn failed_registry_write_cleans_up_the_spawned_process_tree() {
+        let cleanup_called = std::cell::Cell::new(false);
+        let result = finish_process_registration(
+            42,
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture denies registry write",
+            )),
+            || cleanup_called.set(true),
+        );
+
+        assert!(result.is_err());
+        assert!(cleanup_called.get());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("fixture denies registry write")
+        );
     }
 
     #[cfg(target_os = "macos")]
