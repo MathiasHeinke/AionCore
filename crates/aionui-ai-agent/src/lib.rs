@@ -58,4 +58,4 @@ pub use session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,
     ProjectEnvironmentHint, WorkspaceContext,
 };
-pub use task_manager::{IWorkerTaskManager, WorkerTaskManagerImpl};
+pub use task_manager::{IWorkerTaskManager, WarmTaskHandle, WorkerTaskManagerImpl};

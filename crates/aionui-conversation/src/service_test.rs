@@ -19,7 +19,7 @@ use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, Finish
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{
     AcpError, AcpSessionBinding, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind,
-    IWorkerTaskManager,
+    IWorkerTaskManager, WarmTaskHandle,
 };
 use aionui_auth::{
     LocalCapabilityVerifier, ProjectRuntimeAttestationClaims, ProjectRuntimeAttestationPurpose,
@@ -4059,9 +4059,11 @@ impl IWorkerTaskManager for MockTaskManager {
         &self,
         conversation_id: &str,
         options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AgentError> {
+    ) -> Result<WarmTaskHandle, AgentError> {
         self.warm_build_count.fetch_add(1, Ordering::SeqCst);
-        self.get_or_build_task(conversation_id, options).await
+        self.get_or_build_task(conversation_id, options)
+            .await
+            .map(WarmTaskHandle::untracked)
     }
 
     fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {

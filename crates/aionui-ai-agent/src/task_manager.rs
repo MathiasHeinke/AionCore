@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,8 +56,10 @@ pub trait IWorkerTaskManager: Send + Sync {
         &self,
         conversation_id: &str,
         options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AgentError> {
-        self.get_or_build_task(conversation_id, options).await
+    ) -> Result<WarmTaskHandle, AgentError> {
+        self.get_or_build_task(conversation_id, options)
+            .await
+            .map(WarmTaskHandle::untracked)
     }
 
     /// Kill and remove a task.
@@ -115,6 +118,74 @@ struct TaskSlot {
     cleanup_started: AtomicBool,
     prior_termination: Mutex<Option<TaskTerminationFuture>>,
     turn_holders: Mutex<HashSet<usize>>,
+    warmup_holders: AtomicU64,
+}
+
+/// Agent handle returned to an explicit warmup request.
+///
+/// Production handles retain a slot-scoped lease from admission until the
+/// caller finishes (or cancels) the warmup. Idle cleanup therefore cannot
+/// remove a stale-but-current task in the gap before its successful activity
+/// timestamp refresh. Adapter/test managers may return an untracked handle.
+pub struct WarmTaskHandle {
+    agent: AgentInstance,
+    _lease: Option<WarmTaskLease>,
+}
+
+impl WarmTaskHandle {
+    pub fn untracked(agent: AgentInstance) -> Self {
+        Self { agent, _lease: None }
+    }
+
+    fn tracked(agent: AgentInstance, lease: WarmTaskLease) -> Self {
+        Self {
+            agent,
+            _lease: Some(lease),
+        }
+    }
+}
+
+impl Deref for WarmTaskHandle {
+    type Target = AgentInstance;
+
+    fn deref(&self) -> &Self::Target {
+        &self.agent
+    }
+}
+
+struct WarmTaskLease {
+    slot: Arc<TaskSlot>,
+}
+
+impl Drop for WarmTaskLease {
+    fn drop(&mut self) {
+        let released = self
+            .slot
+            .warmup_holders
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_sub(1));
+        debug_assert!(released.is_ok(), "warmup holder underflow");
+    }
+}
+
+struct SelectedTaskSlot {
+    slot: Arc<TaskSlot>,
+    warmup_lease: Option<WarmTaskLease>,
+}
+
+impl SelectedTaskSlot {
+    fn new(slot: Arc<TaskSlot>, intent: BuildIntent) -> Result<Self, AgentError> {
+        let warmup_lease = if intent == BuildIntent::Warmup {
+            slot.warmup_holders
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1))
+                .map_err(|_| AgentError::internal("WARMUP_ACTIVITY_LEASE_EXHAUSTED"))?;
+            Some(WarmTaskLease {
+                slot: Arc::clone(&slot),
+            })
+        } else {
+            None
+        };
+        Ok(Self { slot, warmup_lease })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +237,7 @@ impl TaskSlot {
             cleanup_started: AtomicBool::new(false),
             prior_termination: Mutex::new(prior_termination),
             turn_holders: Mutex::new(HashSet::new()),
+            warmup_holders: AtomicU64::new(0),
         }))
     }
 
@@ -361,6 +433,9 @@ impl TaskSlot {
     }
 
     fn idle_snapshot(&self, idle_threshold_ms: TimestampMs, now: TimestampMs) -> Option<IdleTaskSnapshot> {
+        if self.warmup_holders.load(Ordering::Acquire) > 0 {
+            return None;
+        }
         let lifecycle = self.lifecycle().ok()?;
         let agent = self.get()?;
         let agent_type = agent.agent_type();
@@ -410,7 +485,7 @@ impl WorkerTaskManagerImpl {
         requested_context: Option<ProjectRuntimeContext>,
         requested_use: Option<&ProjectRuntimeUse>,
         requested_intent: BuildIntent,
-    ) -> Result<SharedTaskSlot, AgentError> {
+    ) -> Result<SelectedTaskSlot, AgentError> {
         use dashmap::mapref::entry::Entry;
 
         match self.tasks.entry(conversation_id.to_owned()) {
@@ -418,18 +493,18 @@ impl WorkerTaskManagerImpl {
                 let slot =
                     TaskSlot::new_with_intent(requested_context, requested_use.cloned(), requested_intent, None)?;
                 entry.insert(Arc::clone(&slot));
-                Ok(slot)
+                SelectedTaskSlot::new(slot, requested_intent)
             }
             Entry::Occupied(mut entry) => {
                 let existing = Arc::clone(entry.get());
                 match (existing.project_runtime_context.as_ref(), requested_context.as_ref()) {
                     (None, None) => {
                         existing.admit_exact(None, requested_intent)?;
-                        return Ok(existing);
+                        return SelectedTaskSlot::new(existing, requested_intent);
                     }
                     (Some(previous), Some(requested)) if previous.same_runtime_as(requested) => {
                         existing.admit_exact(requested_use, requested_intent)?;
-                        return Ok(existing);
+                        return SelectedTaskSlot::new(existing, requested_intent);
                     }
                     _ => {}
                 }
@@ -473,7 +548,7 @@ impl WorkerTaskManagerImpl {
                     prior_termination,
                 )?;
                 entry.insert(Arc::clone(&replacement));
-                Ok(replacement)
+                SelectedTaskSlot::new(replacement, requested_intent)
             }
         }
     }
@@ -483,7 +558,7 @@ impl WorkerTaskManagerImpl {
         conversation_id: &str,
         options: BuildTaskOptions,
         intent: BuildIntent,
-    ) -> Result<AgentInstance, AgentError> {
+    ) -> Result<(AgentInstance, Option<WarmTaskLease>), AgentError> {
         let project_runtime = options.project_runtime_context.is_some();
         let project_execution = match (&options.project_runtime_context, &options.project_runtime_execution) {
             (Some(context), Some(permit)) if permit.matches(conversation_id, context) => {
@@ -519,17 +594,23 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
-        self.get_or_build_task_with_intent(conversation_id, options, BuildIntent::Turn)
-            .await
+        let (agent, warmup_lease) = self
+            .get_or_build_task_with_intent(conversation_id, options, BuildIntent::Turn)
+            .await?;
+        debug_assert!(warmup_lease.is_none());
+        Ok(agent)
     }
 
     async fn get_or_build_warm_task(
         &self,
         conversation_id: &str,
         options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AgentError> {
-        self.get_or_build_task_with_intent(conversation_id, options, BuildIntent::Warmup)
-            .await
+    ) -> Result<WarmTaskHandle, AgentError> {
+        let (agent, warmup_lease) = self
+            .get_or_build_task_with_intent(conversation_id, options, BuildIntent::Warmup)
+            .await?;
+        let lease = warmup_lease.ok_or_else(|| AgentError::internal("WARMUP_ACTIVITY_LEASE_MISSING"))?;
+        Ok(WarmTaskHandle::tracked(agent, lease))
     }
 
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
@@ -671,16 +752,18 @@ impl WorkerTaskManagerImpl {
         project_runtime: bool,
         project_execution: Option<ProjectRuntimeExecutionPermit>,
         intent: BuildIntent,
-    ) -> Result<AgentInstance, AgentError> {
+    ) -> Result<(AgentInstance, Option<WarmTaskLease>), AgentError> {
         let requested_use = project_execution
             .as_ref()
             .map(ProjectRuntimeExecutionPermit::runtime_use);
-        let slot = self.select_slot(
+        let selection = self.select_slot(
             conversation_id,
             options.project_runtime_context.clone(),
             requested_use,
             intent,
         )?;
+        let slot = selection.slot;
+        let warmup_lease = selection.warmup_lease;
         if let Some(ProjectRuntimeUse::Turn { turn_id }) = requested_use {
             let weak_slot = Arc::downgrade(&slot);
             let turn_id = turn_id.clone();
@@ -737,7 +820,7 @@ impl WorkerTaskManagerImpl {
             return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED"));
         }
         slot.mark_ready();
-        Ok(instance.clone())
+        Ok((instance.clone(), warmup_lease))
     }
 }
 
@@ -1011,7 +1094,7 @@ mod tests {
         }
     }
 
-    fn expect_agent_error(result: Result<AgentInstance, AgentError>) -> AgentError {
+    fn expect_agent_error<T>(result: Result<T, AgentError>) -> AgentError {
         match result {
             Ok(_) => panic!("expected agent error"),
             Err(error) => error,
@@ -1794,6 +1877,46 @@ mod tests {
             mgr.tasks.get("conv-race").unwrap().lifecycle().unwrap(),
             TaskSlotLifecycle::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn idle_revalidation_skips_candidate_held_by_an_explicit_rewarmup() {
+        let kills = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let kills = Arc::clone(&kills);
+            Arc::new(move |options| {
+                let kills = Arc::clone(&kills);
+                async move {
+                    Ok(mock_instance(
+                        MockAgent::new(options.conversation_id(), None)
+                            .with_last_activity(now_ms() - 600_000)
+                            .with_kill_counter(kills),
+                    ))
+                }
+                .boxed()
+            })
+        };
+        let mgr = WorkerTaskManagerImpl::new(factory);
+        drop(
+            mgr.get_or_build_warm_task("conv-rewarm", make_options("conv-rewarm"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(mgr.collect_idle(300_000), vec!["conv-rewarm".to_owned()]);
+
+        let active_rewarm = mgr
+            .get_or_build_warm_task("conv-rewarm", make_options("conv-rewarm"))
+            .await
+            .unwrap();
+        assert!(mgr.collect_idle(300_000).is_empty());
+        assert!(!mgr.kill_idle_if_still_eligible("conv-rewarm", 300_000).await);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        assert!(mgr.get_task("conv-rewarm").is_some());
+
+        drop(active_rewarm);
+        assert_eq!(mgr.collect_idle(300_000), vec!["conv-rewarm".to_owned()]);
+        assert!(mgr.kill_idle_if_still_eligible("conv-rewarm", 300_000).await);
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
