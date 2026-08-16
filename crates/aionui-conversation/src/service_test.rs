@@ -3777,6 +3777,7 @@ struct MockTaskManager {
     agents: Mutex<std::collections::HashMap<String, AgentInstance>>,
     kill_records: Mutex<Vec<(String, Option<AgentKillReason>)>>,
     kill_count: AtomicUsize,
+    warm_build_count: AtomicUsize,
 }
 
 impl MockTaskManager {
@@ -3785,6 +3786,7 @@ impl MockTaskManager {
             agents: Mutex::new(std::collections::HashMap::new()),
             kill_records: Mutex::new(Vec::new()),
             kill_count: AtomicUsize::new(0),
+            warm_build_count: AtomicUsize::new(0),
         }
     }
 
@@ -3798,6 +3800,10 @@ impl MockTaskManager {
 
     fn kill_records(&self) -> Vec<(String, Option<AgentKillReason>)> {
         self.kill_records.lock().unwrap().clone()
+    }
+
+    fn warm_build_count(&self) -> usize {
+        self.warm_build_count.load(Ordering::SeqCst)
     }
 }
 
@@ -4047,6 +4053,15 @@ impl IWorkerTaskManager for MockTaskManager {
         let instance = AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id)));
         agents.insert(conversation_id.to_owned(), instance.clone());
         Ok(instance)
+    }
+
+    async fn get_or_build_warm_task(
+        &self,
+        conversation_id: &str,
+        options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        self.warm_build_count.fetch_add(1, Ordering::SeqCst);
+        self.get_or_build_task(conversation_id, options).await
     }
 
     fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
@@ -7840,6 +7855,7 @@ async fn warmup_creates_agent_task() {
 
     // Agent should now exist
     assert!(task_mgr.get_task(&conv.id).is_some());
+    assert_eq!(task_mgr.warm_build_count(), 1);
 }
 
 #[tokio::test]

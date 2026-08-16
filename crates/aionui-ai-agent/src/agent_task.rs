@@ -281,14 +281,13 @@ impl AgentInstance {
 
     /// Finish the native ACP session handshake without sending a prompt.
     ///
-    /// Grounded Command EVE turns use this readiness seam before starting
-    /// their separate prompt-admission budget. Other agent variants keep the
-    /// historical warmup behavior.
+    /// Grounded Command EVE turns and explicit re-warmups use this readiness
+    /// seam before starting their separate prompt-admission budget. Hermes
+    /// ACP sessions refresh their idle-residency activity on success; other
+    /// backends keep the historical warmup behavior.
     pub async fn prepare_prompt_session(&self) -> Result<(), AgentError> {
         match self {
-            Self::Acp(manager) if manager.backend() == Some("hermes") => {
-                manager.ensure_session_opened().await.map(|_| ())
-            }
+            Self::Acp(manager) if manager.backend() == Some("hermes") => manager.warmup_session().await,
             Self::Acp(_) | Self::Aionrs(_) => Ok(()),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(_) => Ok(()),

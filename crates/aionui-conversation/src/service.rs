@@ -3730,7 +3730,7 @@ impl ConversationService {
             .project_runtime_context
             .as_ref()
             .map(|_| build_opts.context.workspace.path.clone());
-        let agent = match task_manager.get_or_build_task(conversation_id, build_opts).await {
+        let agent = match task_manager.get_or_build_warm_task(conversation_id, build_opts).await {
             Ok(agent) => agent,
             Err(err) => {
                 let err = match project_runtime_workspace_path.as_deref() {

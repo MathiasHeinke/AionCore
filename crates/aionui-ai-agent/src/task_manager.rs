@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures_util::future::{BoxFuture, join_all};
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
@@ -48,6 +48,17 @@ pub trait IWorkerTaskManager: Send + Sync {
         options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError>;
 
+    /// Get or build a task for proactive warmup without claiming an active
+    /// user turn. Implementations that do not track warm residency may keep
+    /// the historical behavior by delegating to [`Self::get_or_build_task`].
+    async fn get_or_build_warm_task(
+        &self,
+        conversation_id: &str,
+        options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        self.get_or_build_task(conversation_id, options).await
+    }
+
     /// Kill and remove a task.
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError>;
 
@@ -66,10 +77,20 @@ pub trait IWorkerTaskManager: Send + Sync {
 
     /// Collect tasks eligible for idle cleanup.
     ///
-    /// Returns conversation IDs of tasks that:
-    /// - have `status == Some(Finished)`
-    /// - have been idle longer than `idle_threshold_ms`
+    /// Returns conversation IDs of ACP tasks that have exceeded the idle
+    /// threshold and are either warm-resident without a turn or finished.
     fn collect_idle(&self, idle_threshold_ms: TimestampMs) -> Vec<String>;
+
+    /// Revalidate and kill an idle candidate selected by [`Self::collect_idle`].
+    ///
+    /// The default preserves compatibility for test and adapter managers.
+    /// The production manager overrides this so a real turn that starts after
+    /// the scan but before removal wins the race and keeps its task alive.
+    async fn kill_idle_if_still_eligible(&self, conversation_id: &str, _idle_threshold_ms: TimestampMs) -> bool {
+        self.kill_and_wait(conversation_id, Some(AgentKillReason::IdleTimeout))
+            .await;
+        true
+    }
 }
 
 /// Per-conversation single-flight slot plus the pathless project runtime
@@ -98,26 +119,50 @@ struct TaskSlot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TaskSlotLifecycle {
-    Building(Option<ProjectRuntimeUse>),
+    Building {
+        project_runtime_use: Option<ProjectRuntimeUse>,
+        intent: BuildIntent,
+    },
     Ready,
     WarmIdle,
-    TurnActive { turn_id: String },
+    TurnActive {
+        turn_id: String,
+    },
     Finished,
     FailedEmpty,
     Invalidated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildIntent {
+    Warmup,
+    Turn,
+}
+
+#[derive(Debug, Clone)]
+struct IdleTaskSnapshot {
+    agent_type: AgentType,
+    status: Option<ConversationStatus>,
+    lifecycle: TaskSlotLifecycle,
+    idle_ms: TimestampMs,
+    last_activity_at: TimestampMs,
+}
+
 impl TaskSlot {
-    fn new(
+    fn new_with_intent(
         project_runtime_context: Option<ProjectRuntimeContext>,
         project_runtime_use: Option<ProjectRuntimeUse>,
+        intent: BuildIntent,
         prior_termination: Option<TaskTerminationFuture>,
     ) -> Result<Arc<Self>, AgentError> {
         Ok(Arc::new(Self {
             registration_id: allocate_task_slot_registration_id(&NEXT_TASK_SLOT_REGISTRATION_ID)?,
             project_runtime_context,
             instance: OnceCell::new(),
-            lifecycle: Mutex::new(TaskSlotLifecycle::Building(project_runtime_use)),
+            lifecycle: Mutex::new(TaskSlotLifecycle::Building {
+                project_runtime_use,
+                intent,
+            }),
             cleanup_started: AtomicBool::new(false),
             prior_termination: Mutex::new(prior_termination),
             turn_holders: Mutex::new(HashSet::new()),
@@ -144,65 +189,123 @@ impl TaskSlot {
             .map_err(|_| AgentError::internal("PROJECT_RUNTIME_LIFECYCLE_UNAVAILABLE"))
     }
 
-    fn admit_exact(&self, requested_use: Option<&ProjectRuntimeUse>) -> Result<(), AgentError> {
+    fn admit_exact(
+        &self,
+        requested_use: Option<&ProjectRuntimeUse>,
+        requested_intent: BuildIntent,
+    ) -> Result<(), AgentError> {
         let mut lifecycle = self
             .lifecycle
             .lock()
             .map_err(|_| AgentError::internal("PROJECT_RUNTIME_LIFECYCLE_UNAVAILABLE"))?;
-        match (&mut *lifecycle, requested_use) {
-            (TaskSlotLifecycle::Building(None), None) | (TaskSlotLifecycle::Ready, None) => Ok(()),
-            (TaskSlotLifecycle::Building(Some(current)), Some(requested)) => match (&*current, requested) {
-                (ProjectRuntimeUse::Warmup, ProjectRuntimeUse::Turn { .. }) => {
-                    *current = requested.clone();
-                    Ok(())
+        match (&mut *lifecycle, requested_use, requested_intent) {
+            (
+                TaskSlotLifecycle::Building {
+                    project_runtime_use: None,
+                    intent,
+                },
+                None,
+                requested_intent,
+            ) => {
+                if requested_intent == BuildIntent::Turn {
+                    *intent = BuildIntent::Turn;
                 }
-                (ProjectRuntimeUse::Turn { turn_id: active }, ProjectRuntimeUse::Turn { turn_id })
-                    if active == turn_id =>
-                {
-                    Ok(())
+                Ok(())
+            }
+            (TaskSlotLifecycle::Ready, None, _) => Ok(()),
+            (TaskSlotLifecycle::WarmIdle, None, BuildIntent::Warmup) => Ok(()),
+            (TaskSlotLifecycle::Finished, None, BuildIntent::Warmup) => {
+                *lifecycle = TaskSlotLifecycle::WarmIdle;
+                Ok(())
+            }
+            (TaskSlotLifecycle::WarmIdle | TaskSlotLifecycle::Finished, None, BuildIntent::Turn) => {
+                *lifecycle = TaskSlotLifecycle::Ready;
+                Ok(())
+            }
+            (
+                TaskSlotLifecycle::Building {
+                    project_runtime_use: Some(current),
+                    intent,
+                },
+                Some(requested),
+                requested_intent,
+            ) => {
+                let admitted = match (&*current, requested) {
+                    (ProjectRuntimeUse::Warmup, ProjectRuntimeUse::Turn { .. }) => {
+                        *current = requested.clone();
+                        true
+                    }
+                    (ProjectRuntimeUse::Turn { turn_id: active }, ProjectRuntimeUse::Turn { turn_id })
+                        if active == turn_id =>
+                    {
+                        true
+                    }
+                    (ProjectRuntimeUse::Turn { .. }, ProjectRuntimeUse::Warmup)
+                    | (ProjectRuntimeUse::Warmup, ProjectRuntimeUse::Warmup) => true,
+                    _ => false,
+                };
+                if !admitted {
+                    return Err(AgentError::conflict("PROJECT_RUNTIME_TURN_ACTIVE"));
                 }
-                (ProjectRuntimeUse::Turn { .. }, ProjectRuntimeUse::Warmup)
-                | (ProjectRuntimeUse::Warmup, ProjectRuntimeUse::Warmup) => Ok(()),
-                _ => Err(AgentError::conflict("PROJECT_RUNTIME_TURN_ACTIVE")),
-            },
-            (TaskSlotLifecycle::WarmIdle | TaskSlotLifecycle::Finished, Some(ProjectRuntimeUse::Warmup)) => Ok(()),
-            (TaskSlotLifecycle::WarmIdle | TaskSlotLifecycle::Finished, Some(ProjectRuntimeUse::Turn { turn_id })) => {
+                if requested_intent == BuildIntent::Turn {
+                    *intent = BuildIntent::Turn;
+                }
+                Ok(())
+            }
+            (TaskSlotLifecycle::WarmIdle, Some(ProjectRuntimeUse::Warmup), BuildIntent::Warmup) => Ok(()),
+            (TaskSlotLifecycle::Finished, Some(ProjectRuntimeUse::Warmup), BuildIntent::Warmup) => {
+                *lifecycle = TaskSlotLifecycle::WarmIdle;
+                Ok(())
+            }
+            (
+                TaskSlotLifecycle::WarmIdle | TaskSlotLifecycle::Finished,
+                Some(ProjectRuntimeUse::Turn { turn_id }),
+                BuildIntent::Turn,
+            ) => {
                 *lifecycle = TaskSlotLifecycle::TurnActive {
                     turn_id: turn_id.clone(),
                 };
                 Ok(())
             }
-            (TaskSlotLifecycle::TurnActive { .. }, Some(ProjectRuntimeUse::Warmup)) => Ok(()),
-            (TaskSlotLifecycle::TurnActive { turn_id: active }, Some(ProjectRuntimeUse::Turn { turn_id }))
-                if active == turn_id =>
-            {
+            (TaskSlotLifecycle::TurnActive { .. }, Some(ProjectRuntimeUse::Warmup), BuildIntent::Warmup) => Ok(()),
+            (
+                TaskSlotLifecycle::TurnActive { turn_id: active },
+                Some(ProjectRuntimeUse::Turn { turn_id }),
+                BuildIntent::Turn,
+            ) if active == turn_id => Ok(()),
+            (TaskSlotLifecycle::FailedEmpty, requested_use, requested_intent) => {
+                *lifecycle = TaskSlotLifecycle::Building {
+                    project_runtime_use: requested_use.cloned(),
+                    intent: requested_intent,
+                };
                 Ok(())
             }
-            (TaskSlotLifecycle::FailedEmpty, requested_use) => {
-                *lifecycle = TaskSlotLifecycle::Building(requested_use.cloned());
-                Ok(())
-            }
-            (TaskSlotLifecycle::Invalidated, _) => Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED")),
+            (TaskSlotLifecycle::Invalidated, _, _) => Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED")),
             _ => Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT")),
         }
     }
 
     fn mark_ready(&self) {
         if let Ok(mut lifecycle) = self.lifecycle.lock()
-            && let TaskSlotLifecycle::Building(runtime_use) = &*lifecycle
+            && let TaskSlotLifecycle::Building {
+                project_runtime_use,
+                intent,
+            } = &*lifecycle
         {
-            let runtime_use = runtime_use.clone();
-            *lifecycle = match runtime_use {
-                None => TaskSlotLifecycle::Ready,
-                Some(ProjectRuntimeUse::Warmup) => TaskSlotLifecycle::WarmIdle,
-                Some(ProjectRuntimeUse::Turn { turn_id }) => TaskSlotLifecycle::TurnActive { turn_id },
+            let project_runtime_use = project_runtime_use.clone();
+            let intent = *intent;
+            *lifecycle = match (project_runtime_use, intent) {
+                (None, BuildIntent::Warmup) => TaskSlotLifecycle::WarmIdle,
+                (None, BuildIntent::Turn) => TaskSlotLifecycle::Ready,
+                (Some(ProjectRuntimeUse::Warmup), _) => TaskSlotLifecycle::WarmIdle,
+                (Some(ProjectRuntimeUse::Turn { turn_id }), _) => TaskSlotLifecycle::TurnActive { turn_id },
             };
         }
     }
 
     fn mark_failed(&self) {
         if let Ok(mut lifecycle) = self.lifecycle.lock()
-            && matches!(*lifecycle, TaskSlotLifecycle::Building(_))
+            && matches!(*lifecycle, TaskSlotLifecycle::Building { .. })
         {
             *lifecycle = TaskSlotLifecycle::FailedEmpty;
         }
@@ -256,6 +359,28 @@ impl TaskSlot {
             .map(|mut guard| guard.take())
             .map_err(|_| AgentError::internal("Project runtime termination fence is unavailable"))
     }
+
+    fn idle_snapshot(&self, idle_threshold_ms: TimestampMs, now: TimestampMs) -> Option<IdleTaskSnapshot> {
+        let lifecycle = self.lifecycle().ok()?;
+        let agent = self.get()?;
+        let agent_type = agent.agent_type();
+        let status = agent.status();
+        let last_activity_at = agent.last_activity_at();
+        let idle_ms = now.saturating_sub(last_activity_at);
+        let warm_resident = lifecycle == TaskSlotLifecycle::WarmIdle;
+        let completed_turn = status == Some(ConversationStatus::Finished)
+            && matches!(lifecycle, TaskSlotLifecycle::Ready | TaskSlotLifecycle::Finished);
+
+        (agent_type == AgentType::Acp && idle_ms > idle_threshold_ms && (warm_resident || completed_turn)).then_some(
+            IdleTaskSnapshot {
+                agent_type,
+                status,
+                lifecycle,
+                idle_ms,
+                last_activity_at,
+            },
+        )
+    }
 }
 
 type SharedTaskSlot = Arc<TaskSlot>;
@@ -284,12 +409,14 @@ impl WorkerTaskManagerImpl {
         conversation_id: &str,
         requested_context: Option<ProjectRuntimeContext>,
         requested_use: Option<&ProjectRuntimeUse>,
+        requested_intent: BuildIntent,
     ) -> Result<SharedTaskSlot, AgentError> {
         use dashmap::mapref::entry::Entry;
 
         match self.tasks.entry(conversation_id.to_owned()) {
             Entry::Vacant(entry) => {
-                let slot = TaskSlot::new(requested_context, requested_use.cloned(), None)?;
+                let slot =
+                    TaskSlot::new_with_intent(requested_context, requested_use.cloned(), requested_intent, None)?;
                 entry.insert(Arc::clone(&slot));
                 Ok(slot)
             }
@@ -297,11 +424,11 @@ impl WorkerTaskManagerImpl {
                 let existing = Arc::clone(entry.get());
                 match (existing.project_runtime_context.as_ref(), requested_context.as_ref()) {
                     (None, None) => {
-                        existing.admit_exact(None)?;
+                        existing.admit_exact(None, requested_intent)?;
                         return Ok(existing);
                     }
                     (Some(previous), Some(requested)) if previous.same_runtime_as(requested) => {
-                        existing.admit_exact(requested_use)?;
+                        existing.admit_exact(requested_use, requested_intent)?;
                         return Ok(existing);
                     }
                     _ => {}
@@ -317,7 +444,7 @@ impl WorkerTaskManagerImpl {
                 }
 
                 let prior_termination = match existing.lifecycle()? {
-                    TaskSlotLifecycle::Building(_) | TaskSlotLifecycle::TurnActive { .. } => {
+                    TaskSlotLifecycle::Building { .. } | TaskSlotLifecycle::TurnActive { .. } => {
                         return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_CONFLICT"));
                     }
                     TaskSlotLifecycle::WarmIdle | TaskSlotLifecycle::Finished => {
@@ -339,11 +466,45 @@ impl WorkerTaskManagerImpl {
                 };
 
                 existing.mark_invalidated();
-                let replacement = TaskSlot::new(requested_context, requested_use.cloned(), prior_termination)?;
+                let replacement = TaskSlot::new_with_intent(
+                    requested_context,
+                    requested_use.cloned(),
+                    requested_intent,
+                    prior_termination,
+                )?;
                 entry.insert(Arc::clone(&replacement));
                 Ok(replacement)
             }
         }
+    }
+
+    async fn get_or_build_task_with_intent(
+        &self,
+        conversation_id: &str,
+        options: BuildTaskOptions,
+        intent: BuildIntent,
+    ) -> Result<AgentInstance, AgentError> {
+        let project_runtime = options.project_runtime_context.is_some();
+        let project_execution = match (&options.project_runtime_context, &options.project_runtime_execution) {
+            (Some(context), Some(permit)) if permit.matches(conversation_id, context) => {
+                let intent_matches = matches!(
+                    (intent, permit.runtime_use()),
+                    (BuildIntent::Warmup, ProjectRuntimeUse::Warmup)
+                        | (BuildIntent::Turn, ProjectRuntimeUse::Turn { .. })
+                );
+                if !intent_matches {
+                    return Err(AgentError::bad_request("PROJECT_RUNTIME_PERMIT_USE_MISMATCH"));
+                }
+                Some(permit.clone())
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(AgentError::bad_request("PROJECT_RUNTIME_PERMIT_REQUIRED"));
+            }
+            (Some(_), Some(_)) => return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED")),
+            (None, None) => None,
+        };
+        self.get_or_build_task_under_project_fence(conversation_id, options, project_runtime, project_execution, intent)
+            .await
     }
 }
 
@@ -358,16 +519,16 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
-        let project_runtime = options.project_runtime_context.is_some();
-        let project_execution = match (&options.project_runtime_context, &options.project_runtime_execution) {
-            (Some(context), Some(permit)) if permit.matches(conversation_id, context) => Some(permit.clone()),
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(AgentError::bad_request("PROJECT_RUNTIME_PERMIT_REQUIRED"));
-            }
-            (Some(_), Some(_)) => return Err(AgentError::conflict("PROJECT_RUNTIME_CONTEXT_INVALIDATED")),
-            (None, None) => None,
-        };
-        self.get_or_build_task_under_project_fence(conversation_id, options, project_runtime, project_execution)
+        self.get_or_build_task_with_intent(conversation_id, options, BuildIntent::Turn)
+            .await
+    }
+
+    async fn get_or_build_warm_task(
+        &self,
+        conversation_id: &str,
+        options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        self.get_or_build_task_with_intent(conversation_id, options, BuildIntent::Warmup)
             .await
     }
 
@@ -447,31 +608,58 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         self.tasks
             .iter()
             .filter_map(|entry| {
-                let agent = entry.value().get()?;
-                let agent_type = agent.agent_type();
-                let status = agent.status();
-                let last_activity_at = agent.last_activity_at();
-                let idle_ms = now.saturating_sub(last_activity_at);
-
-                let selected = agent_type == AgentType::Acp
-                    && status == Some(ConversationStatus::Finished)
-                    && idle_ms > idle_threshold_ms;
-                if selected {
-                    info!(
-                        conversation_id = %entry.key(),
-                        ?agent_type,
-                        ?status,
-                        idle_ms,
-                        threshold_ms = idle_threshold_ms,
-                        last_activity_at,
-                        "Idle scan: selected idle agent"
-                    );
-                    Some(entry.key().clone())
-                } else {
-                    None
-                }
+                let snapshot = entry.value().idle_snapshot(idle_threshold_ms, now)?;
+                info!(
+                    conversation_id = %entry.key(),
+                    agent_type = ?snapshot.agent_type,
+                    status = ?snapshot.status,
+                    lifecycle = ?snapshot.lifecycle,
+                    idle_ms = snapshot.idle_ms,
+                    threshold_ms = idle_threshold_ms,
+                    last_activity_at = snapshot.last_activity_at,
+                    "Idle scan: selected idle agent"
+                );
+                Some(entry.key().clone())
             })
             .collect()
+    }
+
+    async fn kill_idle_if_still_eligible(&self, conversation_id: &str, idle_threshold_ms: TimestampMs) -> bool {
+        use dashmap::mapref::entry::Entry;
+
+        let removed = match self.tasks.entry(conversation_id.to_owned()) {
+            Entry::Vacant(_) => None,
+            Entry::Occupied(entry) => {
+                if entry.get().idle_snapshot(idle_threshold_ms, now_ms()).is_none() {
+                    None
+                } else {
+                    Some(entry.remove_entry())
+                }
+            }
+        };
+        let Some((id, slot)) = removed else {
+            debug!(
+                conversation_id,
+                threshold_ms = idle_threshold_ms,
+                "Idle scan: candidate became active before cleanup"
+            );
+            return false;
+        };
+
+        let agent_type = slot.get().map(|agent| agent.agent_type());
+        info!(
+            conversation_id = %id,
+            ?agent_type,
+            reason = %"IdleTimeout",
+            "Idle kill: task removed from manager"
+        );
+        slot.mark_invalidated();
+        if let Some(agent) = slot.instance.get()
+            && slot.start_cleanup()
+        {
+            agent.kill_and_wait(Some(AgentKillReason::IdleTimeout)).await;
+        }
+        true
     }
 }
 
@@ -482,11 +670,17 @@ impl WorkerTaskManagerImpl {
         options: BuildTaskOptions,
         project_runtime: bool,
         project_execution: Option<ProjectRuntimeExecutionPermit>,
+        intent: BuildIntent,
     ) -> Result<AgentInstance, AgentError> {
         let requested_use = project_execution
             .as_ref()
             .map(ProjectRuntimeExecutionPermit::runtime_use);
-        let slot = self.select_slot(conversation_id, options.project_runtime_context.clone(), requested_use)?;
+        let slot = self.select_slot(
+            conversation_id,
+            options.project_runtime_context.clone(),
+            requested_use,
+            intent,
+        )?;
         if let Some(ProjectRuntimeUse::Turn { turn_id }) = requested_use {
             let weak_slot = Arc::downgrade(&slot);
             let turn_id = turn_id.clone();
@@ -717,14 +911,45 @@ mod tests {
         root_generation: u64,
         backend_generation: u64,
     ) -> BuildTaskOptions {
-        let context = project_context(runtime, hint, root_generation, backend_generation);
-        let permit = ProjectRuntimeExecutionPermit::test_only(
+        make_project_options_for_use(
             conversation_id,
-            &context,
+            runtime,
+            hint,
+            root_generation,
+            backend_generation,
             ProjectRuntimeUse::Turn {
                 turn_id: "test-turn".to_owned(),
             },
-        );
+        )
+    }
+
+    fn make_project_warmup_options(
+        conversation_id: &str,
+        runtime: &str,
+        hint: &str,
+        root_generation: u64,
+        backend_generation: u64,
+    ) -> BuildTaskOptions {
+        make_project_options_for_use(
+            conversation_id,
+            runtime,
+            hint,
+            root_generation,
+            backend_generation,
+            ProjectRuntimeUse::Warmup,
+        )
+    }
+
+    fn make_project_options_for_use(
+        conversation_id: &str,
+        runtime: &str,
+        hint: &str,
+        root_generation: u64,
+        backend_generation: u64,
+        runtime_use: ProjectRuntimeUse,
+    ) -> BuildTaskOptions {
+        let context = project_context(runtime, hint, root_generation, backend_generation);
+        let permit = ProjectRuntimeExecutionPermit::test_only(conversation_id, &context, runtime_use);
         BuildTaskOptions::new(make_options(conversation_id).context)
             .with_project_runtime_context(context)
             .with_project_runtime_execution(permit)
@@ -814,6 +1039,192 @@ mod tests {
         let h2 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
         assert!(same_mock(&h1, &h2));
         assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn warmup_builds_warm_idle_for_legacy_and_project_tasks() {
+        let mgr = make_manager();
+        mgr.get_or_build_warm_task("conv-warm", make_options("conv-warm"))
+            .await
+            .unwrap();
+        assert_eq!(
+            mgr.tasks.get("conv-warm").unwrap().lifecycle().unwrap(),
+            TaskSlotLifecycle::WarmIdle
+        );
+
+        mgr.get_or_build_warm_task(
+            "conv-project-warm",
+            make_project_warmup_options("conv-project-warm", "runtime-a", "hint-a", 1, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mgr.tasks.get("conv-project-warm").unwrap().lifecycle().unwrap(),
+            TaskSlotLifecycle::WarmIdle
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_promotes_warm_idle_without_rebuilding() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_for_factory = Arc::clone(&builds);
+        let factory: AgentFactory = Arc::new(move |options| {
+            let builds = Arc::clone(&builds_for_factory);
+            async move {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Ok(mock_instance(MockAgent::new(options.conversation_id(), None)))
+            }
+            .boxed()
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory);
+
+        let warmed = mgr
+            .get_or_build_warm_task("conv-promote", make_options("conv-promote"))
+            .await
+            .unwrap();
+        let active = mgr
+            .get_or_build_task("conv-promote", make_options("conv-promote"))
+            .await
+            .unwrap();
+
+        assert!(same_mock(&warmed, &active));
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mgr.tasks.get("conv-promote").unwrap().lifecycle().unwrap(),
+            TaskSlotLifecycle::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn project_rewarm_moves_finished_task_back_to_warm_idle() {
+        let mgr = make_manager();
+        let context = project_context("runtime-a", "hint-a", 1, 1);
+        let turn_permit = ProjectRuntimeExecutionPermit::test_only(
+            "conv-project-rewarm",
+            &context,
+            ProjectRuntimeUse::Turn {
+                turn_id: "turn-1".to_owned(),
+            },
+        );
+        mgr.get_or_build_task(
+            "conv-project-rewarm",
+            BuildTaskOptions::new(make_options("conv-project-rewarm").context)
+                .with_project_runtime_context(context.clone())
+                .with_project_runtime_execution(turn_permit.clone()),
+        )
+        .await
+        .unwrap();
+        drop(turn_permit);
+        assert_eq!(
+            mgr.tasks.get("conv-project-rewarm").unwrap().lifecycle().unwrap(),
+            TaskSlotLifecycle::Finished
+        );
+
+        let warm_permit =
+            ProjectRuntimeExecutionPermit::test_only("conv-project-rewarm", &context, ProjectRuntimeUse::Warmup);
+        mgr.get_or_build_warm_task(
+            "conv-project-rewarm",
+            BuildTaskOptions::new(make_options("conv-project-rewarm").context)
+                .with_project_runtime_context(context)
+                .with_project_runtime_execution(warm_permit),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mgr.tasks.get("conv-project-rewarm").unwrap().lifecycle().unwrap(),
+            TaskSlotLifecycle::WarmIdle
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_during_warmup_build_prevents_late_warm_completion_from_downgrading() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let builds = Arc::clone(&builds);
+            Arc::new(move |options| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let builds = Arc::clone(&builds);
+                async move {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(mock_instance(MockAgent::new(options.conversation_id(), None)))
+                }
+                .boxed()
+            })
+        };
+        let mgr = Arc::new(WorkerTaskManagerImpl::new(factory));
+        let warm = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_build_warm_task("conv-race", make_options("conv-race")).await })
+        };
+        entered.notified().await;
+        let turn = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_build_task("conv-race", make_options("conv-race")).await })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let promoted = mgr.tasks.get("conv-race").is_some_and(|slot| {
+                    matches!(
+                        slot.lifecycle(),
+                        Ok(TaskSlotLifecycle::Building {
+                            intent: BuildIntent::Turn,
+                            ..
+                        })
+                    )
+                });
+                if promoted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("turn intent should promote the shared build");
+
+        release.notify_waiters();
+        warm.await.unwrap().unwrap();
+        turn.await.unwrap().unwrap();
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mgr.tasks.get("conv-race").unwrap().lifecycle().unwrap(),
+            TaskSlotLifecycle::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn project_runtime_permit_use_must_match_build_intent() {
+        let mgr = make_manager();
+        let turn_with_warm_permit = expect_agent_error(
+            mgr.get_or_build_task(
+                "conv-project",
+                make_project_warmup_options("conv-project", "runtime-a", "hint-a", 1, 1),
+            )
+            .await,
+        );
+        assert!(
+            matches!(turn_with_warm_permit, AgentError::BadRequest(reason) if reason == "PROJECT_RUNTIME_PERMIT_USE_MISMATCH")
+        );
+
+        let warm_with_turn_permit = expect_agent_error(
+            mgr.get_or_build_warm_task(
+                "conv-project",
+                make_project_options("conv-project", "runtime-a", "hint-a", 1, 1),
+            )
+            .await,
+        );
+        assert!(
+            matches!(warm_with_turn_permit, AgentError::BadRequest(reason) if reason == "PROJECT_RUNTIME_PERMIT_USE_MISMATCH")
+        );
     }
 
     #[tokio::test]
@@ -1283,7 +1694,7 @@ mod tests {
 
         // Helper: insert a pre-initialised slot bypassing the async factory path.
         let insert = |id: &str, instance: AgentInstance| {
-            let slot = TaskSlot::new(None, None, None).unwrap();
+            let slot = TaskSlot::new_with_intent(None, None, BuildIntent::Turn, None).unwrap();
             slot.instance.set(instance).ok();
             slot.mark_ready();
             mgr.tasks.insert(id.into(), slot);
@@ -1329,6 +1740,91 @@ mod tests {
         assert_eq!(idle[0], "conv-stale");
     }
 
+    #[tokio::test]
+    async fn collect_idle_finds_warm_resident_acp_without_finished_status() {
+        let factory: AgentFactory = Arc::new(|options| {
+            async move {
+                Ok(mock_instance(
+                    MockAgent::new(options.conversation_id(), None).with_last_activity(now_ms() - 600_000),
+                ))
+            }
+            .boxed()
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory);
+
+        mgr.get_or_build_warm_task("conv-warm-idle", make_options("conv-warm-idle"))
+            .await
+            .unwrap();
+
+        assert_eq!(mgr.collect_idle(300_000), vec!["conv-warm-idle".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn idle_revalidation_skips_candidate_promoted_by_a_real_turn() {
+        let kills = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let kills = Arc::clone(&kills);
+            Arc::new(move |options| {
+                let kills = Arc::clone(&kills);
+                async move {
+                    Ok(mock_instance(
+                        MockAgent::new(options.conversation_id(), None)
+                            .with_last_activity(now_ms() - 600_000)
+                            .with_kill_counter(kills),
+                    ))
+                }
+                .boxed()
+            })
+        };
+        let mgr = WorkerTaskManagerImpl::new(factory);
+        mgr.get_or_build_warm_task("conv-race", make_options("conv-race"))
+            .await
+            .unwrap();
+        assert_eq!(mgr.collect_idle(300_000), vec!["conv-race".to_owned()]);
+
+        mgr.get_or_build_task("conv-race", make_options("conv-race"))
+            .await
+            .unwrap();
+        let killed = mgr.kill_idle_if_still_eligible("conv-race", 300_000).await;
+
+        assert!(!killed);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        assert!(mgr.get_task("conv-race").is_some());
+        assert_eq!(
+            mgr.tasks.get("conv-race").unwrap().lifecycle().unwrap(),
+            TaskSlotLifecycle::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_revalidation_kills_candidate_that_remains_warm_idle() {
+        let kills = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let kills = Arc::clone(&kills);
+            Arc::new(move |options| {
+                let kills = Arc::clone(&kills);
+                async move {
+                    Ok(mock_instance(
+                        MockAgent::new(options.conversation_id(), None)
+                            .with_last_activity(now_ms() - 600_000)
+                            .with_kill_counter(kills),
+                    ))
+                }
+                .boxed()
+            })
+        };
+        let mgr = WorkerTaskManagerImpl::new(factory);
+        mgr.get_or_build_warm_task("conv-warm-idle", make_options("conv-warm-idle"))
+            .await
+            .unwrap();
+
+        let killed = mgr.kill_idle_if_still_eligible("conv-warm-idle", 300_000).await;
+
+        assert!(killed);
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        assert!(mgr.get_task("conv-warm-idle").is_none());
+    }
+
     #[test]
     fn collect_idle_logs_selected_agent_with_idle_fields() {
         let manager = WorkerTaskManagerImpl::new(Arc::new(|_options| {
@@ -1337,7 +1833,7 @@ mod tests {
         let now = now_ms();
         let agent =
             Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)).with_last_activity(now - 10_000));
-        let slot = TaskSlot::new(None, None, None).unwrap();
+        let slot = TaskSlot::new_with_intent(None, None, BuildIntent::Turn, None).unwrap();
         assert!(slot.instance.set(AgentInstance::Mock(agent)).is_ok());
         slot.mark_ready();
         manager.tasks.insert("conv_idle".to_owned(), slot);
@@ -1362,7 +1858,7 @@ mod tests {
             async { Err(AgentError::bad_gateway("not used")) }.boxed()
         }));
         let agent = Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)));
-        let slot = TaskSlot::new(None, None, None).unwrap();
+        let slot = TaskSlot::new_with_intent(None, None, BuildIntent::Turn, None).unwrap();
         assert!(slot.instance.set(AgentInstance::Mock(agent)).is_ok());
         slot.mark_ready();
         manager.tasks.insert("conv_idle".to_owned(), slot);

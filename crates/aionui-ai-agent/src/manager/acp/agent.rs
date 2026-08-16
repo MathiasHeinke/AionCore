@@ -1423,11 +1423,20 @@ impl AcpAgentManager {
     pub async fn warmup_session(&self) -> Result<(), AgentError> {
         info!("Warming up ACP session");
         let result = self.ensure_session_opened().await.map(|_sid| ());
+        record_successful_warmup_activity(&self.runtime, &result);
         match &result {
-            Ok(()) => info!("ACP session warmed up"),
+            Ok(()) => {
+                info!("ACP session warmed up");
+            }
             Err(e) => warn!(error = %ErrorChain(e), "ACP session warmup failed"),
         }
         result
+    }
+}
+
+fn record_successful_warmup_activity(runtime: &AgentRuntime, result: &Result<(), AgentError>) {
+    if result.is_ok() {
+        runtime.bump_activity();
     }
 }
 
@@ -1937,6 +1946,23 @@ mod tests {
             !session.is_opened(),
             "warmup must not mark the aggregate opened when the protocol is already disconnected"
         );
+    }
+
+    #[test]
+    fn successful_warmup_refreshes_idle_activity_but_failure_does_not() {
+        let runtime = AgentRuntime::new("conv-warm", "/tmp", 8);
+        let before_success = runtime.last_activity_at();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        super::record_successful_warmup_activity(&runtime, &Ok(()));
+
+        let after_success = runtime.last_activity_at();
+        assert!(after_success > before_success);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        super::record_successful_warmup_activity(&runtime, &Err(AgentError::bad_gateway("warmup failed")));
+
+        assert_eq!(runtime.last_activity_at(), after_success);
     }
 
     #[test]
